@@ -64,11 +64,25 @@ try {
         # 消費済みポインタは使わない（古いhandoffの無期限再生を防ぐ）
         if ($ok -and $pointer.PSObject.Properties["consumed_at"] -and
             -not [string]::IsNullOrEmpty($pointer.consumed_at)) { $ok = $false }
-        # 有効期限
-        if ($ok -and $pointer.PSObject.Properties["updated_at"]) {
-            $ts = [datetime]::MinValue
-            if ([datetime]::TryParse($pointer.updated_at, [ref]$ts)) {
-                if ($ts -lt (Get-Date).AddDays(-$POINTER_MAX_AGE_DAYS)) { $ok = $false }
+        # 有効期限。**時刻が無い/解釈できないポインタは信用しない**（fail-closed。sh版と同一契約）。
+        # producerは両実装とも必ずupdated_atを書くので、無い・読めないのは改変か壊れた記録。
+        # 素通りさせると「updated_atを消す/壊すだけで期限を無期限に迂回できる」
+        if ($ok) {
+            $rawUpdated = ""
+            if ($pointer.PSObject.Properties["updated_at"]) { $rawUpdated = [string]$pointer.updated_at }
+            if ([string]::IsNullOrEmpty($rawUpdated)) {
+                $ok = $false
+                Write-HandoffError $handoffRoot "restore" "latest.jsonにupdated_atがありません。ポインタを無効として扱いました"
+            }
+            else {
+                $ts = [datetime]::MinValue
+                if ([datetime]::TryParse($rawUpdated, [ref]$ts)) {
+                    if ($ts -lt (Get-Date).AddDays(-$POINTER_MAX_AGE_DAYS)) { $ok = $false }
+                }
+                else {
+                    $ok = $false
+                    Write-HandoffError $handoffRoot "restore" "latest.jsonのupdated_atを解釈できません（$rawUpdated）。ポインタを無効として扱いました"
+                }
             }
         }
         if (-not $ok) { $pointer = $null }

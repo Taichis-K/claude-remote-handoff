@@ -116,4 +116,26 @@ printf 'TAMPERED\n' >> "$md_dir/current.md"
 o=$(invoke_hook handoff-restore.sh "$restore_in")
 printf 'C10 output=%s\n' "$(out_kind "$o")"
 
+# C11: **他実装が書いた形式**の期限切れポインタを拒否する（issue #1）
+# 各実装は自分が書いた形式しか通らないため、C1〜C10 ではこの穴を検出できなかった。
+# 固定リテラル（コロン付きオフセット・遠い過去）を使い、実装によらず同じ入力にする
+sed "s/{{NONCE}}/$nonce/" "$fixtures/md/good-handoff.md.tmpl" > "$md_dir/current.md"
+jq --arg u '2020-01-02T03:04:05+09:00' 'del(.consumed_at) | .updated_at = $u' "$latest" > "$latest.new" \
+    && mv -f "$latest.new" "$latest"
+o=$(invoke_hook handoff-restore.sh "$restore_in")
+printf 'C11 output=%s\n' "$(out_kind "$o")"
+
+# C12: updated_at が無いポインタは拒否（削るだけで期限を迂回できないこと）
+sed "s/{{NONCE}}/$nonce/" "$fixtures/md/good-handoff.md.tmpl" > "$md_dir/current.md"
+jq 'del(.consumed_at) | del(.updated_at)' "$latest" > "$latest.new" && mv -f "$latest.new" "$latest"
+o=$(invoke_hook handoff-restore.sh "$restore_in")
+printf 'C12 output=%s\n' "$(out_kind "$o")"
+
+# C13: 解釈できない updated_at のポインタは拒否（両実装で同じ判定になること）
+sed "s/{{NONCE}}/$nonce/" "$fixtures/md/good-handoff.md.tmpl" > "$md_dir/current.md"
+jq --arg u 'not-a-timestamp' 'del(.consumed_at) | .updated_at = $u' "$latest" > "$latest.new" \
+    && mv -f "$latest.new" "$latest"
+o=$(invoke_hook handoff-restore.sh "$restore_in")
+printf 'C13 output=%s\n' "$(out_kind "$o")"
+
 rm -rf "$work"

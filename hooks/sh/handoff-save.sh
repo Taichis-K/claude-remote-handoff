@@ -51,7 +51,7 @@ main() {
             items=$(printf '%s' "$items" | jq --arg v "skipped-too-large($t_size bytes)" '.transcript = $v')
         elif [ -n "$free_kb" ] && [ "$free_kb" -lt "$need_kb" ] 2>/dev/null; then
             items=$(printf '%s' "$items" | jq '.transcript = "skipped-low-disk-space"')
-            ho_error "$handoff_root" "handoff-save" "空きディスク容量不足のためtranscriptコピーを見送り（size=$t_size）"
+            ho_error "$handoff_root" "handoff-save" "空きディスク容量不足のためtranscriptコピーを見送り（size=${t_size}）"
         elif cp -f "$transcript" "$dest_dir/transcript.jsonl" 2>/dev/null; then
             items=$(printf '%s' "$items" | jq '.transcript = "ok"')
         else

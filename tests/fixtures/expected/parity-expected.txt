@@ -8,3 +8,6 @@ C7 output=hard-retry state=hard/2
 C8 output=injected goal=yes consumed=yes
 C9 output=none
 C10 output=refused
+C11 output=none
+C12 output=none
+C13 output=none

@@ -123,6 +123,35 @@ Add-Content -LiteralPath "$mdDir/current.md" -Value "TAMPERED" -Encoding UTF8
 $o = Invoke-Hook "handoff-restore.ps1" $restoreIn
 Write-Output "C10 output=$(Get-OutKind $o)"
 
+# C11: **他実装が書いた形式**の期限切れポインタを拒否する（issue #1）
+# 各実装は自分が書いた形式しか通らないため、C1〜C10 ではこの穴を検出できなかった。
+# 固定リテラル（コロン付きオフセット・遠い過去）を使い、実装によらず同じ入力にする
+Set-Content -LiteralPath "$mdDir/current.md" -Value $md -Encoding UTF8
+$latest3 = Get-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+$latest3.PSObject.Properties.Remove("consumed_at")
+$latest3 | Add-Member -NotePropertyName updated_at -NotePropertyValue "2020-01-02T03:04:05+09:00" -Force
+Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Value ($latest3 | ConvertTo-Json) -Encoding UTF8
+$o = Invoke-Hook "handoff-restore.ps1" $restoreIn
+Write-Output "C11 output=$(Get-OutKind $o)"
+
+# C12: updated_at が無いポインタは拒否（削るだけで期限を迂回できないこと）
+Set-Content -LiteralPath "$mdDir/current.md" -Value $md -Encoding UTF8
+$latest4 = Get-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+$latest4.PSObject.Properties.Remove("consumed_at")
+$latest4.PSObject.Properties.Remove("updated_at")
+Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Value ($latest4 | ConvertTo-Json) -Encoding UTF8
+$o = Invoke-Hook "handoff-restore.ps1" $restoreIn
+Write-Output "C12 output=$(Get-OutKind $o)"
+
+# C13: 解釈できない updated_at のポインタは拒否（両実装で同じ判定になること）
+Set-Content -LiteralPath "$mdDir/current.md" -Value $md -Encoding UTF8
+$latest5 = Get-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+$latest5.PSObject.Properties.Remove("consumed_at")
+$latest5 | Add-Member -NotePropertyName updated_at -NotePropertyValue "not-a-timestamp" -Force
+Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Value ($latest5 | ConvertTo-Json) -Encoding UTF8
+$o = Invoke-Hook "handoff-restore.ps1" $restoreIn
+Write-Output "C13 output=$(Get-OutKind $o)"
+
 Remove-Item $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
 
 

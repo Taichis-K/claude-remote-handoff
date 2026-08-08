@@ -25,7 +25,7 @@ instruction_common() {
 記載セクション（この7見出しをすべて \`## 見出し名\` の形で含め、各セクションに本文を書くこと）: Goal / Completed / Not Yet Done / Failed Approaches / Key Decisions / Current State / Resume Instructions。
 ファイルの最終行として完了マーカー行 <!-- handoff-complete: $2 --> を必ず書くこと。
 恒久的な決定事項があればCLAUDE.mdへも反映すること。
-完成したらユーザーへ「/clear の実行を推奨します（トークン消費ゼロでコンテキストをリセットでき、引き継ぎ資料は次のコンテキストに自動注入されます。Remote Control中はモバイル/Webからも実行可。放置してもauto compactが安全網として働きます）」と案内して停止すること。
+完成したらユーザーへ次を案内して停止すること:「引き継ぎ資料が完成しました。Remote Control中や会話ログを残したい場合はこのまま続行してください（放置すればauto compactが働き、資料は圧縮後のコンテキストへ自動注入されます）。トークン消費を節約したい場合は /clear を実行してください（消費ゼロで資料が自動注入されます。ただし会話ログは新しい空のセッションに切り替わり、次に一言送るまで作業は自動再開されません）」
 EOF
 }
 
@@ -88,7 +88,7 @@ main() {
         fi
         fire_point=$((w * pct / 100))
         if [ $((hard + min_margin)) -ge "$fire_point" ]; then
-            ho_error "$handoff_root" "handoff-check" "実行時再検証NG: ハード閾値$hard+マージン$min_margin >= 発火点$fire_point（window=$w pct=$pct）。無効化中"
+            ho_error "$handoff_root" "handoff-check" "実行時再検証NG: ハード閾値$hard+マージン$min_margin >= 発火点${fire_point}（window=$w pct=${pct}）。無効化中"
             exit 0
         fi
     fi
@@ -140,7 +140,7 @@ main() {
                 if [ "$s_failed" != "true" ]; then
                     jq -n --arg n "$s_nonce" --argjson a "$s_attempts" \
                         '{mode: "hard", nonce: $n, attempts: $a, completed: false, failed: true}' | ho_write_atomic "$state_path"
-                    ho_error "$handoff_root" "handoff-check" "ハードhandoffが${MAX_ATTEMPTS}回失敗して打ち切り（session=$session_id）"
+                    ho_error "$handoff_root" "handoff-check" "ハードhandoffが${MAX_ATTEMPTS}回失敗して打ち切り（session=${session_id}）"
                     jq -n --arg m "claude-remote-handoff: 引き継ぎ資料の作成が${MAX_ATTEMPTS}回失敗し打ち切りました。このまま/clearすると意味的な引き継ぎなしになります。原因（書き込み権限等）を確認し、必要なら手動でhandoff作成を指示してください。" '{systemMessage: $m}'
                 fi
                 exit 0

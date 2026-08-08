@@ -77,7 +77,7 @@ function New-InstructionText {
         "記載セクション（この7見出しをすべて `## 見出し名` の形で含め、各セクションに本文を書くこと）: Goal / Completed / Not Yet Done / Failed Approaches / Key Decisions / Current State / Resume Instructions。",
         "ファイルの最終行として完了マーカー行 <!-- handoff-complete: $Nonce --> を必ず書くこと。",
         "恒久的な決定事項があればCLAUDE.mdへも反映すること。",
-        "完成したらユーザーへ「/clear の実行を推奨します（トークン消費ゼロでコンテキストをリセットでき、引き継ぎ資料は次のコンテキストに自動注入されます。Remote Control中はモバイル/Webからも実行可。放置してもauto compactが安全網として働きます）」と案内して停止すること。"
+        "完成したらユーザーへ次を案内して停止すること:「引き継ぎ資料が完成しました。Remote Control中や会話ログを残したい場合はこのまま続行してください（放置すればauto compactが働き、資料は圧縮後のコンテキストへ自動注入されます）。トークン消費を節約したい場合は /clear を実行してください（消費ゼロで資料が自動注入されます。ただし会話ログは新しい空のセッションに切り替わり、次に一言送るまで作業は自動再開されません）」"
     ) -join "`n"
     if ($Mode -eq "hard") {
         $retryNote = ""

@@ -39,14 +39,31 @@ main() {
             ho_is_uuid "$p_sid" || pointer_ok="no"
         fi
         if [ "$pointer_ok" = "ok" ]; then
-            # 有効期限（updated_atのパースはbest-effort。date -dはGNU/BSDで差があるため日数はエポック秒で比較）
+            # 有効期限（date -dはGNU/BSDで差があるため日数はエポック秒で比較）。
+            # **オフセット表記を正規化してから渡す** — PS版は `zzz` で `+09:00`、sh版は `%z` で
+            # `+0900` を書くので、実装をまたぐと形式が違う。BSDの `%z` はコロン付きを解釈できず
+            # （`Failed conversion` になる）、以前はそこで黙って期限判定ごと飛ばしていた＝
+            # 他実装が書いたポインタでは有効期限が無効になっていた（macOSで実測）
             p_updated=$(jq -r '.updated_at // empty' "$latest_path")
-            if [ -n "$p_updated" ]; then
-                p_epoch=$(date -d "$p_updated" +%s 2>/dev/null || date -j -f '%Y-%m-%dT%H:%M:%S%z' "$p_updated" +%s 2>/dev/null || echo "")
+            if [ -z "$p_updated" ]; then
+                # **時刻が無いポインタは信用しない**（fail-closed）。欠落・null・空文字は
+                # ここへ来る。producerは両実装とも必ず書くので、無いのは改変か壊れた記録。
+                # 素通りさせると「updated_atを消すだけで期限を無期限に迂回できる」
+                pointer_ok="no"
+                ho_error "$handoff_root" "restore" "latest.jsonにupdated_atがありません。ポインタを無効として扱いました"
+            else
+                p_norm=$(printf '%s' "$p_updated" | sed 's/\([+-][0-9][0-9]\):\([0-9][0-9]\)$/\1\2/; s/[Zz]$/+0000/')
+                p_epoch=$(date -d "$p_updated" +%s 2>/dev/null || date -j -f '%Y-%m-%dT%H:%M:%S%z' "$p_norm" +%s 2>/dev/null || echo "")
                 if [ -n "$p_epoch" ]; then
                     now_epoch=$(date +%s)
                     age_limit=$((POINTER_MAX_AGE_DAYS * 86400))
                     [ $((now_epoch - p_epoch)) -gt "$age_limit" ] && pointer_ok="no"
+                else
+                    # **パースできない時刻も信用しない**（fail-closed）。ここを素通りさせると
+                    # 「期限切れのはずの資料が注入される」ことに気づけない。ポインタは毎サイクル
+                    # 書き直されるので、拒否しても次のhandoff作成で復帰する
+                    pointer_ok="no"
+                    ho_error "$handoff_root" "restore" "latest.jsonのupdated_atを解釈できません（${p_updated}）。ポインタを無効として扱いました"
                 fi
             fi
         fi
@@ -58,14 +75,14 @@ main() {
     use_pointer="no"
     if [ "$source_kind" != "clear" ] && [ -n "$own_sid" ] && [ -f "$handoff_root/$own_sid/current.md" ]; then
         resolved_sid="$own_sid"
-        origin="セッションディレクトリ直接参照（$own_sid）"
+        origin="セッションディレクトリ直接参照（${own_sid}）"
     elif [ "$pointer_ok" = "ok" ]; then
         resolved_sid="$p_sid"
         use_pointer="yes"
         origin="latest.json経由（作成セッション: $p_sid / 更新: $(jq -r '.updated_at // ""' "$latest_path")）"
     elif [ -n "$own_sid" ] && [ -f "$handoff_root/$own_sid/current.md" ]; then
         resolved_sid="$own_sid"
-        origin="セッションディレクトリ直接参照（$own_sid）"
+        origin="セッションディレクトリ直接参照（${own_sid}）"
     fi
 
     # パスは検証済みUUIDから再構築（ポインタのパスは信用しない）+ root配下検証
@@ -125,7 +142,7 @@ main() {
         exit 0
     fi
 
-    out="# 引き継ぎコンテキスト自動再注入（claude-remote-handoff / source: $source_kind）"
+    out="# 引き継ぎコンテキスト自動再注入（claude-remote-handoff / source: ${source_kind}）"
 
     # --- 5. current.md（ゲート通過時のみ内容を注入） ---
     if [ -n "$current_md" ] && [ "$gate" = "yes" ]; then
@@ -141,7 +158,7 @@ $md_body"
     elif [ -n "$current_md" ]; then
         out="$out
 
-## 引き継ぎ資料 current.md: ⚠️ 検証に失敗したため注入しない（$gate_note）。必要なら下記バックアップから状況を確認すること"
+## 引き継ぎ資料 current.md: ⚠️ 検証に失敗したため注入しない（${gate_note}）。必要なら下記バックアップから状況を確認すること"
     else
         out="$out
 
@@ -164,7 +181,7 @@ $md_body"
 $txt
 "
             elif [ "$r" != "ok" ]; then
-                git_text="$git_text### git $label: 取得失敗（$r）
+                git_text="$git_text### git $label: 取得失敗（${r}）
 "
             fi
         done
