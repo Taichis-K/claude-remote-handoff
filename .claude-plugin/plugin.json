@@ -1,7 +1,7 @@
 {
   "name": "claude-remote-handoff",
   "description": "【Windows専用プラグイン】Remote Controlセッション向け・閾値トリガー式の自動コンテキスト引き継ぎ（macOS/LinuxはINSTALL.mdの手動導入） / [Windows-only plugin] Automatic, threshold-triggered context handoffs for Claude Code Remote Control sessions. macOS/Linux: manual install per INSTALL.md",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": {
     "name": "Taichis-K",
     "url": "https://github.com/Taichis-K"

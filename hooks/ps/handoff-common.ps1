@@ -121,37 +121,87 @@ function Test-HandoffComplete {
     #  2) 完了マーカーが「最後の非空行」に完全一致（途中コピペ・末尾偽装を弾く）
     #  3) コードフェンス内を除外した上で、7必須見出しの完全一致と各セクション本文の非空
     param([string]$HandoffPath, [string]$Nonce, [int]$MinChars = 300)
-    if (-not (Test-Path -LiteralPath $HandoffPath)) { return $false }
+    return ((@(Get-HandoffIncompleteReasons -HandoffPath $HandoffPath -Nonce $Nonce -MinChars $MinChars)).Count -eq 0)
+}
+
+function Get-HandoffIncompleteReasons {
+    # 完了検証の失敗理由の配列を返す（空配列=検証合格）。文言はsh版と同一（挙動一致）。
+    # 理由をモデルへ返し、同じ書き方の再試行で試行枠を浪費させないため（issue #5）
+    param([string]$HandoffPath, [string]$Nonce, [int]$MinChars = 300)
+    if (-not (Test-Path -LiteralPath $HandoffPath)) { return @("ファイルが存在しない") }
+    # 最大サイズ（10MB）超過は読み込む前に弾く: 巨大current.mdによるStop/SessionStartフックの
+    # CPU・メモリ枯渇を防ぐ（codexレビュー4回目 M2。文言・閾値はsh版と同一）
+    try {
+        if ((Get-Item -LiteralPath $HandoffPath).Length -gt 10485760) { return @("全体が最大サイズ（10MB）超過") }
+    } catch { }
     $text = Get-Content -LiteralPath $HandoffPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-    if ($null -eq $text -or $text.Length -lt $MinChars) { return $false }
-    $rawLines = $text -split "`r?`n"
+    if ($null -eq $text) { return @("ファイルが存在しない") }
+    # 最大行数: 改行の数が100000を超える資料も弾く（codexレビュー5回目 M1: 10MB未満でも
+    # 改行密集ファイルで走査コストを膨らませられる。IndexOfループは上限到達で打ち切るため
+    # 爆弾サイズに依存しない。文言・閾値はsh版 wc -l と同一契約=\nの個数）
+    $nl = 0
+    $pos = -1
+    while (($pos = $text.IndexOf("`n", $pos + 1)) -ge 0) {
+        $nl++
+        if ($nl -gt 100000) { return @("全体が最大行数（100000行）超過") }
+    }
+    $reasons = @()
+    if ($text.Length -lt $MinChars) { $reasons += "全体が最小文字数（$MinChars）未満" }
+    # 空白の契約はASCIIの [ \t]（+行末の\r除去1回）のみ: PSの.Trim()/\sはU+00A0等の
+    # Unicode空白も含み、awkの[[:space:]]（Cロケール）と分裂する（codexレビュー5回目 L2）。
+    # 行中に埋め込まれた\rは除去しない=マーカー不一致として拒否（sh版と同一。5回目 L3）。
+    # 分割は\nのみ+各行の末尾\rを1回だけ除去: `r?`nで分割するとEndsWith除去と合わせて
+    # \r\r\n行末のCRを2個消してしまい、1個しか消さないawkと合否が分裂する（6回目 L1）
+    $rawLines = $text -split "`n"
     $lastNonEmpty = ""
     for ($i = $rawLines.Count - 1; $i -ge 0; $i--) {
-        if ($rawLines[$i].Trim().Length -gt 0) { $lastNonEmpty = $rawLines[$i].Trim(); break }
+        $s = $rawLines[$i]
+        if ($s.EndsWith("`r")) { $s = $s.Substring(0, $s.Length - 1) }
+        $s = $s.Trim(' ', "`t")
+        if ($s.Length -gt 0) { $lastNonEmpty = $s; break }
     }
-    if ($lastNonEmpty -ne "<!-- handoff-complete: $Nonce -->") { return $false }
-    $lines = @()
+    # -cne: PSの-ne/-eqは大文字小文字を無視するため、nonce照合はケース厳密にする（sh版と一致）
+    if ($lastNonEmpty -cne "<!-- handoff-complete: $Nonce -->") {
+        $reasons += "完了マーカーが最後の非空行に無い、またはnonceが今回の指示の値と一致しない"
+    }
+    # 状態機械で走査する（sh版awkと同一セマンティクス。codexレビュー3回目 High-1:
+    # per-section走査だとps/shで合否が分裂し、###への必須見出し退避も通ってしまう）
+    # - 必須見出しはh1/h2のみ（###に書いた必須見出しは「無い」扱い）
+    # - 見出し行（###含む）自体は本文に数えない（###1行だけの空セクションを許さない）
+    # - h1/h2の非必須見出しで本文の帰属を打ち切る。###以深は帰属を維持（issue #4）
+    # - 中間配列を作らない単一パス（codexレビュー5回目 M1: 配列+=は二次時間になる）
+    $found = @{}
+    $body = @{}
+    foreach ($name in $script:HANDOFF_REQUIRED_SECTIONS) { $found[$name] = $false; $body[$name] = $false }
+    $cur = $null
     $inFence = $false
-    foreach ($ln in $rawLines) {
-        if ($ln -match '^\s*```') { $inFence = -not $inFence; continue }
-        if (-not $inFence) { $lines += $ln }
+    foreach ($ln0 in $rawLines) {
+        $ln = $ln0
+        if ($ln.EndsWith("`r")) { $ln = $ln.Substring(0, $ln.Length - 1) }
+        if ($ln -cmatch '^[ \t]*```') { $inFence = -not $inFence; continue }
+        if ($inFence) { continue }
+        if ($ln -match '^#') {
+            $matched = $false
+            foreach ($name in $script:HANDOFF_REQUIRED_SECTIONS) {
+                # -cmatch + [ \t]+ 必須: PSの-matchは大文字小文字を無視し\s*は空白ゼロを許すため、
+                # 「## goal」「##Goal」が通ってsh版と合否が分裂していた（codexレビュー4回目 H1）
+                if ($ln -cmatch ('^#{1,2}[ \t]+' + [regex]::Escape($name) + '[ \t]*$')) {
+                    $found[$name] = $true; $cur = $name; $matched = $true; break
+                }
+            }
+            # 帰属打ち切りも [ \t] に限定（\sはU+00A0等も含みsh版[[:space:]]と分裂するため）
+            if (-not $matched -and $ln -cmatch '^#{1,2}[ \t]') { $cur = $null }
+            continue
+        }
+        if ($null -eq $cur) { continue }
+        $t = $ln.Trim(' ', "`t")
+        if ($t.Length -gt 0 -and $t -notmatch '^<!--') { $body[$cur] = $true }
     }
     foreach ($name in $script:HANDOFF_REQUIRED_SECTIONS) {
-        $idx = -1
-        $pattern = '^#{1,3}\s*' + [regex]::Escape($name) + '\s*$'
-        for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match $pattern) { $idx = $i; break }
-        }
-        if ($idx -lt 0) { return $false }
-        $hasBody = $false
-        for ($j = $idx + 1; $j -lt $lines.Count; $j++) {
-            if ($lines[$j] -match '^#{1,3}\s') { break }
-            $t = $lines[$j].Trim()
-            if ($t.Length -gt 0 -and $t -notmatch '^<!--') { $hasBody = $true; break }
-        }
-        if (-not $hasBody) { return $false }
+        if (-not $found[$name]) { $reasons += "見出しが無い: $name" }
+        elseif (-not $body[$name]) { $reasons += "本文が空: $name" }
     }
-    return $true
+    return $reasons
 }
 
 function Invoke-GitCapture {
@@ -210,12 +260,25 @@ function Limit-Text {
 
 function Limit-TextHeadTail {
     param([string]$Text, [int]$Head, [int]$Tail)
-    # 上限超過時は先頭Head+末尾Tailを残す（current.md用: Resume Instructionsが後半にあるため）
+    # 上限超過時は先頭Head+末尾Tailを残す（current.md用: Resume Instructionsが後半にあるため）。
+    # 中略行に省略区間の見出し名を含め、読み手が「何が欠けたか」を認識できるようにする（issue #6）
     if ($null -eq $Text) { return "" }
     if ($Text.Length -le ($Head + $Tail)) { return $Text }
     $h = $Text.Substring(0, $Head)
     $t = $Text.Substring($Text.Length - $Tail)
-    return "$h`n...(中略: 全$($Text.Length)文字)...`n$t"
+    $omitted = $Text.Substring($Head, $Text.Length - $Tail - $Head)
+    # 既知の7必須見出しのみを、正順・重複なしで表示する（codexレビュー3回目 High-2:
+    # 任意の見出し文字列を無制限に載せると、省略部の敵対的見出しが注入文へ復活し、
+    # かつ長さ暴走で末尾予算〔Resume Instructions等〕を押し出せる）。
+    # 任意見出しは配列に収集せず必須名ごとの-cmatch走査にする（codexレビュー4回目 M2:
+    # 大量見出しでの二次的な配列再生成と、-containsの大小無視によるsh版との分裂を排除）
+    $present = @()
+    foreach ($rn in $script:HANDOFF_REQUIRED_SECTIONS) {
+        if ($omitted -cmatch ('(?m)^## ' + [regex]::Escape($rn) + '[ \t]*\r?$')) { $present += $rn }
+    }
+    $info = "全$($Text.Length)文字"
+    if ($present.Count -gt 0) { $info = "$info。省略区間の見出し: " + ($present -join ", ") }
+    return "$h`n...(中略: $info)...`n$t"
 }
 
 

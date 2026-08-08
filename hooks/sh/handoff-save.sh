@@ -11,6 +11,7 @@ MAX_TRANSCRIPT_BYTES=209715200   # 200MB
 MAX_TOTAL_BYTES=524288000        # 500MB
 
 main() {
+    ho_require_jq handoff-save || exit 0
     ho_read_input || exit 0
     handoff_root=$(ho_handoff_root) || exit 0
     project_dir=$(ho_project_dir)

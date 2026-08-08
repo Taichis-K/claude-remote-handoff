@@ -63,11 +63,23 @@ Remote Control中は `/resume` がローカル限定のため、既存ツール�
 **macOS/Linux または手動導入** — [INSTALL.md](INSTALL.md) 参照
 （pwsh版とsh版〔要jq〕があります）。
 
+⚠️ **プラグイン経路はWindows専用です**。macOS/Linuxで `/plugin install` してもフックは
+動作しません（powershell.exe前提のため**静かに失敗**します）。必ずINSTALL.mdの手動導入を
+使ってください。
+
 インストール後に必須の設定（詳細はINSTALL.md）:
 
 1. `setup/setup.ps1`（または `setup.sh`）で**閾値ペアを設定** — 未設定の場合、本ツールは何もしません
 2. セッションで `/autocompact 160000`（setupに渡した値と同じ値）
-3. 権限ルール `Edit(.claude-handoff/**)` の追加を推奨（handoff書き込みの自動許可）
+3. 権限ルール `Edit(.claude-handoff/**)` の追加（**実質必須**: 無いとhandoff作成のたびに
+   許可プロンプトで中断します）
+
+setupは `.gitignore` へマシン/環境固有の4エントリ（`.claude-handoff/`・
+`.claude/handoff-config.json`・`.claude/hooks/claude-remote-handoff/`・
+`.claude/settings.local.json*`）を追記します。
+特に `.claude/handoff-config.json` は**コミットしないでください**: 閾値はモデルの
+コンテキスト窓（200K/1M）とマシンの設定に依存するため、チームで共有すると別モデルの
+環境で「発火しない/早すぎる」原因になります（各マシンでsetupを実行するのが正です）。
 
 ## 既知の限界
 
@@ -85,19 +97,27 @@ Remote Control中は `/resume` がローカル限定のため、既存ツール�
    実行時保証はありません（環境変数が見える場合はbest-effortで再検証します）
 6. **保存データに秘密情報が含まれ得ます**: `.claude-handoff/` にはtranscriptと
    git diffが保存されます。setupが `.gitignore` へ追記しますが、クラウド同期・
-   共有マシン経由の露出は防げません。保持は既定で30日・500MBまでで自動削除されます。
+   共有マシン経由の露出は防げません。保持は既定で30日・500MBまでで自動削除されます
+   （**バックアップ世代だけでなく引き継ぎ資料本体〔current.md〕も削除対象**です。
+   ただしポインタは7日で失効するため、注入経路への影響はありません）。
    手動で消す場合は `.claude-handoff/` ディレクトリを削除してください
    （秘密情報のマスキング機能はありません）
 7. **バックアップの保存はbest-effort**: transcriptが200MBを超える場合・ディスク空き容量が
    不足する場合はコピーを見送ります（meta.jsonに記録）。また `.claude-handoff/` 配下に
    git trackedなファイルがある場合、保存機能全体が無効化されます（error.logに記録）
-8. **未検証の範囲**: auto compact実発火時の通し動作と、Remote Control実機
-   （モバイル/Webからの操作）での通し動作は、手動 `/compact`・`/clear` 相当の
-   検証までに留まっています（同一フックが発火するため低リスクと判断していますが未実測です）
+8. **未検証の範囲**: Remote Control実機（モバイル/Webからの操作）での通し動作は
+   未実測です（同一フックが発火するため低リスクと判断しています）。
+   auto compact実発火→再注入の通し動作は、独立した実地報告2件（Windows/pwsh・macOS/sh、
+   いずれも1Mコンテキスト）で確認済みです
 9. **`/clear` 経路のUX制約**: `/clear` はsession_idごと新規セッションになるため、
    Remote Controlの画面では会話ログが空のセッションに切り替わります（旧セッションの
    ログはその画面からは見えません）。また注入された引き継ぎ資料は次のユーザー入力まで
    読まれないため、自動では作業が再開されません（「続き」など一言送る必要があります）
+10. **複数セッション同時利用時の挙動**: ポインタ（latest.json）はプロジェクト単位で
+    1つのため、同一プロジェクトで複数セッションを並行させると、`/clear` 後に
+    **別セッションが作成した資料**が注入されることがあります。この場合、注入文の冒頭に
+    「※ この資料は別セッション（uuid）で作成されたものです」と明示されるので、
+    内容が現在の作業と一致するか確認してから使ってください
 
 ## 動作要件
 
@@ -108,7 +128,8 @@ Remote Control中は `/resume` がローカル限定のため、既存ツール�
 ## アンインストール
 
 プラグイン導入なら `/plugin uninstall claude-remote-handoff`。手動導入なら
-`.claude/settings.json` から該当フックエントリを除去。いずれも
+`.claude/settings.local.json`（旧手順で導入した場合は `.claude/settings.json`）から
+該当フックエントリを除去。いずれも
 `.claude-handoff/`（保存データ）と `.claude/handoff-config.json`（設定）は
 残るため、不要なら削除してください。
 

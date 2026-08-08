@@ -178,6 +178,12 @@ try {
     $sections = New-Object System.Collections.Generic.List[string]
     $sections.Add("# 引き継ぎコンテキスト自動再注入（claude-remote-handoff / source: $source）")
 
+    # ポインタ経由で自分以外のセッションの資料を注入する場合は冒頭で明示する
+    # （同一プロジェクトで複数セッションを並行させると他セッションの資料が来得る。issue #19）
+    if ($usePointer -and ($null -eq $ownSessionId -or $pointer.session_id -ne $ownSessionId)) {
+        $sections.Add("※ この資料は別セッション（$($pointer.session_id)）で作成されたものです。同一プロジェクトで複数のセッションを併用している場合は、現在の作業に対応する内容か確認してから使うこと。")
+    }
+
     # --- 5. current.md（検証ゲートを通過した場合のみ内容を注入する） ---
     if ($null -ne $currentMdPath -and $gatePassed) {
         $mdText = Get-Content -LiteralPath $currentMdPath -Raw -Encoding UTF8

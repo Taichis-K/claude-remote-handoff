@@ -26,5 +26,32 @@ if ($bad.Count -gt 0) {
     $bad | ForEach-Object { Write-Host "  $_" }
     exit 1
 }
-Write-Host "lint-sh OK: 非ASCII直前の裸の変数展開なし"
+
+# .ps1にも同型の罠がある: PowerShellは変数名にCJK等のUnicode文字・数字を許すため、
+# "$var直後に非ASCIIの文字/数字" は変数名の一部と解釈され、未定義変数=空文字に
+# サイレント展開される（実測: "$reasonPart完了..." が丸ごと消えた）。`${var}` で囲めば安全。
+# `）` `。` 等の記号（punctuation）は変数名に含まれないため対象外
+$badPs = @()
+$psPattern = [regex]'\$[A-Za-z_][A-Za-z0-9_]*'
+Get-ChildItem -Path $DistRoot -Recurse -Filter *.ps1 | ForEach-Object {
+    $file = $_.FullName
+    $lines = [System.IO.File]::ReadAllLines($file, [System.Text.Encoding]::UTF8)
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if ($line -match '^\s*#') { continue }
+        foreach ($m in $psPattern.Matches($line)) {
+            $next = $m.Index + $m.Length
+            if ($next -lt $line.Length -and [int]$line[$next] -gt 127 -and
+                [char]::IsLetterOrDigit($line[$next])) {
+                $badPs += ("{0}:{1}: {2}" -f $file, ($i + 1), $line.Trim())
+            }
+        }
+    }
+}
+if ($badPs.Count -gt 0) {
+    Write-Host "NG: .ps1で非ASCII文字の直前に裸の変数展開があります。PSは非ASCIIを変数名の一部と解釈し空文字に化けるため `${var} で囲んでください"
+    $badPs | ForEach-Object { Write-Host "  $_" }
+    exit 1
+}
+Write-Host "lint-sh OK: 非ASCII直前の裸の変数展開なし（sh/ps1とも）"
 exit 0

@@ -138,4 +138,130 @@ jq --arg u 'not-a-timestamp' 'del(.consumed_at) | .updated_at = $u' "$latest" > 
 o=$(invoke_hook handoff-restore.sh "$restore_in")
 printf 'C13 output=%s\n' "$(out_kind "$o")"
 
-rm -rf "$work"
+# C14: 必須見出し直後の###小見出しを含む正常な資料が検証を通る（issue #4:
+# 以前は###を本文終端と誤認して「本文が空」となり、検証が恒久的に失敗していた）
+sid14="22222222-3333-4444-5555-666666666666"
+t14="$work/t14.jsonl"
+usage_transcript "$t14" 450
+invoke_hook handoff-check.sh "$(stop_input "$sid14" "$t14")" > /dev/null
+nonce14=$(jq -r '.nonce' "$t14.handoff-state.json")
+mkdir -p "$work/proj/.claude-handoff/$sid14"
+sed "s/{{NONCE}}/$nonce14/" "$fixtures/md/good-handoff-subheadings.md.tmpl" > "$work/proj/.claude-handoff/$sid14/current.md"
+o=$(invoke_hook handoff-check.sh "$(stop_input "$sid14" "$t14")")
+printf 'C14 output=%s state=%s\n' "$(out_kind "$o")" "$(get_state "$t14")"
+
+# C15/C16 は理由数のps/sh一致も見るため、検証関数を直接呼ぶ（codexレビュー3回目 High-1）
+. "$hooks_dir/handoff-common.sh"
+count_reasons() { # $1=file $2=nonce
+    _cr=$(ho_incomplete_reasons "$1" "$2")
+    if [ -z "$_cr" ]; then printf '0'; else printf '%s' "$_cr" | awk -F' / ' '{print NF}'; fi
+}
+
+# C15: 必須見出しをすべて###へ退避した資料は拒否される（h1/h2のみが必須見出しとして有効。
+# サイズ・マーカーは正しいため、理由は「見出しが無い」×7 = 7件になるはず）
+sid15="33333333-4444-5555-6666-777777777777"
+t15="$work/t15.jsonl"
+usage_transcript "$t15" 450
+invoke_hook handoff-check.sh "$(stop_input "$sid15" "$t15")" > /dev/null
+nonce15=$(jq -r '.nonce' "$t15.handoff-state.json")
+mkdir -p "$work/proj/.claude-handoff/$sid15"
+sed "s/{{NONCE}}/$nonce15/" "$fixtures/md/bad-handoff-h3.md.tmpl" > "$work/proj/.claude-handoff/$sid15/current.md"
+# 理由数は2回目のフック呼び出し前に数える（呼び出し後はnonceがローテートし件数が変わるため）
+r15=$(count_reasons "$work/proj/.claude-handoff/$sid15/current.md" "$nonce15")
+o=$(invoke_hook handoff-check.sh "$(stop_input "$sid15" "$t15")")
+printf 'C15 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t15")" "$r15"
+
+# C16: 各必須セクションが###小見出し1行だけ（実本文ゼロ）の資料は拒否される（見出し行は
+# 本文に数えない。理由は「本文が空」×7 = 7件になるはず）
+sid16="44444444-5555-6666-7777-888888888888"
+t16="$work/t16.jsonl"
+usage_transcript "$t16" 450
+invoke_hook handoff-check.sh "$(stop_input "$sid16" "$t16")" > /dev/null
+nonce16=$(jq -r '.nonce' "$t16.handoff-state.json")
+mkdir -p "$work/proj/.claude-handoff/$sid16"
+sed "s/{{NONCE}}/$nonce16/" "$fixtures/md/bad-handoff-empty-sections.md.tmpl" > "$work/proj/.claude-handoff/$sid16/current.md"
+r16=$(count_reasons "$work/proj/.claude-handoff/$sid16/current.md" "$nonce16")
+o=$(invoke_hook handoff-check.sh "$(stop_input "$sid16" "$t16")")
+printf 'C16 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t16")" "$r16"
+
+# C17: 見出しの大文字小文字違い（## goal / ## KEY DECISIONS）と空白抜き（##Goal）は
+# すべて拒否される（codexレビュー4回目 H1: PSの-matchの大小無視と\s*の空白ゼロ許容で
+# ps/shの合否が分裂していた。理由は「見出しが無い」×7 = 7件になるはず）
+sid17="55555555-6666-7777-8888-999999999999"
+t17="$work/t17.jsonl"
+usage_transcript "$t17" 450
+invoke_hook handoff-check.sh "$(stop_input "$sid17" "$t17")" > /dev/null
+nonce17=$(jq -r '.nonce' "$t17.handoff-state.json")
+mkdir -p "$work/proj/.claude-handoff/$sid17"
+sed "s/{{NONCE}}/$nonce17/" "$fixtures/md/bad-handoff-casespace.md.tmpl" > "$work/proj/.claude-handoff/$sid17/current.md"
+r17=$(count_reasons "$work/proj/.claude-handoff/$sid17/current.md" "$nonce17")
+o=$(invoke_hook handoff-check.sh "$(stop_input "$sid17" "$t17")")
+printf 'C17 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t17")" "$r17"
+
+# C18: 最大サイズ（10MB）超過のcurrent.mdは内容を読まずに拒否される（codexレビュー4回目 M2:
+# 巨大ファイルによるフックDoS対策。理由は「全体が最大サイズ（10MB）超過」の1件のみ）
+sid18="66666666-7777-8888-9999-aaaaaaaaaaaa"
+t18="$work/t18.jsonl"
+usage_transcript "$t18" 450
+invoke_hook handoff-check.sh "$(stop_input "$sid18" "$t18")" > /dev/null
+nonce18=$(jq -r '.nonce' "$t18.handoff-state.json")
+mkdir -p "$work/proj/.claude-handoff/$sid18"
+awk 'BEGIN { s = sprintf("%0100d", 0); gsub(/0/, "x", s); for (i = 0; i < 115344; i++) print s }' \
+    > "$work/proj/.claude-handoff/$sid18/current.md"
+r18=$(count_reasons "$work/proj/.claude-handoff/$sid18/current.md" "$nonce18")
+o=$(invoke_hook handoff-check.sh "$(stop_input "$sid18" "$t18")")
+printf 'C18 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t18")" "$r18"
+
+# C19: 10MB未満でも行数（改行10万超）が多すぎるcurrent.mdは拒否される（codexレビュー5回目 M1:
+# 改行密集ファイルによる走査コスト膨張の遮断。理由は「全体が最大行数（100000行）超過」の1件のみ）
+sid19="77777777-8888-9999-aaaa-bbbbbbbbbbbb"
+t19="$work/t19.jsonl"
+usage_transcript "$t19" 450
+invoke_hook handoff-check.sh "$(stop_input "$sid19" "$t19")" > /dev/null
+nonce19=$(jq -r '.nonce' "$t19.handoff-state.json")
+mkdir -p "$work/proj/.claude-handoff/$sid19"
+awk 'BEGIN { for (i = 0; i < 200001; i++) print "" }' > "$work/proj/.claude-handoff/$sid19/current.md"
+r19=$(count_reasons "$work/proj/.claude-handoff/$sid19/current.md" "$nonce19")
+o=$(invoke_hook handoff-check.sh "$(stop_input "$sid19" "$t19")")
+printf 'C19 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t19")" "$r19"
+
+# C20: 完了マーカーのnonceに\rを埋め込んだ資料は両実装とも拒否される（codexレビュー5回目 L3:
+# sh版の tr -d '\r' が行中のCRまで削除して受理し、PS版と合否が分裂していた）
+sid20="88888888-9999-aaaa-bbbb-cccccccccccc"
+t20="$work/t20.jsonl"
+usage_transcript "$t20" 450
+invoke_hook handoff-check.sh "$(stop_input "$sid20" "$t20")" > /dev/null
+nonce20=$(jq -r '.nonce' "$t20.handoff-state.json")
+mkdir -p "$work/proj/.claude-handoff/$sid20"
+# nonceの5文字目に\rを埋め込む（index/substrで置換し、sedの\r移植性問題を回避）
+bad20=$(printf '%s' "$nonce20" | awk '{ printf "%s\r%s", substr($0, 1, 4), substr($0, 5) }')
+sed "s/{{NONCE}}/$nonce20/" "$fixtures/md/good-handoff.md.tmpl" \
+    | awk -v old="$nonce20" -v bad="$bad20" \
+        '{ i = index($0, old); if (i > 0) { $0 = substr($0, 1, i - 1) bad substr($0, i + length(old)) } print }' \
+    > "$work/proj/.claude-handoff/$sid20/current.md"
+r20=$(count_reasons "$work/proj/.claude-handoff/$sid20/current.md" "$nonce20")
+o=$(invoke_hook handoff-check.sh "$(stop_input "$sid20" "$t20")")
+printf 'C20 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t20")" "$r20"
+
+# C21: 完了マーカー行の行末を\r\r（+改行）にした資料は両実装とも拒否される（codexレビュー
+# 6回目 L1: PS版が`r?`n分割+末尾\r除去でCRを2個消し、1個しか消さないawkと合否が分裂していた。
+# 契約は「行末の\r除去は1回だけ」。理由はマーカー不一致の1件のみ）
+sid21="99999999-aaaa-bbbb-cccc-dddddddddddd"
+t21="$work/t21.jsonl"
+usage_transcript "$t21" 450
+invoke_hook handoff-check.sh "$(stop_input "$sid21" "$t21")" > /dev/null
+nonce21=$(jq -r '.nonce' "$t21.handoff-state.json")
+mkdir -p "$work/proj/.claude-handoff/$sid21"
+sed "s/{{NONCE}}/$nonce21/" "$fixtures/md/good-handoff.md.tmpl" \
+    | awk -v BINMODE=3 '{ if (index($0, "handoff-complete") > 0) printf "%s\r\r\n", $0; else print }' \
+    > "$work/proj/.claude-handoff/$sid21/current.md"
+r21=$(count_reasons "$work/proj/.claude-handoff/$sid21/current.md" "$nonce21")
+o=$(invoke_hook handoff-check.sh "$(stop_input "$sid21" "$t21")")
+printf 'C21 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t21")" "$r21"
+
+# KEEP_WORK=1 で作業ディレクトリを残す（失敗ケースの成果物調査用。issue #16）
+if [ -z "${KEEP_WORK:-}" ]; then
+    rm -rf "$work"
+else
+    printf 'KEEP_WORK: 作業ディレクトリを残しました: %s\n' "$work" >&2
+fi

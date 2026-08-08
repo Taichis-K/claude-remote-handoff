@@ -12,7 +12,11 @@ MARGIN="${4:-10000}"
 PCT="${5:-92}"
 PROJ="${6:-.}"
 MIN_VERSION="2.1.163"
-IGNORE_ENTRY=".claude-handoff/"
+# 4エントリとも「マシン/環境固有」でコミット対象外（setup.ps1と同一。詳細はps版コメント参照）
+IGNORE_ENTRIES=".claude-handoff/
+.claude/handoff-config.json
+.claude/hooks/claude-remote-handoff/
+.claude/settings.local.json*"
 
 fail() { printf 'NG: %s\n' "$1" >&2; exit 1; }
 
@@ -33,10 +37,19 @@ for v in "$WINDOW" "$SOFT" "$HARD" "$MARGIN" "$PCT"; do
 done
 [ "$SOFT" -gt 0 ] && [ "$HARD" -gt 0 ] && [ "$SOFT" -le "$HARD" ] || fail "閾値が不正です: soft($SOFT) <= hard($HARD) かつ両方正の値にしてください"
 [ "$PCT" -ge 1 ] && [ "$PCT" -le 100 ] || fail "発火%は1-100にしてください"
+# フック側の実行時検証と同じ上限（1e9）。ここで通してもフックが設定全体を拒否するため、
+# 生成側でも同じ契約で弾く（codexレビュー4回目 M3）
+MAX_TOKEN=1000000000
+[ "$WINDOW" -gt 0 ] 2>/dev/null || fail "windowは正の値にしてください"
+for v in "$WINDOW" "$SOFT" "$HARD" "$MARGIN"; do
+    [ "$v" -le "$MAX_TOKEN" ] 2>/dev/null || fail "数値が上限 $MAX_TOKEN を超えています: ${v}（フック側の実行時検証と同じ上限。超えた設定は実行時に全体が拒否されます）"
+done
 fire_point=$((WINDOW * PCT / 100))
 if [ $((HARD + MARGIN)) -ge "$fire_point" ]; then
     printf '静的検証NG:\n  ハード閾値(%s) + 最低マージン(%s) >= 発火点(%s = window %s x %s%%)\n' "$HARD" "$MARGIN" "$fire_point" "$WINDOW" "$PCT" >&2
     printf '  この組合せではhandoff作成がauto compactに間に合わない可能性があるため、設定を書き込みません。\n' >&2
+    printf '  閾値を下げるか、autocompact値を上げてください（例: /autocompact %s 以上）\n' "$((HARD * 125 / 100))" >&2
+    printf '  この window(%s)・margin(%s)・pct(%s) のままなら、ハード閾値は最大 %s まで設定できます\n' "$WINDOW" "$MARGIN" "$PCT" "$((fire_point - MARGIN - 1))" >&2
     exit 1
 fi
 printf 'OK: 静的検証（hard %s + margin %s < 発火点 %s）\n' "$HARD" "$MARGIN" "$fire_point"
@@ -60,23 +73,36 @@ printf '  Claude Code側でも autocompact を設定してください: /autocom
 # --- 3. .gitignore追記（重複チェック・git未導入/リポジトリ外はスキップ） ---
 if command -v git >/dev/null 2>&1 && git -C "$PROJ" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     gi="$PROJ/.gitignore"
-    if [ -f "$gi" ] && grep -Eq '^[[:space:]]*\.claude-handoff/?[[:space:]]*$' "$gi"; then
-        printf 'OK: .gitignore に %s は追記済み\n' "$IGNORE_ENTRY"
-    else
-        # 末尾に改行が無い場合に備えて追記前に改行を保証する
-        [ -f "$gi" ] && [ -n "$(tail -c 1 "$gi" 2>/dev/null)" ] && printf '\n' >> "$gi"
-        printf '%s\n' "$IGNORE_ENTRY" >> "$gi"
-        printf 'OK: .gitignore に %s を追記しました\n' "$IGNORE_ENTRY"
-    fi
-    if [ -n "$(git -C "$PROJ" ls-files -- .claude-handoff 2>/dev/null)" ]; then
-        printf '警告: .claude-handoff 配下にgit trackedなファイルがあります。バックアップが無効化されるため整理してください\n' >&2
-    fi
+    printf '%s\n' "$IGNORE_ENTRIES" | while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        bare="${entry%/}"
+        # 前後空白をtrimした行単位の完全一致（末尾スラッシュ有無の両形を許容）= ps版と同一判定。
+        # CRLFの.gitignoreでも判定できるよう\rもtrimする（codexレビュー3回目 Low-7）
+        if [ -f "$gi" ] && awk -v e="$entry" -v b="$bare" \
+            '{ t=$0; gsub(/^[ \t\r]+|[ \t\r]+$/, "", t); if (t == e || t == b) { found=1; exit } } END { exit !found }' "$gi"; then
+            printf 'OK: .gitignore に %s は追記済み\n' "$entry"
+        else
+            # 末尾に改行が無い場合に備えて追記前に改行を保証する
+            [ -f "$gi" ] && [ -n "$(tail -c 1 "$gi" 2>/dev/null)" ] && printf '\n' >> "$gi"
+            printf '%s\n' "$entry" >> "$gi"
+            printf 'OK: .gitignore に %s を追記しました\n' "$entry"
+        fi
+    done
+    # 既にtrackedなファイルはgitignoreだけでは外れないため警告（git rm --cached等は自動では行わない）
+    for target in .claude-handoff .claude/handoff-config.json .claude/hooks/claude-remote-handoff .claude/settings.local.json; do
+        if [ -n "$(git -C "$PROJ" ls-files -- "$target" 2>/dev/null)" ]; then
+            extra=""
+            [ "$target" = ".claude-handoff" ] && extra="（trackedのままだとバックアップ保存が無効化されます）"
+            printf '警告: %s がgit trackedです。gitignoreだけでは外れないため git rm --cached で整理してください%s\n' "$target" "$extra" >&2
+        fi
+    done
 else
     printf 'SKIP: gitリポジトリではない（または git 未導入）ため .gitignore 追記をスキップ\n'
 fi
 
 printf '\nセットアップ完了。残りの手動確認:\n'
 printf '  1. Claude Codeで /autocompact %s を設定\n' "$WINDOW"
-printf '  2. .claude/settings.json の permissions.allow に "Edit(.claude-handoff/**)" を追加推奨\n'
+printf '  2. permissions.allow に "Edit(.claude-handoff/**)" を追加（実質必須: 無いとhandoff作成のたびに許可プロンプトで中断。チームで共有するなら .claude/settings.json、共有しないなら .claude/settings.local.json）\n'
 printf '  3. このプロジェクトで一度Claude Codeを対話起動しtrustを承認（未trustだと許可ルールが無視されます）\n'
+printf '  4. /hooks で5エントリ（PreCompact / SessionStart x3 / Stop）の登録を確認（見えなければClaude Codeを再起動）\n'
 exit 0

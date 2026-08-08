@@ -23,8 +23,9 @@ instruction_common() {
     cat <<EOF
 書き先は次の絶対パス固定: $1 （このパス以外の既存ファイル、特にプロジェクトルートのHANDOFF.mdには書かないこと）。
 記載セクション（この7見出しをすべて \`## 見出し名\` の形で含め、各セクションに本文を書くこと）: Goal / Completed / Not Yet Done / Failed Approaches / Key Decisions / Current State / Resume Instructions。
+分量の目安: 全体で5000文字以内。長い資料は再注入時に中央（Failed Approaches / Key Decisions付近）から省略されるため、失敗した方法と決定理由ほど簡潔・確実に残すこと。
 ファイルの最終行として完了マーカー行 <!-- handoff-complete: $2 --> を必ず書くこと。
-恒久的な決定事項があればCLAUDE.mdへも反映すること。
+恒久的な決定事項は反映先を選ぶこと: チーム共有すべき決定はCLAUDE.mdへ、このマシン・個人に固有の決定はCLAUDE.local.mdへ（無ければ作成し、.gitignoreへCLAUDE.local.mdを追加）。共有ファイルを編集してよいか判断できない場合は編集せず、本資料のKey Decisionsに記載するに留めること。
 完成したらユーザーへ次を案内して停止すること:「引き継ぎ資料が完成しました。Remote Control中や会話ログを残したい場合はこのまま続行してください（放置すればauto compactが働き、資料は圧縮後のコンテキストへ自動注入されます）。トークン消費を節約したい場合は /clear を実行してください（消費ゼロで資料が自動注入されます。ただし会話ログは新しい空のセッションに切り替わり、次に一言送るまで作業は自動再開されません）」
 EOF
 }
@@ -34,7 +35,7 @@ emit_context() {
     jq -Rs '{hookSpecificOutput: {hookEventName: "Stop", additionalContext: .}}'
 }
 
-# ハード指示発行: $1=statePath $2=handoffMd $3=attempt
+# ハード指示発行: $1=statePath $2=handoffMd $3=attempt [$4=前回の検証NG理由]
 emit_hard() {
     mkdir -p "$(dirname "$2")" 2>/dev/null
     _n=$(ho_uuid)
@@ -43,13 +44,16 @@ emit_hard() {
     {
         printf 'コンテキスト使用量がハード閾値を超えました。auto compactで作業精度が落ちる前に、今の作業を一旦止めて引き継ぎ資料を作成してください。\n'
         if [ "$3" -gt 1 ]; then
-            printf '（前回の指示では完了マーカー付きの完全な引き継ぎ資料を確認できなかった。今回は必ず全7セクション+最終行マーカーで完成させること。試行 %s/%s）\n' "$3" "$MAX_ATTEMPTS"
+            _rp=""
+            [ -n "${4:-}" ] && _rp="前回の検証NG理由: ${4}。"
+            printf '（%s完了マーカーのnonceは試行ごとに更新される — 必ず今回の指示にある値を使うこと。試行 %s/%s）\n' "$_rp" "$3" "$MAX_ATTEMPTS"
         fi
         instruction_common "$2" "$_n"
     } | emit_context
 }
 
 main() {
+    ho_require_jq handoff-check || exit 0
     ho_read_input || exit 0
     handoff_root=$(ho_handoff_root) || exit 0
     project_dir=$(ho_project_dir)
@@ -62,13 +66,17 @@ main() {
     # --- 設定読込み（明示設定必須・値検証。不正は安全側に無効化） ---
     config_path="$project_dir/.claude/handoff-config.json"
     [ -f "$config_path" ] || exit 0
+    # 全数値項目を「JSON numberかつ整数かつ実用上限1e9以下」で検証（PS版Get-ConfigLongと同一契約。
+    # codexレビュー3回目 Medium-3: 型・整数性・上限の検証分裂とオーバーフロー対策）
     config_ok=$(jq -r '
+        def okint(min; max): type == "number" and . == floor and . >= min and . <= max;
         if type == "object"
-           and (.soft_threshold | type == "number" and . > 0)
-           and (.hard_threshold | type == "number" and . > 0)
+           and (.soft_threshold | okint(1; 1000000000))
+           and (.hard_threshold | okint(1; 1000000000))
            and (.soft_threshold <= .hard_threshold)
-           and ((has("min_margin") | not) or (.min_margin | type == "number" and . >= 0))
-           and ((has("conservative_fire_pct") | not) or (.conservative_fire_pct | type == "number" and . >= 1 and . <= 100))
+           and ((has("min_margin") | not) or (.min_margin | okint(0; 1000000000)))
+           and ((has("conservative_fire_pct") | not) or (.conservative_fire_pct | okint(1; 100)))
+           and ((has("autocompact_window") | not) or (.autocompact_window | okint(1; 1000000000)))
         then "ok" else "bad" end' "$config_path" 2>/dev/null)
     if [ "$config_ok" != "ok" ]; then
         ho_error "$handoff_root" "handoff-check" "handoff-config.jsonが不正。機能を無効化中"
@@ -77,18 +85,32 @@ main() {
     soft=$(jq -r '.soft_threshold' "$config_path")
     hard=$(jq -r '.hard_threshold' "$config_path")
     min_margin=$(jq -r '.min_margin // 10000' "$config_path")
-    pct=$(jq -r '.conservative_fire_pct // 80' "$config_path")
+    # 既定92はsetupと同一（config手書きで省略時に静かに無効化されないため。issue #8）
+    pct=$(jq -r '.conservative_fire_pct // 92' "$config_path")
 
-    # 実行時best-effort再検証（環境変数が見える場合のみ）
-    if [ -n "$CLAUDE_CODE_AUTO_COMPACT_WINDOW" ] && printf '%s' "$CLAUDE_CODE_AUTO_COMPACT_WINDOW" | grep -Eq '^[0-9]+$'; then
-        w="$CLAUDE_CODE_AUTO_COMPACT_WINDOW"
-        if [ -n "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" ] && printf '%s' "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" | grep -Eq '^[0-9]+$' \
+    # 実行時best-effort再検証: 環境変数を最優先、見えない場合はconfigのautocompact_windowで
+    # 同じ検証を行う（env不可視環境で検証が丸ごとスキップされる穴を塞ぐ。issue #9）
+    check_window=""
+    window_source=""
+    # env値は桁数を先に制限（巨大数の算術ラップ回避）+ 上限1e9（PS版と同一）
+    if [ -n "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" ] && printf '%s' "$CLAUDE_CODE_AUTO_COMPACT_WINDOW" | grep -Eq '^[0-9]{1,10}$' \
+        && [ "$CLAUDE_CODE_AUTO_COMPACT_WINDOW" -gt 0 ] 2>/dev/null \
+        && [ "$CLAUDE_CODE_AUTO_COMPACT_WINDOW" -le 1000000000 ] 2>/dev/null; then
+        check_window="$CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+        window_source="env"
+    else
+        # configのautocompact_windowはconfig_ok検証済み（number・整数・1..1e9）
+        cw=$(jq -r '.autocompact_window // empty' "$config_path" 2>/dev/null)
+        if [ -n "$cw" ]; then check_window="$cw"; window_source="config"; fi
+    fi
+    if [ -n "$check_window" ]; then
+        if [ -n "${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-}" ] && printf '%s' "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" | grep -Eq '^[0-9]+$' \
             && [ "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" -ge 1 ] && [ "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" -le 100 ]; then
             pct="$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
         fi
-        fire_point=$((w * pct / 100))
+        fire_point=$((check_window * pct / 100))
         if [ $((hard + min_margin)) -ge "$fire_point" ]; then
-            ho_error "$handoff_root" "handoff-check" "実行時再検証NG: ハード閾値$hard+マージン$min_margin >= 発火点${fire_point}（window=$w pct=${pct}）。無効化中"
+            ho_error "$handoff_root" "handoff-check" "実行時再検証NG: ハード閾値$hard+マージン$min_margin >= 発火点${fire_point}（window=$check_window source=$window_source pct=${pct}）。無効化中"
             exit 0
         fi
     fi
@@ -106,6 +128,8 @@ main() {
                and ((has("failed") | not) or (.failed | type == "boolean"))
             then "ok" else "bad" end' "$state_path" 2>/dev/null)
         if [ "$state_ok" != "ok" ]; then
+            # 無言で消すと手がかりが残らない（issue #20）ためerror.logに記録する
+            ho_error "$handoff_root" "handoff-check" "不正なhandoff-stateを破棄して再生成します（${state_path}）"
             rm -f "$state_path" 2>/dev/null
             [ "$(ho_field stop_hook_active)" = "true" ] && exit 0
             state_ok="none"
@@ -145,7 +169,9 @@ main() {
                 fi
                 exit 0
             fi
-            emit_hard "$state_path" "$handoff_md" $((s_attempts + 1))
+            # 検証NGの理由を次の指示文へ含める（同じ書き方の再試行で枠を浪費させない。issue #5）
+            fail_reasons=$(ho_incomplete_reasons "$handoff_md" "$s_nonce")
+            emit_hard "$state_path" "$handoff_md" $((s_attempts + 1)) "$fail_reasons"
             exit 0
         fi
         # ソフト未完了は追わない。ただしハード閾値到達でエスカレーション

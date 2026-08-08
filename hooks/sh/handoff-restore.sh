@@ -12,6 +12,7 @@ GIT_TIMEOUT_SEC=10
 POINTER_MAX_AGE_DAYS=7
 
 main() {
+    ho_require_jq handoff-restore || exit 0
     ho_read_input || exit 0
     handoff_root=$(ho_handoff_root) || exit 0
     project_dir=$(ho_project_dir)
@@ -144,11 +145,31 @@ main() {
 
     out="# 引き継ぎコンテキスト自動再注入（claude-remote-handoff / source: ${source_kind}）"
 
+    # ポインタ経由で自分以外のセッションの資料を注入する場合は冒頭で明示する
+    # （同一プロジェクトで複数セッションを並行させると他セッションの資料が来得る。issue #19）
+    if [ "$use_pointer" = "yes" ] && { [ -z "$own_sid" ] || [ "$p_sid" != "$own_sid" ]; }; then
+        out="$out
+
+※ この資料は別セッション（${p_sid}）で作成されたものです。同一プロジェクトで複数のセッションを併用している場合は、現在の作業に対応する内容か確認してから使うこと。"
+    fi
+
     # --- 5. current.md（ゲート通過時のみ内容を注入） ---
+    # 中略行に省略区間の見出し名を含める（issue #6）。表示は既知の7必須見出しのみ・
+    # 正順・重複なし（codexレビュー3回目 High-2: 任意見出しの無制限表示は注入・肥大の経路）。
+    # 任意見出しの文字列は収集せず「## 必須名」の行単位完全一致（大小厳密・末尾空白のみ許容）で
+    # 存在確認する（codexレビュー4回目 M2。PS版Limit-TextHeadTailと同一契約）
     if [ -n "$current_md" ] && [ "$gate" = "yes" ]; then
-        md_body=$(jq -Rs --argjson h "$BUDGET_CURRENT_HEAD" --argjson t "$BUDGET_CURRENT_TAIL" '
+        md_body=$(jq -Rs --argjson h "$BUDGET_CURRENT_HEAD" --argjson t "$BUDGET_CURRENT_TAIL" \
+            --argjson req '["Goal","Completed","Not Yet Done","Failed Approaches","Key Decisions","Current State","Resume Instructions"]' '
             if length <= ($h + $t) then .
-            else .[0:$h] + "\n...(中略: 全" + (length | tostring) + "文字)...\n" + .[(length - $t):]
+            else
+              ( [ .[($h):(length - $t)] | split("\n")[] | sub("\r$"; "") | sub("[ \t]+$"; "") ] ) as $ls
+              | ( [ $req[] | select(("## " + .) as $hl | $ls | index($hl)) ] | join(", ") ) as $names
+              | .[0:$h]
+                + "\n...(中略: 全" + (length | tostring) + "文字"
+                + (if ($names | length) > 0 then "。省略区間の見出し: " + $names else "" end)
+                + ")...\n"
+                + .[(length - $t):]
             end' "$current_md" | jq -r .)
         out="$out
 

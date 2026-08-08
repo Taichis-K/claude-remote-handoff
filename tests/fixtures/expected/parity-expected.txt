@@ -11,3 +11,11 @@ C10 output=refused
 C11 output=none
 C12 output=none
 C13 output=none
+C14 output=none state=completed
+C15 output=hard-retry state=hard/2 reasons=7
+C16 output=hard-retry state=hard/2 reasons=7
+C17 output=hard-retry state=hard/2 reasons=7
+C18 output=hard-retry state=hard/2 reasons=1
+C19 output=hard-retry state=hard/2 reasons=1
+C20 output=hard-retry state=hard/2 reasons=1
+C21 output=hard-retry state=hard/2 reasons=1
