@@ -1,0 +1,6 @@
+{"type":"assistant","isSidechain":false,"message":{"usage":{"input_tokens":100,"cache_read_input_tokens":50,"cache_creation_input_tokens":10,"output_tokens":20}}}
+{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":9000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}
+{"type":"assistant","isSidechain":false,"message":{"usage":{"input_tokens":100}}}
+{"type":"assistant","isSidechain":false,"message":{"usage":{"input_tokens":true,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}
+{"broken json line
+{"type":"user","isSidechain":false,"message":{"role":"user","content":"直近メッセージ1: 機能Aを実装して"}}

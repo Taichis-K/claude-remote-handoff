@@ -1,0 +1,15 @@
+{
+  "name": "claude-remote-handoff",
+  "description": "Automatic, threshold-triggered context handoffs for Claude Code Remote Control sessions (plugin is Windows only; macOS/Linux use manual install)",
+  "owner": {
+    "name": "Taichis-K",
+    "url": "https://github.com/Taichis-K"
+  },
+  "plugins": [
+    {
+      "name": "claude-remote-handoff",
+      "source": "./",
+      "description": "[Windows only] Automatic, threshold-triggered context handoffs for Claude Code Remote Control sessions. macOS/Linux: manual install per INSTALL.md"
+    }
+  ]
+}

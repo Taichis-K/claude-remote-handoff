@@ -1,0 +1,10 @@
+C1 output=none state=none
+C2 output=soft state=soft/1
+C3 output=none state=soft/1
+C4 output=hard state=hard/1
+C5 output=hard-retry state=hard/2
+C6 output=none state=completed latest-nonce=yes sha=yes
+C7 output=hard-retry state=hard/2
+C8 output=injected goal=yes consumed=yes
+C9 output=none
+C10 output=refused

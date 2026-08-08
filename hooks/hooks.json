@@ -1,0 +1,63 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                     "${CLAUDE_PLUGIN_ROOT}/hooks/ps/handoff-save.ps1"]
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                     "${CLAUDE_PLUGIN_ROOT}/hooks/ps/handoff-restore.ps1"]
+          }
+        ]
+      },
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                     "${CLAUDE_PLUGIN_ROOT}/hooks/ps/handoff-restore.ps1"]
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                     "${CLAUDE_PLUGIN_ROOT}/hooks/ps/handoff-reset.ps1"]
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                     "${CLAUDE_PLUGIN_ROOT}/hooks/ps/handoff-check.ps1"]
+          }
+        ]
+      }
+    ]
+  }
+}
