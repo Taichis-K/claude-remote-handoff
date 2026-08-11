@@ -12,9 +12,11 @@ try {
     $inp = Read-HookInput
     if ($null -eq $inp) { exit 0 }
     $handoffRoot = Get-HandoffRoot $inp
-    if ($inp.PSObject.Properties["transcript_path"] -and -not [string]::IsNullOrEmpty($inp.transcript_path)) {
-        $sf = "$($inp.transcript_path).handoff-state.json"
-        if (Test-Path $sf) { Remove-Item $sf -Force }
+    if ((Test-HoProp $inp "transcript_path")) {
+        # 削除対象はprojects_root配下の包含ゲートを通った実在通常ファイルのみ（issue #33:
+        # 従来は任意パス+固定サフィックスを削除できた — 挙動変更）。ゲートNGは黙って何もしない
+        $sf = Get-ValidStateFilePath -TranscriptPath $inp.transcript_path -Mode "delete"
+        if ($null -ne $sf) { Remove-Item -LiteralPath $sf -Force }
     }
 } catch {
     Write-HandoffError $handoffRoot "handoff-reset" "$($_.Exception.GetType().Name): $($_.Exception.Message)"

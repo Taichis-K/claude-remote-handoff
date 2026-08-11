@@ -25,11 +25,11 @@ try {
 
     # session_idはパス結合に使うためUUID形式のみ許可（不正値は定数"unknown"に落とす）
     $sessionId = "unknown"
-    if ($inp.PSObject.Properties["session_id"] -and (Test-Uuid $inp.session_id)) {
+    if ((Test-HoProp $inp "session_id") -and (Test-Uuid $inp.session_id)) {
         $sessionId = $inp.session_id
     }
     $transcript = $null
-    if ($inp.PSObject.Properties["transcript_path"]) { $transcript = $inp.transcript_path }
+    if ((Test-HoProp $inp "transcript_path") -and ($inp.transcript_path -is [string])) { $transcript = $inp.transcript_path }
 
     if (-not (Test-Path $handoffRoot)) {
         New-Item -ItemType Directory -Force -Path $handoffRoot | Out-Null
@@ -105,8 +105,9 @@ try {
     }
 
     # 3. メタデータ（原子的書き込み）
+    # 文字列以外のtriggerは空にする（shのho_string_fieldと同一契約 — 罠8の型固定）
     $trigger = ""
-    if ($inp.PSObject.Properties["trigger"]) { $trigger = $inp.trigger }
+    if ((Test-HoProp $inp "trigger") -and ($inp.trigger -is [string])) { $trigger = $inp.trigger }
     $meta = @{
         saved_at        = (Get-Date).ToString("yyyy-MM-ddTHH:mm:sszzz")
         session_id      = $sessionId
@@ -134,15 +135,16 @@ try {
             Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    # 4c. 孤児状態ファイルの掃除（自ツールのファイル名パターンに完全一致するもののみ）
-    if ($null -ne $transcript) {
-        $tdir = Split-Path $transcript -Parent
-        if (Test-Path -LiteralPath $tdir) {
-            Get-ChildItem -LiteralPath $tdir -Filter "*.handoff-state.json" -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.LastWriteTime -lt $cutoff } | ForEach-Object {
-                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-                }
-        }
+    # 4c. 孤児状態ファイルの掃除（自ツールのファイル名パターンに完全一致するもののみ）。
+    # 対象ディレクトリはtranscript_pathが包含ゲートを通る場合のみ採用し（issue #33 —
+    # 従来は任意ディレクトリを掃除対象にできた）、reparse point（symlink等）は削除しない
+    $validState = Get-ValidStateFilePath -TranscriptPath $transcript -Mode "write"
+    if ($null -ne $validState) {
+        $tdir = $validState.Substring(0, $validState.LastIndexOf("/"))
+        Get-ChildItem -LiteralPath $tdir -Filter "*.handoff-state.json" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cutoff -and (Test-RegularFile $_.FullName) } | ForEach-Object {
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+            }
     }
     # 4d. 全セッション横断の合計容量上限。超過時は古いセッション（現セッション以外）から削除
     $total = [long]0
@@ -150,7 +152,7 @@ try {
     if ($null -ne $files) { $total = ($files | Measure-Object -Sum Length).Sum }
     if ($total -gt $MAX_TOTAL_BYTES) {
         $sessionDirs = Get-ChildItem -LiteralPath $handoffRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne $sessionId } | Sort-Object LastWriteTime
+            Where-Object { -not (Test-OrdinalEqual $_.Name $sessionId) } | Sort-Object LastWriteTime
         foreach ($s in $sessionDirs) {
             if ($total -le $MAX_TOTAL_BYTES) { break }
             $sz = [long]0

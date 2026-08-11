@@ -16,9 +16,9 @@ main() {
     handoff_root=$(ho_handoff_root) || exit 0
     project_dir=$(ho_project_dir)
 
-    session_id=$(ho_field session_id)
+    session_id=$(ho_string_field session_id)
     ho_is_uuid "$session_id" || session_id="unknown"
-    transcript=$(ho_field transcript_path)
+    transcript=$(ho_path_field transcript_path)
 
     mkdir -p "$handoff_root" 2>/dev/null || exit 0
 
@@ -77,7 +77,7 @@ main() {
     fi
 
     # 3. メタデータ（原子的書き込み）
-    trigger=$(ho_field trigger)
+    trigger=$(ho_string_field trigger)
     jq -n --arg sa "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg sid "$session_id" --arg tg "$trigger" \
           --arg tp "$transcript" --argjson it "$items" \
         '{saved_at: $sa, session_id: $sid, trigger: $tg, transcript_path: $tp, items: $it}' \
@@ -96,9 +96,11 @@ main() {
         [ -z "$newest" ] && rm -rf "$d" 2>/dev/null
     done
 
-    # 4c. 孤児状態ファイルの掃除（自ツールのパターンに完全一致するもののみ）
-    if [ -n "$transcript" ]; then
-        tdir=$(dirname "$transcript")
+    # 4c. 孤児状態ファイルの掃除（自ツールのパターンに完全一致するもののみ）。
+    # 対象ディレクトリはtranscript_pathが包含ゲートを通る場合のみ採用する（issue #33 —
+    # 従来は任意ディレクトリを掃除対象にできた）。-type fはsymlinkを対象にしない
+    if _vsp=$(ho_valid_state_path "$transcript" write); then
+        tdir="${_vsp%/*}"
         find "$tdir" -maxdepth 1 -name "*.handoff-state.json" -type f -mtime +"$RETENTION_DAYS" 2>/dev/null \
             -exec rm -f {} \; 2>/dev/null
     fi

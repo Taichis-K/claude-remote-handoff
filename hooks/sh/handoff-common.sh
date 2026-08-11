@@ -26,11 +26,27 @@ ho_field() {
     printf '%s' "$HO_INPUT" | jq -r --arg k "$1" '.[$k] // empty' 2>/dev/null
 }
 
+# 文字列フィールド専用の取得: 文字列以外の型（配列・boolean・number等）は空扱い
+# （PS版の -is [string] ガードと同一契約。ho_fieldは非文字列をjqの出力表現で返すため、
+# パス等に使うとPS版と挙動が分裂し得る — 罠8の型固定）
+ho_string_field() {
+    printf '%s' "$HO_INPUT" | jq -r --arg k "$1" '.[$k] | if type == "string" then . else "" end' 2>/dev/null
+}
+
+# パス用フィールド取得: 文字列型かつC0制御文字/DELを含まない場合のみ返す（それ以外は空）。
+# シェルのコマンド置換は末尾LFを剥がすため、ho_string_fieldでは「末尾改行入りパス」が
+# 「改行なしの有効パス」へ化け、生値を保持して字句ゲートで拒否するPS版と受否が分裂する
+# （codexレビュー#33-4 L2）。制御文字の検査は値がシェルへ出る前にjq内で行う
+ho_path_field() {
+    printf '%s' "$HO_INPUT" | jq -r --arg k "$1" \
+        '.[$k] | if type == "string" and (test("[\u0000-\u001f\u007f]") | not) then . else "" end' 2>/dev/null
+}
+
 ho_project_dir() {
     if [ -n "$CLAUDE_PROJECT_DIR" ]; then
         printf '%s' "$CLAUDE_PROJECT_DIR"
     else
-        ho_field cwd
+        ho_string_field cwd
     fi
 }
 
@@ -59,12 +75,27 @@ ho_error() {
 
 # 原子的書き込み: stdinの内容を$1へ（tmp→rename。tmp名は短いランダム名 — MAX_PATH対策はPS版と同じ思想）
 ho_write_atomic() {
+    # テスト用シーム: 書き込み失敗経路をパリティ試験で決定的に再現する（C61）
+    if [ "${HANDOFF_TEST_FORCE_WRITE_FAIL:-}" = "1" ]; then
+        cat > /dev/null
+        return 1
+    fi
     _dst="$1"
     _dir=$(dirname "$_dst")
     _tmp="$_dir/~ho.$$.$(od -An -N4 -tx4 /dev/urandom 2>/dev/null | tr -d ' \n' || echo $$).tmp"
     cat > "$_tmp" || { rm -f "$_tmp"; return 1; }
     mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; return 1; }
     return 0
+}
+
+# 文字列全体が1〜10桁のASCII数字であることを検証する（環境変数ゲート用 — issue #32）。
+# grep -Eq は行単位一致のため改行混入値（"LF500"等）の1行が通ってしまう。caseは全文一致。
+# 文字クラスはロケール照合順の影響を避けるため範囲でなく列挙で書く
+ho_is_uint_token() {
+    case "$1" in
+        ''|*[!0123456789]*) return 1 ;;
+    esac
+    [ ${#1} -le 10 ]
 }
 
 ho_is_uuid() {
@@ -94,8 +125,188 @@ ho_under_root() {
     esac
 }
 
+# --- transcript由来の状態ファイルパス包含ゲート（issue #33） ---
+# transcript_pathはhook入力由来の非信頼値であり、固定サフィックス連結のままでは
+# 「任意パス+.handoff-state.json」の削除・作成ができてしまう。削除・書込みの対象を
+# projects_root（CLAUDE_CONFIG_DIR、無ければ (USERPROFILE|HOME)/.claude、+ /projects）
+# 配下の正規パスに限定する（設計文書4.8のうち#33スコープ分。transcript読取り系は#36で再評価）。
+# 検証・操作とも「\」→「/」正規化後のパスで統一し、包含判定はbyte厳密・要素境界。
+# PS版 Get-ValidStateFilePath / Test-HandoffPathToken / Get-ClaudeProjectsRoot と同一契約
+
+HO_STATE_SUFFIX=".handoff-state.json"
+
+# 完全性ファイルの既知キー集合（issue #38 — 設計文書4.2/4.3/4.4。閉じたスキーマ）。
+# jqの --argjson known へ渡すJSON配列リテラル。ポインタの handoff_path / size は
+# 移行期間用の受理専用キー（無検証・不使用）。照合はjqのキー完全一致
+# （大小違いキーは未知キー — issue #37の契約と整合）
+HO_POINTER_KNOWN_KEYS='["schema_version","session_id","nonce","sha256","transcript_path","updated_epoch","updated_at","consumed","consumed_at","handoff_path","size"]'
+HO_STATE_KNOWN_KEYS='["schema_version","mode","nonce","attempts","completed","failed"]'
+HO_CONFIG_KNOWN_KEYS='["soft_threshold","hard_threshold","min_margin","conservative_fire_pct","autocompact_window"]'
+
+ho_projects_root() {
+    # 解決不能・字句不正は失敗（fail-closed）。優先順はPS版と同一。
+    # 正規化は「\→/」+末尾スラッシュ全除去+空拒否（PS版と同一規則。片側だけ
+    # "//"や"/tmp/cfg//"を受理する分裂を防ぐ — codexレビュー#33-1 L3）。
+    # 改行入りの生値はコマンド置換 $( ) が末尾LFを剥がし「改行を含まない値」として
+    # 通ってしまう（PS版は拒否 — 分裂）ため、置換に通す前に全域拒否する（#33-2 L2）
+    _lf=$(printf '\nX'); _lf="${_lf%X}"
+    if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+        _b="$CLAUDE_CONFIG_DIR"
+    else
+        if [ -n "${USERPROFILE:-}" ]; then
+            _h="$USERPROFILE"
+        elif [ -n "${HOME:-}" ]; then
+            _h="$HOME"
+        else
+            return 1
+        fi
+        case "$_h" in *"$_lf"*) return 1 ;; esac
+        _h=$(printf '%s' "$_h" | tr '\\' '/')
+        while [ "${_h%/}" != "$_h" ]; do _h="${_h%/}"; done
+        _b="$_h/.claude"
+    fi
+    case "$_b" in *"$_lf"*) return 1 ;; esac
+    _b=$(printf '%s' "$_b" | tr '\\' '/')
+    while [ "${_b%/}" != "$_b" ]; do _b="${_b%/}"; done
+    [ -n "$_b" ] || return 1
+    _r="$_b/projects"
+    ho_path_token_ok "$_r" || return 1
+    printf '%s' "$_r"
+}
+
+ho_path_token_ok() {
+    # 字句検査: 制御文字（C0/DEL）拒否・UNC/デバイスパス（先頭\\・//）拒否・絶対パスのみ・
+    # コロンはドライブ位置のみ（ADS遮断）・"."/".."セグメント拒否（/と\の両方を区切り扱い）・
+    # Windows予約デバイス名（CON等。拡張子付き含む）拒否。判定はLC_ALL=Cでbyte厳密。
+    # 末尾LFはawkの行単位読みで見えなくなるため、先にcaseで改行混入を全域拒否する
+    _lf=$(printf '\nX'); _lf="${_lf%X}"
+    case "$1" in
+        ''|*"$_lf"*) return 1 ;;
+    esac
+    printf '%s' "$1" | LC_ALL=C awk '
+        NR > 1 { bad = 1; exit }
+        NR == 1 {
+            p = $0
+            if (p ~ /[[:cntrl:]]/) bad = 1
+            if (p ~ /^\\\\/ || p ~ /^\/\//) bad = 1
+            drive = (p ~ /^[A-Za-z]:[\/\\]/)
+            if (!drive && p !~ /^[\/\\]/) bad = 1
+            q = p
+            if (drive) q = substr(p, 3)
+            if (index(q, ":") > 0) bad = 1
+            gsub(/\\/, "/", p)
+            n = split(p, seg, "/")
+            for (i = 1; i <= n; i++) {
+                s = seg[i]
+                if (s == "") continue
+                if (s == "." || s == "..") bad = 1
+                stem = s
+                d = index(s, ".")
+                if (d > 0) stem = substr(s, 1, d - 1)
+                stem = toupper(stem)
+                if (stem ~ /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/) bad = 1
+            }
+        }
+        END { if (NR == 0) bad = 1; exit bad ? 1 : 0 }'
+}
+
+ho_valid_state_path() {
+    # $1=transcript_path $2=mode（delete|write）。全検証を通った場合のみ「/」正規化済みの
+    # <transcript>.handoff-state.json をstdoutへ出し0を返す。以降のファイル操作はこの
+    # 戻り値に対して行う（検証対象と操作対象を同一文字列にする）。検証NGは1（fail-closed）。
+    # mode=delete: leafは実在するsymlinkでない通常ファイルのみ
+    # mode=write : leafは実在するなら通常ファイル（親ディレクトリは実在必須）
+    # 注: 宙吊りsymlinkのleafはsh版は-hで拒否、PS版はTest-Pathの版差で許容し得るが、
+    # いずれもrename上書きでリンク自体の置換になり参照先追跡はしない（安全方向の非対称のみ）
+    _tp="$1"; _mode="$2"
+    ho_path_token_ok "$_tp" || return 1
+    _vp="$(printf '%s' "$_tp" | tr '\\' '/')$HO_STATE_SUFFIX"
+    # 長さ上限240: Windows実効MAX_PATH(260)側だけ失敗する非対称を排除するため両実装共通。
+    # 単位は**UTF-8バイト長**に規範化（${#var}はロケール依存の文字数になり得るため
+    # wc -cで決定的にバイト数を取る — codexレビュー#33-1 L4）
+    _len=$(printf '%s' "$_vp" | LC_ALL=C wc -c | tr -d ' \t')
+    [ "$_len" -le 240 ] 2>/dev/null || return 1
+    _root=$(ho_projects_root) || return 1
+    # 連続する区切り（"//"）は全域拒否: shのIFS分割は末尾の空フィールドを落とし、
+    # ファイルシステムは"//"を畳み込むため、空要素検査だけではPS版（空要素拒否）と
+    # 分裂する（codexレビュー#33-3 L2実測: "proj//x.jsonl" をshだけ受理していた）
+    case "$_vp" in
+        *//*) return 1 ;;
+    esac
+    case "$_vp" in
+        "$_root"/*) : ;;
+        *) return 1 ;;
+    esac
+    [ -d "$_root" ] || return 1
+    if [ -h "$_root" ]; then return 1; fi
+    # rootから親ディレクトリまでの各構成要素を検査（実在ディレクトリかつ非symlink。
+    # symlink経由でroot外の実体を指す経路を遮断する）
+    _parent="${_vp%/*}"
+    _relp="${_parent#"$_root"}"
+    _relp="${_relp#/}"
+    _walk="$_root"
+    if [ -n "$_relp" ]; then
+        _oldifs="$IFS"; IFS='/'; set -f
+        for _seg in $_relp; do
+            if [ -z "$_seg" ]; then IFS="$_oldifs"; set +f; return 1; fi
+            _walk="$_walk/$_seg"
+            if [ -h "$_walk" ] || [ ! -d "$_walk" ]; then
+                IFS="$_oldifs"; set +f; return 1
+            fi
+        done
+        IFS="$_oldifs"; set +f
+    fi
+    if [ "$_mode" = "delete" ]; then
+        if [ -h "$_vp" ]; then return 1; fi
+        [ -f "$_vp" ] || return 1
+    else
+        if [ -h "$_vp" ]; then return 1; fi
+        if [ -e "$_vp" ] && [ ! -f "$_vp" ]; then return 1; fi
+    fi
+    printf '%s' "$_vp"
+}
+
+# 現在時刻のUNIX秒（PS版 Get-HoNowEpoch と同一契約）。失敗時はreturn 1。
+# テスト用シーム: HANDOFF_TEST_NOW_EPOCH で固定、HANDOFF_TEST_FORCE_NOW_FAIL=1 で
+# 取得失敗を強制（epoch境界・fail-closed経路の決定的検証用）。
+# 採用条件は「先頭ゼロなし・18桁以下の10進のみ」の完全一致（末尾LF・先頭ゼロ・過大桁は
+# 実時刻へフォールバック。先頭ゼロはjqの--argjsonで不正JSONになり、PS版の[long]解釈と
+# 分裂する — レビュー2回目 L1）
+ho_now_epoch() {
+    if [ "${HANDOFF_TEST_FORCE_NOW_FAIL:-}" = "1" ]; then
+        return 1
+    fi
+    _ov="${HANDOFF_TEST_NOW_EPOCH:-}"
+    case "$_ov" in
+        ''|*[!0-9]*) date +%s; return $? ;;
+    esac
+    case "$_ov" in
+        0) printf '%s' "$_ov"; return 0 ;;
+        0*) date +%s; return $? ;;
+    esac
+    if [ "${#_ov}" -le 18 ]; then
+        printf '%s' "$_ov"
+        return 0
+    fi
+    date +%s
+}
+
+# 人間可読の現在日時（表示用。PS版 Get-HoNowDisplay と同一契約）。失敗時はreturn 1。
+# テスト用シーム: HANDOFF_TEST_FORCE_DATE_FAIL=1 で失敗を強制（dual-writeのフォールバック検証用）
+ho_now_display() {
+    if [ "${HANDOFF_TEST_FORCE_DATE_FAIL:-}" = "1" ]; then
+        return 1
+    fi
+    date +%Y-%m-%dT%H:%M:%S%z
+}
+
 ho_sha256() {
-    # 失敗時は空文字（restore側はスキップで縮退 — PS版と同じ）
+    # 失敗時は空文字。空文字時の縮退（restore側の照合スキップ）は廃止した（issue #31）:
+    # producer(check)はポインタ更新をスキップ、consumer(restore)は注入拒否（fail-closed。PS版と同じ）
+    # テスト用シーム: SHA計算失敗経路をパリティ試験で決定的に再現する（C59）
+    if [ "${HANDOFF_TEST_FORCE_SHA_FAIL:-}" = "1" ]; then
+        return 0
+    fi
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" 2>/dev/null | awk '{print toupper($1)}'
     elif command -v shasum >/dev/null 2>&1; then
@@ -133,8 +344,11 @@ ho_incomplete_reasons() {
     # BINMODE=3はGit BashのGNU awkの暗黙CRLF変換を抑止し「\r除去は1回」の契約を
     # 全awk実装で揃える（gawk以外では無害な変数代入。6回目 L1）。
     # 比較はawk内で行う: MSYS bashの$( )は末尾の\r\nを丸ごと剥ぐため、\rを残した値を
-    # コマンド置換で持ち出すと環境で比較結果が分裂する（実測）
-    _marker_ok=$(awk -v BINMODE=3 -v m="<!-- handoff-complete: $_nonce -->" \
+    # コマンド置換で持ち出すと環境で比較結果が分裂する（実測）。
+    # LC_ALL=C必須: macOSのBWK awkはUTF-8ロケールで文字列比較(==/!=)にstrcoll()を使い、
+    # U+00A0等の「照合上無視可能」な文字を無視して等価判定する（実測。NBSP前置マーカーや
+    # NBSPだけの行が偽装通過し、バイト厳密なPS版と合否が分裂する）。Cロケールでstrcmpに固定する
+    _marker_ok=$(LC_ALL=C awk -v BINMODE=3 -v m="<!-- handoff-complete: $_nonce -->" \
         '{ line = $0; sub(/\r$/, "", line); gsub(/^[ \t]+|[ \t]+$/, "", line); if (line != "") last = line }
          END { print (last == m ? "ok" : "ng") }' "$_f")
     if [ "$_marker_ok" != "ok" ]; then

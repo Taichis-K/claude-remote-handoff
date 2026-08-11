@@ -19,3 +19,62 @@ C18 output=hard-retry state=hard/2 reasons=1
 C19 output=hard-retry state=hard/2 reasons=1
 C20 output=hard-retry state=hard/2 reasons=1
 C21 output=hard-retry state=hard/2 reasons=1
+C22 output=hard-retry state=hard/2 reasons=1
+C23 output=hard-retry state=hard/2 reasons=1
+C24 output=hard-retry state=hard/2 reasons=1
+C25 output=none state=none
+C26 output=hard state=hard/1
+C27 output=refused
+C28 output=none state=none
+C29 output=hard state=hard/1
+C30 output=injected consumed=no
+C31 output=injected goalB=yes
+C32 output=refused
+C33 output=none
+C34 output=injected u1=yes u2=no u3=no u4=yes u5=no u6=no
+C35 output=refused
+C36 output=none
+C37 output=none
+C38 output=hard state=hard/1
+C39 output=none state=none
+C40 output=hard state=hard/1
+C41 output=soft state=soft/1
+C42 output=none
+C43 output=hard state=hard/1
+C44 output=none state=none
+C45 output=none state=none
+C46 trigger=empty
+C47 output=injected meta=empty
+C48 output=injected d1=yes d2=yes
+C49 unknown-dir=absent
+C50 output=none consumed=no
+C51 output=none
+C52 output=none
+C53 output=injected d1=yes d2=yes
+C54 output=none
+C55 output=none
+C56 arr=soft/1 str=none
+C57 output=soft state=soft/1
+C58 output=hard state=hard/1
+C59 output=other msg=yes latest=intact state=completed log=1 second=none postrestore=injected
+C60 missing=refused/yes null=refused/yes empty=refused/yes
+C61 output=none state=hard/1 log=1
+C62 output=none second=none state=none log=2
+C63 plussign=none/none leadzero=hard/hard/1 lfprefix=none/none
+C64 output=none state=none
+C65 sign=hard/hard/1 leadzero=none/none zero=hard/hard/1 traillf=hard/hard/1
+C66 outside=none/none reset-outside=yes
+C67 dotdot=none/none boundary=none/none reset-dotdot=yes gatelog=3
+C68 restore-outside=yes restore-inside=no save-outside=yes save-inside=no longbytes=none/none bytecheck=ok cfglf=none/none dupsep=none/none dupsep2=none/none tplf=none/none
+C69 output=none
+C70 output=none
+C71 output=injected dualwrite=yes
+C72 output=injected evil=no
+C73 output=injected subst=yes
+C74 output=injected dwfallback=yes
+C75 fresh=injected skewmax=injected skewover=none agemax=injected ageover=none
+C76 output=none
+C77 output=other msg=yes latest=intact state=completed
+C78 lf=injected zeros=injected digits19=injected valid=injected
+C79 wrongcase-consumed=none/1 wrongcase-mode=hard/hard/1 wrongcase-source=injected consumed=no content-valid=yes content-wrongcase=no
+C80 ptr-unknown=none/1 ptr-oldform=none/1 ptr-badver=none/1 ptr-wrongcase-dup=none ptr-verfloat=injected state-unknown=hard/hard/1/1 state-known=hard-retry/hard/2 config-unknown=none/1 state-oldform=hard-retry/hard/2 state-badver=hard/hard/1/1 sv-f=yes sv-g=yes soft-new=soft/soft/1/yes sv-complete=yes sv-failpath=yes sv-failed=yes compact-oldform=injected compact-unknown=refused compact-badver=refused ptr-notobj=none/none/0

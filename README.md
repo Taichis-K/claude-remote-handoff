@@ -69,17 +69,34 @@ Remote Control中は `/resume` がローカル限定のため、既存ツール�
 
 インストール後に必須の設定（詳細はINSTALL.md）:
 
-1. `setup/setup.ps1`（または `setup.sh`）で**閾値ペアを設定** — 未設定の場合、本ツールは何もしません
-2. セッションで `/autocompact 160000`（setupに渡した値と同じ値）
+1. `setup/setup.ps1`（または `setup.sh`）で**閾値ペアを設定** — 未設定の場合、本ツールは何もしません。
+   setupスクリプトは**人がターミナルで実行**してください（Claude Codeに実行させると
+   ブロックされることがあります。その場合はINSTALL.mdの「スクリプトを使わない手順」へ）
+
+   ```powershell
+   # Windows（名前付きパラメータ。既定: window 160000 / soft 120000 / hard 135000）
+   powershell -NoProfile -ExecutionPolicy Bypass -File setup\setup.ps1 `
+     -AutocompactWindow 500000 -SoftThreshold 400000 -HardThreshold 440000
+   ```
+   ```sh
+   # macOS/Linux（位置引数: window soft hard [margin] [pct]）
+   sh setup/setup.sh 500000 400000 440000
+   ```
+
+   ⚠️ window値は**モデルの公称ウィンドウではなく `/context` が表示する総量**に合わせて
+   ください（例: 1Mコンテキストモデルでも表示が `xxx k / 500k` なら 500000。
+   公称値を入れると閾値到達前にauto compactが走り、実質無効になります）
+2. セッションで `/autocompact <window値>`（setupに渡した値と同じ値）
 3. 権限ルール `Edit(.claude-handoff/**)` の追加（**実質必須**: 無いとhandoff作成のたびに
    許可プロンプトで中断します）
 
 setupは `.gitignore` へマシン/環境固有の4エントリ（`.claude-handoff/`・
 `.claude/handoff-config.json`・`.claude/hooks/claude-remote-handoff/`・
 `.claude/settings.local.json*`）を追記します。
-特に `.claude/handoff-config.json` は**コミットしないでください**: 閾値はモデルの
-コンテキスト窓（200K/1M）とマシンの設定に依存するため、チームで共有すると別モデルの
-環境で「発火しない/早すぎる」原因になります（各マシンでsetupを実行するのが正です）。
+特に `.claude/handoff-config.json` は**コミットしないでください**: 閾値は実効コンテキスト
+総量（`/context` の表示。モデル・環境で異なる）とマシンの設定に依存するため、チームで
+共有すると総量の異なる環境で「発火しない/早すぎる」原因になります
+（各マシンでsetupを実行するのが正です）。
 
 ## 既知の限界
 
@@ -92,9 +109,12 @@ setupは `.gitignore` へマシン/環境固有の4エントリ（`.claude-hando
    完了検証付きの有限リトライで軽減し、打ち切り時はユーザーへ通知します
 4. **閾値到達からcompactまでの差分は意味的handoffに反映されない**: 資料は閾値時点の
    スナップショットで、以降の進捗はgit状態・直近メッセージの機械的情報でのみ補完されます
-5. **autocompact値と閾値の整合検証は静的**: 実効発火点は環境変数
-   （`CLAUDE_CODE_AUTO_COMPACT_WINDOW` / `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`）で変わるため、
-   実行時保証はありません（環境変数が見える場合はbest-effortで再検証します）
+5. **autocompact値と閾値の整合検証は申告値ベース**: 発火のたびに、有効な環境変数
+   （`CLAUDE_CODE_AUTO_COMPACT_WINDOW` / `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`。
+   全体が1〜10桁のASCII数字のみ有効）、無ければ必須の `autocompact_window` 設定値で
+   `ハード閾値+マージン < floor(window×発火%÷100)` を検証し、満たさない場合は機能を
+   無効化します（error.logに記録）。ただし検証に使うwindow値は「ユーザーの申告」であり、
+   実際のClaude Code設定との一致やcompactの実発火時機までは保証できません
 6. **保存データに秘密情報が含まれ得ます**: `.claude-handoff/` にはtranscriptと
    git diffが保存されます。setupが `.gitignore` へ追記しますが、クラウド同期・
    共有マシン経由の露出は防げません。保持は既定で30日・500MBまでで自動削除されます
@@ -118,6 +138,13 @@ setupは `.gitignore` へマシン/環境固有の4エントリ（`.claude-hando
     **別セッションが作成した資料**が注入されることがあります。この場合、注入文の冒頭に
     「※ この資料は別セッション（uuid）で作成されたものです」と明示されるので、
     内容が現在の作業と一致するか確認してから使ってください
+11. **特殊なプロファイル構成では機能が無効になります**: 安全のため、セッション状態
+    ファイルの作成・削除はClaude Codeのプロジェクトディレクトリ
+    （`CLAUDE_CONFIG_DIR`、無ければ `(USERPROFILE|HOME)/.claude`、配下の `projects/`）
+    の中に限定しています。UNCネットワークパスのプロファイル・途中にシンボリックリンクや
+    ジャンクションを含む構成・`CLAUDE_CONFIG_DIR` とtranscriptのパスで大小文字表記が
+    食い違う構成・派生パスがUTF-8で240バイトを超える場合は、
+    層3（閾値トリガー）が無効になります（error.logに記録。層1のバックアップは動作します）
 
 ## 動作要件
 

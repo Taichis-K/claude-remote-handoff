@@ -17,6 +17,10 @@ IGNORE_ENTRIES=".claude-handoff/
 .claude/handoff-config.json
 .claude/hooks/claude-remote-handoff/
 .claude/settings.local.json*"
+# UTF-8 BOM（PS 5.1のSet-Content/Add-Content -Encoding UTF8が.gitignore作成時に付け得る）。
+# PS版のGet-ContentはBOMを自動除去するため、sh版も先頭行から除去しないと判定が分裂し
+# 重複追記が起きる（codexレビュー issue23-28 2回目 M2）
+BOM_CHAR=$(printf '\357\273\277')
 
 fail() { printf 'NG: %s\n' "$1" >&2; exit 1; }
 
@@ -25,11 +29,16 @@ PROJ=$(cd "$PROJ" 2>/dev/null && pwd) || fail "プロジェクトディレクト
 printf '対象プロジェクト: %s\n' "$PROJ"
 
 # --- 1. Claude Codeバージョン確認 ---
-ver=$(claude --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-[ -n "$ver" ] || fail "claude コマンドが見つからないかバージョンを特定できません"
-newer=$(printf '%s\n%s\n' "$MIN_VERSION" "$ver" | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
-[ "$newer" = "$ver" ] || fail "Claude Code $ver は最低要求 $MIN_VERSION 未満です。アップデートしてください"
-printf 'OK: Claude Code %s（>= %s）\n' "$ver" "$MIN_VERSION"
+if [ "${HANDOFF_SETUP_SKIP_CLAUDE_CHECK:-}" = "1" ]; then
+    # テスト用（claude CLIが無い環境でgitignore/設定生成ロジックを試験するため）。通常は使わない
+    printf 'SKIP: Claude Codeバージョン確認（HANDOFF_SETUP_SKIP_CLAUDE_CHECK=1）\n'
+else
+    ver=$(claude --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    [ -n "$ver" ] || fail "claude コマンドが見つからないかバージョンを特定できません"
+    newer=$(printf '%s\n%s\n' "$MIN_VERSION" "$ver" | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
+    [ "$newer" = "$ver" ] || fail "Claude Code $ver は最低要求 $MIN_VERSION 未満です。アップデートしてください"
+    printf 'OK: Claude Code %s（>= %s）\n' "$ver" "$MIN_VERSION"
+fi
 
 # --- 2. 閾値ペアの静的検証 → handoff-config.json 書き込み ---
 for v in "$WINDOW" "$SOFT" "$HARD" "$MARGIN" "$PCT"; do
@@ -53,7 +62,7 @@ if [ $((HARD + MARGIN)) -ge "$fire_point" ]; then
     exit 1
 fi
 printf 'OK: 静的検証（hard %s + margin %s < 発火点 %s）\n' "$HARD" "$MARGIN" "$fire_point"
-printf '  注意: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE 環境変数で発火点は下がり得ます（実行時にもbest-effort再検証されます）\n'
+printf '  注意: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE 環境変数で発火点は下がり得ます（フックは有効な環境変数、無ければ設定値で毎Stop再検証し、満たさない場合は機能を無効化します）\n'
 
 mkdir -p "$PROJ/.claude" || fail ".claudeディレクトリを作成できません"
 # 既存設定を直接truncateしない: 一時ファイルへ生成→JSON妥当性を再確認→atomic rename
@@ -75,12 +84,30 @@ if command -v git >/dev/null 2>&1 && git -C "$PROJ" rev-parse --is-inside-work-t
     gi="$PROJ/.gitignore"
     printf '%s\n' "$IGNORE_ENTRIES" | while IFS= read -r entry; do
         [ -n "$entry" ] || continue
-        bare="${entry%/}"
-        # 前後空白をtrimした行単位の完全一致（末尾スラッシュ有無の両形を許容）= ps版と同一判定。
-        # CRLFの.gitignoreでも判定できるよう\rもtrimする（codexレビュー3回目 Low-7）
-        if [ -f "$gi" ] && awk -v e="$entry" -v b="$bare" \
-            '{ t=$0; gsub(/^[ \t\r]+|[ \t\r]+$/, "", t); if (t == e || t == b) { found=1; exit } } END { exit !found }' "$gi"; then
-            printf 'OK: .gitignore に %s は追記済み\n' "$entry"
+        # 意味的に同値な既存行も「追記済み」と判定する（ps版と同一契約。issue #25）:
+        #   dir/ は dir・dir/* も可 / file は file* も可 / file* は file〔*なし〕も可
+        #   〔部分カバー → *付きへの更新を推奨表示〕。ファイル項目への末尾/は
+        #   ディレクトリ専用パターンでファイルを無視しないため同値としない。
+        # 比較は大小厳密（awkの==）・trimは[ \t\r]のみ（codexレビュー3回目 Low-7のCRLF対応含む）。
+        # LC_ALL=C必須: macOSのBWK awkはUTF-8ロケールで==にstrcoll()を使い、U+00A0等の
+        # 照合上無視可能な文字を無視して「NBSP前置行 == エントリ」が真になる（CI実測）
+        c1=""; c2=""
+        case "$entry" in
+            */)  bare="${entry%/}"; c1="$bare"; c2="$bare/*" ;;
+            *\*) c1="${entry%\*}" ;;
+            *)   c1="$entry*" ;;
+        esac
+        matched=""
+        if [ -f "$gi" ]; then
+            matched=$(LC_ALL=C awk -v e="$entry" -v a="$c1" -v b="$c2" -v bom="$BOM_CHAR" \
+                '{ t=$0; if (NR == 1 && index(t, bom) == 1) t = substr(t, length(bom) + 1); gsub(/^[ \t\r]+|[ \t\r]+$/, "", t); if (t == e || (a != "" && t == a) || (b != "" && t == b)) { print t; exit } }' "$gi")
+        fi
+        if [ -n "$matched" ]; then
+            printf 'OK: .gitignore に %s は追記済み（既存行: %s）\n' "$entry" "$matched"
+            # 末尾の [HANDOFF-RECOMMEND-GLOB] はテスト用の機械可読マーカー（ps版と同一契約）
+            case "$entry" in
+                *\*) [ "$matched" = "$entry" ] || printf '  推奨: 既存行を %s に更新すると、編集時に生成される .bak もカバーされます [HANDOFF-RECOMMEND-GLOB]\n' "$entry" ;;
+            esac
         else
             # 末尾に改行が無い場合に備えて追記前に改行を保証する
             [ -f "$gi" ] && [ -n "$(tail -c 1 "$gi" 2>/dev/null)" ] && printf '\n' >> "$gi"

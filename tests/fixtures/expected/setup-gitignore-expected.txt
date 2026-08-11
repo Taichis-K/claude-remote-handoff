@@ -1,0 +1,39 @@
+S1 exit=1 lines=4 starred=1 rec=0 config=1
+S1L .claude-handoff/
+S1L .claude/handoff-config.json
+S1L .claude/hooks/claude-remote-handoff/
+S1L .claude/settings.local.json*
+S2 exit=1 lines=4 starred=1 rec=0 config=1
+S2L .claude-handoff/
+S2L .claude/handoff-config.json
+S2L .claude/hooks/claude-remote-handoff/
+S2L .claude/settings.local.json*
+S3 exit=1 lines=4 starred=0 rec=1 config=1
+S3L .claude-handoff
+S3L .claude/hooks/claude-remote-handoff/*
+S3L .claude/handoff-config.json*
+S3L .claude/settings.local.json
+S4 exit=1 lines=11 starred=1 rec=0 config=1
+S4L # .claude-handoff/
+S4L !.claude-handoff/
+S4L .CLAUDE-HANDOFF/
+S4L .claude/settings.local.json/
+S4L .claude/handoff-config.json/
+S4L ?.claude-handoff/
+S4L ?.claude-handoff/
+S4L .claude-handoff/
+S4L .claude/handoff-config.json
+S4L .claude/hooks/claude-remote-handoff/
+S4L .claude/settings.local.json*
+S5 exit=1 lines=4 starred=0 rec=1 config=1
+S5L .claude-handoff
+S5L .claude/hooks/claude-remote-handoff/*
+S5L .claude/handoff-config.json*
+S5L .claude/settings.local.json
+S6 exit=1 lines=4 starred=1 rec=0 config=1
+S6L .claude-handoff/
+S6L .claude/handoff-config.json
+S6L .claude/hooks/claude-remote-handoff/
+S6L .claude/settings.local.json*
+S7 exit=0 lines=0 starred=0 rec=0 config=0
+S8 exit=0 lines=0 starred=0 rec=0 config=0
