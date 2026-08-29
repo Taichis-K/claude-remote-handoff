@@ -14,6 +14,7 @@
 #  - バックアップ導線は解決したセッションのものに限定（セッション間の情報混入防止）
 # 処理順序: 状態読取り → current.md検証 → 合成 → stdout出力 → 状態削除
 # PS 5.1互換文法・UTF-8 BOM付きで保存すること。HANDOFF.md「層1」参照
+# 配布元: https://github.com/Taichis-K/claude-remote-handoff （導入済みバージョンは ../VERSION）
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "handoff-common.ps1")

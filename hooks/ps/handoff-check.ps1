@@ -7,6 +7,7 @@
 # 閾値はインストール時の明示設定必須（.claude/handoff-config.json）。設定が無ければ何もしない。
 # ロジック仕様: docs/reference/handoff-check-reference.py + HANDOFF.md「層3」
 # PS 5.1互換文法・UTF-8 BOM付きで保存すること
+# 配布元: https://github.com/Taichis-K/claude-remote-handoff （導入済みバージョンは ../VERSION）
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "handoff-common.ps1")

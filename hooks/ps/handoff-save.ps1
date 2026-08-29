@@ -3,6 +3,7 @@
 # .claude/handoff/<session_id>/backup/<timestamp>/ へ世代管理付きで保存する。
 # エラー時も作業を妨げない（常にexit 0）が、error.logへbest-effortで記録する。
 # PS 5.1互換文法・UTF-8 BOM付きで保存すること。HANDOFF.md「層1」参照
+# 配布元: https://github.com/Taichis-K/claude-remote-handoff （導入済みバージョンは ../VERSION）
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "handoff-common.ps1")

@@ -2,6 +2,7 @@
 # handoff-common.sh - フック共通ヘルパー（各フックから . で読み込む。単体実行しない）
 # 依存: jq（必須）。sha256sum または shasum、timeout があれば利用する（無くても縮退動作）
 # PS版 handoff-common.ps1 と挙動一致必須（dist/tests で検証）
+# 配布元: https://github.com/Taichis-K/claude-remote-handoff （導入済みバージョンは ../VERSION）
 
 # jq不在の検出（issue #18: 以前は無言終了でerror.logにも残らなかった）。
 # jq無しで書ける手段だけで記録する。$1=フック名。不在なら1を返す（呼び出し側はexit 0）

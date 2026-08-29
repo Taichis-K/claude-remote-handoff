@@ -3,6 +3,7 @@
 # resumeはsession_id / transcript_pathが維持される（実測確定）ため、この削除で
 # 「復帰後に閾値超過なら再度handoffを発火させる」という意図どおりに動く。
 # PS 5.1互換文法・UTF-8 BOM付きで保存すること。HANDOFF.md「層3 > ループ防止と完了検証 5」参照
+# 配布元: https://github.com/Taichis-K/claude-remote-handoff （導入済みバージョンは ../VERSION）
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "handoff-common.ps1")

@@ -1,5 +1,6 @@
 ﻿# handoff-common.ps1 - フック共通ヘルパー（各フックから dot-source される。単体実行しない）
 # PS 5.1互換文法のみ使用（三項演算子・??・&&/|| 禁止）。UTF-8 BOM付きで保存すること
+# 配布元: https://github.com/Taichis-K/claude-remote-handoff （導入済みバージョンは ../VERSION）
 
 # PS 5.1はstdin/stdoutを既定でANSIコードページ（日本語環境はcp932）として扱うため、
 # 日本語を含むフック入出力が文字化けする（実測）。両方向をUTF-8へ強制する

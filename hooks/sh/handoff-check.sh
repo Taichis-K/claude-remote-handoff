@@ -1,6 +1,7 @@
 #!/bin/sh
 # handoff-check.sh - 層3: Stopフック（sh版・jq必須）
 # PS版 handoff-check.ps1 と挙動一致必須。仕様はPS版ヘッダと HANDOFF.md「層3」参照
+# 配布元: https://github.com/Taichis-K/claude-remote-handoff （導入済みバージョンは ../VERSION）
 . "$(dirname "$0")/handoff-common.sh"
 
 TAIL_LINES=500

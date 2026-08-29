@@ -2,6 +2,7 @@
 # handoff-restore.sh - 層1: SessionStartフック（matcher: compact / clear。sh版・jq必須）
 # PS版 handoff-restore.ps1 と挙動一致必須。仕様（解決順序・必須ゲート・予算・消費/失効）は
 # PS版ヘッダと HANDOFF.md「層1」参照
+# 配布元: https://github.com/Taichis-K/claude-remote-handoff （導入済みバージョンは ../VERSION）
 . "$(dirname "$0")/handoff-common.sh"
 
 BUDGET_CURRENT_HEAD=3500

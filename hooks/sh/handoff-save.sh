@@ -1,6 +1,7 @@
 #!/bin/sh
 # handoff-save.sh - 層1: PreCompactフック（sh版・jq必須）
 # PS版 handoff-save.ps1 と挙動一致必須。仕様はPS版ヘッダと HANDOFF.md「層1」参照
+# 配布元: https://github.com/Taichis-K/claude-remote-handoff （導入済みバージョンは ../VERSION）
 . "$(dirname "$0")/handoff-common.sh"
 
 GIT_TIMEOUT_SEC=10

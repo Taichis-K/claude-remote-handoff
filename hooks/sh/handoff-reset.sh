@@ -1,6 +1,7 @@
 #!/bin/sh
 # handoff-reset.sh - SessionStartフック（matcher: resume。sh版・jq必須）
 # PS版 handoff-reset.ps1 と挙動一致必須: transcript_pathに対応する状態ファイルを削除する
+# 配布元: https://github.com/Taichis-K/claude-remote-handoff （導入済みバージョンは ../VERSION）
 . "$(dirname "$0")/handoff-common.sh"
 
 ho_require_jq handoff-reset || exit 0
