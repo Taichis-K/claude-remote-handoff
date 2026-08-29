@@ -53,6 +53,8 @@ macOS/Linuxは方法Bで導入すること。
 1. 本リポジトリの `hooks/` ディレクトリ一式をプロジェクトの `.claude/hooks/claude-remote-handoff/` へコピーする
    - このディレクトリは**コミットしないこと**（OSごとにps/shを選ぶマシン固有物。
      後述のsetupが `.gitignore` へ追記する）
+   - `hooks/VERSION`（導入したバージョンの記録）も**必ず一緒にコピーすること**。
+     後から「入っているのがどの版か」を判別する唯一の手段になる（§5）
 2. `.claude/settings.local.json`（個人用・コミット非対象の設定ファイル）に以下のフック定義を
    マージする（**既存のhooks定義がある場合は配列に追記し、既存エントリを消さないこと**。
    同一コマンドパスのエントリが既にあれば追加しない=冪等）:
@@ -69,22 +71,22 @@ macOS/Linuxは方法Bで導入すること。
   "hooks": {
     "PreCompact": [
       { "hooks": [{ "type": "command", "command": "powershell.exe",
-        "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-remote-handoff/ps/handoff-save.ps1"] }] }
+        "args": ["-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-remote-handoff/ps/handoff-save.ps1"] }] }
     ],
     "SessionStart": [
       { "matcher": "compact",
         "hooks": [{ "type": "command", "command": "powershell.exe",
-          "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-remote-handoff/ps/handoff-restore.ps1"] }] },
+          "args": ["-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-remote-handoff/ps/handoff-restore.ps1"] }] },
       { "matcher": "clear",
         "hooks": [{ "type": "command", "command": "powershell.exe",
-          "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-remote-handoff/ps/handoff-restore.ps1"] }] },
+          "args": ["-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-remote-handoff/ps/handoff-restore.ps1"] }] },
       { "matcher": "resume",
         "hooks": [{ "type": "command", "command": "powershell.exe",
-          "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-remote-handoff/ps/handoff-reset.ps1"] }] }
+          "args": ["-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-remote-handoff/ps/handoff-reset.ps1"] }] }
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "powershell.exe",
-        "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-remote-handoff/ps/handoff-check.ps1"] }] }
+        "args": ["-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-remote-handoff/ps/handoff-check.ps1"] }] }
     ]
   }
 }
@@ -277,6 +279,82 @@ setupスクリプトの3操作は次のファイル編集で置き換えられ�
    - `/clear` を実行 → 次の発言で引き継ぎ内容をClaudeが把握していれば層1は動作している
    - **確認後、setupを再実行して閾値を必ず本来の値に戻す**
 4. エラーが疑われる場合は `.claude-handoff/error.log` を確認する
+
+## 5. 導入済みバージョンの確認とアップグレード
+
+上流で既に直っている不具合を手元で追い直す事故が実際に起きているため、
+**動作を疑ったら最初にバージョンを確認すること**。手順は導入方法で異なる。
+
+### 5-1. 導入済みバージョンの確認
+
+**方法A（プラグイン）**: バージョンと**インストールscope**（`user` / `project` / `local` /
+`managed`）が表示される。scopeは §5-2 の更新で必要になるので控えておくこと。
+
+```
+claude plugin list
+claude plugin list --json   # scope・installPath まで確実に見たい場合
+```
+
+**方法B（手動導入）**: 導入先にコピーされた `VERSION` を読む。
+
+```
+cat .claude/hooks/claude-remote-handoff/VERSION
+```
+
+- `VERSION` が無い場合、**配布物を一式コピーしているなら v0.1.3 以前**
+  （このファイルはv0.1.4で追加された）。`ps/`・`sh/` だけをコピーした不完全導入や、
+  利用者が削除した場合もあり得るので、それ以上の特定はしない。いずれにせよ
+  §5-2 のとおり一式で入れ直すこと
+- 最新版とその変更内容: https://github.com/Taichis-K/claude-remote-handoff/releases
+  （`CHANGELOG.md` に修正済みの不具合が症状ごと載っている。手元の症状が該当しないか先に見る）
+
+### 5-2. アップグレード手順
+
+**先に共通の確認**（版を飛ばして上げる場合は、間の各Releaseの「導入・更新」も読むこと）:
+
+1. **未消費の引き継ぎ資料が残っていないか確認する**。旧バージョンが書いた
+   `.claude-handoff/latest.json` は更新後に拒否されることがある（v0.1.3の変更）。
+   残っているなら**更新前に消費する**（`/clear` して復元させる）こと。
+   更新後は次のhandoff作成サイクルから復元が復帰する
+2. `.claude-handoff/` は**削除しない**（過去の資料とバックアップが入っている）。
+   フックの入れ替えでこのディレクトリに触れる必要はない
+
+**方法A（プラグイン）**: **§5-1で控えたscopeを必ず `--scope` で指定する**。
+
+```
+claude plugin update claude-remote-handoff --scope <user|project|local|managed>
+```
+
+- ⚠️ `--scope` の既定値は `user`。**省略すると別scopeの導入は更新されない**
+  （`local` / `project` で入れている場合に「更新したのに直らない」となる）。
+  `local` / `project` の場合は**対象プロジェクトのルートで実行**すること
+- **反映にはClaude Codeの再起動が必要**（`claude plugin update` の仕様）
+- `hooks.json` はプラグイン側が持つため、`settings.local.json` の編集は不要
+- 自動更新が有効な環境では、明示的に実行しなくても更新されることがある
+
+**方法B（手動導入）**:
+
+1. 最新Releaseのzipを展開する（または本リポジトリを `git pull` する）
+2. `.claude/hooks/claude-remote-handoff/` を**新しい `hooks/` 一式で丸ごと置き換える**
+   （差分適用はしない。ローカルで手を入れていた場合その改変は失われる — 必要なら退避しておく）
+3. `.claude/settings.local.json` のフック定義を §1手順2 の最新スニペットと突き合わせ、
+   コマンド・引数が変わっていれば差し替える（**v0.1.4でWindowsの `args` に
+   `-WindowStyle Hidden` が入った** — 無くても機能は動作する。コンソールウィンドウの
+   点滅対策）
+4. `/hooks` で5エントリが見えるか確認し、見えなければClaude Codeを再起動する
+
+**両方に共通の最終確認**:
+
+- `.claude/handoff-config.json` に `autocompact_window` があるか確認する
+  （**v0.1.3から必須**。無いか不正だと機能は黙って無効化され、
+  `.claude-handoff/error.log` にだけ診断が残る）。無ければ §2 のsetupを再実行する
+- 手書きconfigの場合、既知キー以外があると機能が無効になる（§2参照）
+
+### 5-3. 複数プロジェクト・複数マシンに入れている場合
+
+**手動導入（方法B）の場合**、フック本体は**プロジェクトごとの複製**で、`.gitignore` 対象の
+ためgitでは配れない。1か所直しても他は古いまま残る。導入先を洗い出し、
+**全数を同じ版へ揃えること**。
 
 ## 注意事項
 
