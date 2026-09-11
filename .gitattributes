@@ -1,0 +1,24 @@
+# 改行コードの固定（公開ツリー用）
+#
+# このファイルは公開リポジトリ（Taichis-K/claude-remote-handoff）の**ルート**に来る。
+# 開発リポジトリのルートにも同じ宣言があるが、**あれは公開経路に効かない**:
+# release.ps1 は `git archive HEAD:dist` でサブツリーを固めるため、gitが見るのは
+# アーカイブ対象ツリーの中の .gitattributes だけで、開発リポジトリのルートのものは
+# 参照されない。このファイルがそのサブツリーの中の宣言にあたる。
+#
+# なぜ要るのか: 宣言が無いと、`git clone` した作業ツリーの改行は
+# **cloneする人の core.autocrlf 次第**になる。true（Windowsの既定インストール等）だと
+# `.sh` がCRLFでチェックアウトされ、macOS/Linuxで `$'\r': command not found` になって
+# 動かない。v0.1.0〜v0.1.3 のRelease zipが実際にこれで壊れていた。
+#
+#   text     … コミット時にLFへ正規化する
+#   eol=lf   … チェックアウト時もLFにする（core.autocrlf の設定に関わらず変換されない）
+#
+# この宣言と、手順書（INSTALL.md / commands/handoff-init.md）が指示する
+# `git -c core.autocrlf=false clone`、release.ps1 の
+# `git -c core.autocrlf=false archive` は**三重の防御**であり、どれも外さないこと。
+#
+# 対象は全ファイル。この公開ツリーの中身は ps1/sh/tmpl/md/json/jsonl/txt/VERSION/LICENSE で
+# すべてテキストであり、CRを意図的に含むファイルもNULバイトを含むファイルも無い（確認済み）。
+# 将来バイナリを追加するときは、そのパスに `-text` を明示すること。
+* text eol=lf

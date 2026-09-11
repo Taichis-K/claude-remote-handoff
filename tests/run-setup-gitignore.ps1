@@ -126,6 +126,15 @@ $rec8 = 0
 if ($out8.Contains("[HANDOFF-RECOMMEND-GLOB]")) { $rec8 = 1 }
 Report "S8" $d8 @($ok8, $rec8)
 
+# S9: 終端改行の無い.gitignore（最終バイトが改行でない）→ 追記が前の行に連結されないこと。
+# 連結するとlines=4かつ `node_modules/.claude-handoff/` の1行になり .claude-handoff/ が
+# 無視されない（transcriptを含む保存データがgit add -Aでステージされ得る）。
+# 正しければ既存1行+4エントリでlines=5。Add-Contentは値の前に改行を入れないため、
+# setup.ps1側の終端改行保証が無いとここで落ちる（sh版は元から保証していた）
+$d9 = New-Proj "s9" @("node_modules/")
+[System.IO.File]::WriteAllText((Join-Path $d9 ".gitignore"), "node_modules/")
+Report "S9" $d9 (Invoke-Setup $d9)
+
 if ([string]::IsNullOrEmpty($env:KEEP_WORK)) {
     Remove-Item $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
 } else {

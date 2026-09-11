@@ -2,9 +2,25 @@
 # run-parity.sh と同一ケース・同一出力形式。run-local-check.ps1 / .sh が両者の出力を
 # 期待値と照合して2系統一致を検証する（ローカル実行）
 # 出力形式: "C<番号> <key>=<value> ..."（1ケース1行）
-param([string]$WorkDir = "")
+# 使い方: -WorkDir <作業ディレクトリ> -Part <all|1|2|3>
+#   Part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C89）。
+#   パートは独立した作業ディレクトリで並列に実行し、出力を1〜3の順に連結すると
+#   all と同じ89行になる（run-local-check.ps1 がそれを行い期待値と照合する）
+param([string]$WorkDir = "", [string]$Part = "all")
 
 $ErrorActionPreference = "Stop"
+# パート分割（シャーディング）。境界は「ケース間の依存が跨がないこと」と
+# 「フック起動回数が揃うこと」（実測 55/56/53）で決めている:
+#   C1〜C13 は既定transcriptを共有する連鎖 / C35以降は C34 が作るポインタが土台で、
+#   C34 は全パート共通の前段として無条件に走る / C67 の gatelog は C66 の診断を
+#   含めて数えるので両者は同じパートに置く / C46-C47・C59-C60・C85〜C88 は変数を
+#   持ち越すので割らない（`# C<番号>` で分割したセグメント間の持ち越しを機械抽出して
+#   確認した。C74-C75 は以前から割らない扱いだが、今回の抽出では持ち越しを
+#   検出していない）
+if ($Part -ne "all" -and $Part -ne "1" -and $Part -ne "2" -and $Part -ne "3") {
+    [Console]::Error.WriteLine("NG: -Part は all / 1 / 2 / 3 のいずれか: " + $Part)
+    exit 1
+}
 $testsDir = $PSScriptRoot
 $hooksDir = Join-Path (Split-Path $testsDir -Parent) "hooks/ps"
 $fixtures = Join-Path $testsDir "fixtures"
@@ -62,10 +78,25 @@ function New-UsageTranscript([string]$Path, [int]$Tokens) {
     Set-Content -LiteralPath $Path -Value ('{"type":"assistant","isSidechain":false,"message":{"usage":{"input_tokens":' + $Tokens + ',"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}') -Encoding UTF8
 }
 
+# hardサイクル開始直後の状態ファイルを直接書く。「nonceを得るためだけ」のフック起動を
+# 省くためで、内容は handoff-check.ps1 の hard発火が書く形と同じ。
+# 「450トークンでhard発火して状態を作る」こと自体は C4/C5 が確かめている
+function New-HardState([string]$Transcript, [string]$Nonce) {
+    $json = '{"schema_version":1,"mode":"hard","nonce":"' + $Nonce + '","attempts":1,"completed":false,"failed":false}'
+    Set-Content -LiteralPath "$Transcript.handoff-state.json" -Value $json -Encoding UTF8
+}
+
 $sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 $t = "$tRoot/t.jsonl"
 $stopIn = @{ session_id = $sid; transcript_path = $t; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 
+# フックの共通ヘルパー。C15/C16 は検証関数を直接呼び、C80 は ConvertFrom-JsonPreserve を
+# 使う。**パート分割で片方のパートに閉じ込めない**（part2/3 で「コマンドが見つかりません」に
+# なる）ため、ケースの外側で読む。読む位置は上の自前関数より後（同名があれば従来どおり
+# ヘルパー側が勝つ順序を変えない）
+. (Join-Path $hooksDir "handoff-common.ps1")
+
+if ($Part -eq "all" -or $Part -eq "1") {
 # C1: 閾値未満+ノイズ行（sidechain/部分行/型不正/壊れたJSON）は無発火
 Copy-Item (Join-Path $fixtures "transcripts/mixed-below.jsonl") $t -Force
 $o = Invoke-Hook "handoff-check.ps1" $stopIn
@@ -108,7 +139,7 @@ $sid7 = "11111111-2222-3333-4444-555555555555"
 $t7 = "$tRoot/t7.jsonl"
 $stopIn7 = @{ session_id = $sid7; transcript_path = $t7; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t7 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn7
+New-HardState $t7 "nonce-t7-00000000"
 $st7 = Get-Content -LiteralPath "$t7.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid7" | Out-Null
 $bad = (Get-Content -LiteralPath (Join-Path $fixtures "md/bad-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st7.nonce
@@ -178,7 +209,7 @@ $sid14 = "22222222-3333-4444-5555-666666666666"
 $t14 = "$tRoot/t14.jsonl"
 $stopIn14 = @{ session_id = $sid14; transcript_path = $t14; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t14 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn14
+New-HardState $t14 "nonce-t14-00000000"
 $st14 = Get-Content -LiteralPath "$t14.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid14" | Out-Null
 $md14 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff-subheadings.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st14.nonce
@@ -186,8 +217,8 @@ Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/$sid14/current.md" -Valu
 $o = Invoke-Hook "handoff-check.ps1" $stopIn14
 Write-Output "C14 output=$(Get-OutKind $o) state=$(Get-State $t14)"
 
-# C15/C16 は理由数のps/sh一致も見るため、検証関数を直接呼ぶ（codexレビュー3回目 High-1）
-. (Join-Path $hooksDir "handoff-common.ps1")
+# C15/C16 は理由数のps/sh一致も見るため、検証関数を直接呼ぶ（codexレビュー3回目 High-1。
+# ヘルパーの読み込みは前段で済ませてある）
 
 # C15: 必須見出しをすべて###へ退避した資料は拒否される（h1/h2のみが必須見出しとして有効。
 # サイズ・マーカーは正しいため、理由は「見出しが無い」×7 = 7件になるはず）
@@ -195,7 +226,7 @@ $sid15 = "33333333-4444-5555-6666-777777777777"
 $t15 = "$tRoot/t15.jsonl"
 $stopIn15 = @{ session_id = $sid15; transcript_path = $t15; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t15 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn15
+New-HardState $t15 "nonce-t15-00000000"
 $st15 = Get-Content -LiteralPath "$t15.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid15" | Out-Null
 $md15 = (Get-Content -LiteralPath (Join-Path $fixtures "md/bad-handoff-h3.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st15.nonce
@@ -211,7 +242,7 @@ $sid16 = "44444444-5555-6666-7777-888888888888"
 $t16 = "$tRoot/t16.jsonl"
 $stopIn16 = @{ session_id = $sid16; transcript_path = $t16; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t16 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn16
+New-HardState $t16 "nonce-t16-00000000"
 $st16 = Get-Content -LiteralPath "$t16.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid16" | Out-Null
 $md16 = (Get-Content -LiteralPath (Join-Path $fixtures "md/bad-handoff-empty-sections.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st16.nonce
@@ -227,7 +258,7 @@ $sid17 = "55555555-6666-7777-8888-999999999999"
 $t17 = "$tRoot/t17.jsonl"
 $stopIn17 = @{ session_id = $sid17; transcript_path = $t17; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t17 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn17
+New-HardState $t17 "nonce-t17-00000000"
 $st17 = Get-Content -LiteralPath "$t17.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid17" | Out-Null
 $md17 = (Get-Content -LiteralPath (Join-Path $fixtures "md/bad-handoff-casespace.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st17.nonce
@@ -242,7 +273,7 @@ $sid18 = "66666666-7777-8888-9999-aaaaaaaaaaaa"
 $t18 = "$tRoot/t18.jsonl"
 $stopIn18 = @{ session_id = $sid18; transcript_path = $t18; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t18 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn18
+New-HardState $t18 "nonce-t18-00000000"
 $st18 = Get-Content -LiteralPath "$t18.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid18" | Out-Null
 Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/$sid18/current.md" -Value ("x" * 11534336) -Encoding UTF8
@@ -256,7 +287,7 @@ $sid19 = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
 $t19 = "$tRoot/t19.jsonl"
 $stopIn19 = @{ session_id = $sid19; transcript_path = $t19; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t19 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn19
+New-HardState $t19 "nonce-t19-00000000"
 $st19 = Get-Content -LiteralPath "$t19.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid19" | Out-Null
 Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/$sid19/current.md" -Value ("`n" * 200000) -Encoding UTF8
@@ -270,7 +301,7 @@ $sid20 = "88888888-9999-aaaa-bbbb-cccccccccccc"
 $t20 = "$tRoot/t20.jsonl"
 $stopIn20 = @{ session_id = $sid20; transcript_path = $t20; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t20 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn20
+New-HardState $t20 "nonce-t20-00000000"
 $st20 = Get-Content -LiteralPath "$t20.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid20" | Out-Null
 $badNonce20 = $st20.nonce.Substring(0, 4) + "`r" + $st20.nonce.Substring(4)
@@ -287,7 +318,7 @@ $sid21 = "99999999-aaaa-bbbb-cccc-dddddddddddd"
 $t21 = "$tRoot/t21.jsonl"
 $stopIn21 = @{ session_id = $sid21; transcript_path = $t21; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t21 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn21
+New-HardState $t21 "nonce-t21-00000000"
 $st21 = Get-Content -LiteralPath "$t21.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid21" | Out-Null
 $md21 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st21.nonce
@@ -305,7 +336,7 @@ $sid22 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 $t22 = "$tRoot/t22.jsonl"
 $stopIn22 = @{ session_id = $sid22; transcript_path = $t22; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t22 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn22
+New-HardState $t22 "nonce-t22-00000000"
 $st22 = Get-Content -LiteralPath "$t22.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid22" | Out-Null
 $nbsp22 = [string][char]0x00A0
@@ -323,7 +354,7 @@ $sid23 = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 $t23 = "$tRoot/t23.jsonl"
 $stopIn23 = @{ session_id = $sid23; transcript_path = $t23; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t23 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn23
+New-HardState $t23 "nonce-t23-00000000"
 $st23 = Get-Content -LiteralPath "$t23.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid23" | Out-Null
 $md23 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st23.nonce
@@ -341,7 +372,7 @@ $sid24 = "cccccccc-dddd-eeee-ffff-000000000000"
 $t24 = "$tRoot/t24.jsonl"
 $stopIn24 = @{ session_id = $sid24; transcript_path = $t24; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t24 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn24
+New-HardState $t24 "nonce-t24-00000000"
 $st24 = Get-Content -LiteralPath "$t24.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid24" | Out-Null
 $shy24 = [string][char]0x00AD
@@ -383,7 +414,7 @@ $sid27 = "ffffffff-0000-1111-2222-333333333333"
 $t27 = "$tRoot/t27.jsonl"
 $stopIn27 = @{ session_id = $sid27; transcript_path = $t27; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t27 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn27
+New-HardState $t27 "nonce-t27-00000000"
 $st27 = Get-Content -LiteralPath "$t27.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid27" | Out-Null
 $md27 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st27.nonce
@@ -441,7 +472,7 @@ $t31 = "$tRoot/t31.jsonl"
 $stopIn31 = @{ session_id = $sid31; transcript_path = $t31; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 $pointer27Json = Get-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Raw -Encoding UTF8
 New-UsageTranscript $t31 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn31
+New-HardState $t31 "nonce-t31-00000000"
 $st31 = Get-Content -LiteralPath "$t31.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid31" | Out-Null
 $md31 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st31.nonce
@@ -473,6 +504,7 @@ Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Value ($la
 $restoreIn33 = @{ session_id = "66666666-0000-1111-2222-777777777777"; transcript_path = "$tRoot/new33.jsonl"; cwd = "$WorkDir/proj"; hook_event_name = "SessionStart"; source = "clear" }
 $o = Invoke-Hook "handoff-restore.ps1" $restoreIn33
 Write-Output "C33 output=$(Get-OutKind $o)"
+}
 
 # C34: compact経路の直近ユーザーメッセージ抽出で、typeが配列["user"]の行と
 # contentパーツのtypeが配列["text"]の要素は除外される（-is [string] ガードの回帰検出。
@@ -485,7 +517,7 @@ Add-Content -LiteralPath $t34 -Value '{"type":"user","isSidechain":false,"messag
 Add-Content -LiteralPath $t34 -Value '{"type":["user"],"isSidechain":false,"message":{"content":"MARKER-ARRTYPE-USER"}}' -Encoding UTF8
 Add-Content -LiteralPath $t34 -Value '{"type":"user","isSidechain":false,"message":{"content":[{"type":["text"],"text":"MARKER-ARRTEXT-PART"},{"type":"text","text":"MARKER-VALID-PART"},{"type":"text","text":["MARKER-ARRVAL-PART"]}]}}' -Encoding UTF8
 Add-Content -LiteralPath $t34 -Value '{"type":"user","isSidechain":false,"message":[{"content":"MARKER-ARRMSG-USER"}]}' -Encoding UTF8
-$null = Invoke-Hook "handoff-check.ps1" $stopIn34
+New-HardState $t34 "nonce-t34-00000000"
 $st34 = Get-Content -LiteralPath "$t34.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid34" | Out-Null
 $md34 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st34.nonce
@@ -499,12 +531,16 @@ $u3 = "no"; if ($o -match 'MARKER-ARRTEXT-PART') { $u3 = "yes" }
 $u4 = "no"; if ($o -match 'MARKER-VALID-PART') { $u4 = "yes" }
 $u5 = "no"; if ($o -match 'MARKER-ARRVAL-PART') { $u5 = "yes" }
 $u6 = "no"; if ($o -match 'MARKER-ARRMSG-USER') { $u6 = "yes" }
+if ($Part -eq "all" -or $Part -eq "1") {
 Write-Output "C34 output=$(Get-OutKind $o) u1=$u1 u2=$u2 u3=$u3 u4=$u4 u5=$u5 u6=$u6"
+}
 
 # C35〜C37: 有効なポインタ（sid34・未消費）をベースに、ポインタのフィールド型破壊を検証する
 # （旧実装ではPSの文字列縮退/jqの `// empty` により両実装の判定が分裂していた — 罠8の型固定）
+# このポインタはパート2・3の土台でもあるため、Part の指定に関わらず作る
 $validPtrJson = Get-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Raw -Encoding UTF8
 
+if ($Part -eq "all" -or $Part -eq "1") {
 # C35: sha256がboolean false → 非文字列は不一致として拒否（旧shは `// empty` でスキップし注入していた）
 $p35 = $validPtrJson | ConvertFrom-Json
 $p35.sha256 = $false
@@ -529,7 +565,9 @@ Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Value ($p3
 $restoreIn37 = @{ session_id = "aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb"; transcript_path = "$tRoot/new37.jsonl"; cwd = "$WorkDir/proj"; hook_event_name = "SessionStart"; source = "clear" }
 $o = Invoke-Hook "handoff-restore.ps1" $restoreIn37
 Write-Output "C37 output=$(Get-OutKind $o)"
+}
 
+if ($Part -eq "all" -or $Part -eq "1") {
 # C38: isSidechainが文字列"false"の行は除外しない（除外はboolean trueのみ — jqの `!= true` と
 # 同一契約。旧PSはtruthy判定で誤除外し無発火になっていた）
 $sid38 = "bbbbbbbb-0000-1111-2222-cccccccccccc"
@@ -619,7 +657,7 @@ $sid46 = "efefefef-0000-1111-2222-787878787878"
 $t46 = "$tRoot/t46.jsonl"
 $stopIn46 = @{ session_id = $sid46; transcript_path = $t46; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t46 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn46
+New-HardState $t46 "nonce-t46-00000000"
 $st46 = Get-Content -LiteralPath "$t46.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid46" | Out-Null
 $md46 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st46.nonce
@@ -656,7 +694,7 @@ $stopIn48 = @{ session_id = $sid48; transcript_path = $t48; cwd = "$WorkDir/proj
 New-UsageTranscript $t48 450
 Add-Content -LiteralPath $t48 -Value '{"type":"user","isSidechain":false,"message":{"content":"2026-01-02T03:04:05Z"}}' -Encoding UTF8
 Add-Content -LiteralPath $t48 -Value '{"type":"user","isSidechain":false,"message":{"content":[{"type":"text","text":"2026-01-02T03:04:05+09:00"}]}}' -Encoding UTF8
-$null = Invoke-Hook "handoff-check.ps1" $stopIn48
+New-HardState $t48 "nonce-t48-00000000"
 $st48 = Get-Content -LiteralPath "$t48.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid48" | Out-Null
 $md48 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st48.nonce
@@ -688,6 +726,9 @@ try {
 } catch { }
 Write-Output "C50 output=$(Get-OutKind $o) consumed=$c50"
 
+}
+
+if ($Part -eq "all" -or $Part -eq "2") {
 # C51: ポインタのupdated_epochが0 → 契約（0 < v）違反でポインタ無効・無出力
 # （UNIXエポック原点は「時刻なし」の典型的な偽値 — issue #34でupdated_at契約から置換)
 $p51 = $validPtrJson | ConvertFrom-Json
@@ -716,7 +757,7 @@ $stopIn53 = @{ session_id = $sid53; transcript_path = $t53; cwd = "$WorkDir/proj
 New-UsageTranscript $t53 450
 Add-Content -LiteralPath $t53 -Value '{"type":"user","isSidechain":false,"message":{"content":"2026-01-02T03:04:05Z"}}' -Encoding UTF8
 Add-Content -LiteralPath $t53 -Value '{"type":"user","isSidechain":false,"message":{"content":[{"type":"text","text":"2026-01-02T03:04:05+09:00"}]}}' -Encoding UTF8
-$null = Invoke-Hook "handoff-check.ps1" $stopIn53
+New-HardState $t53 "nonce-t53-00000000"
 $st53 = Get-Content -LiteralPath "$t53.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid53" | Out-Null
 $md53 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st53.nonce
@@ -788,7 +829,7 @@ $sid59 = "12121212-3434-5656-7878-909090909090"
 $t59 = "$tRoot/t59.jsonl"
 $stopIn59 = @{ session_id = $sid59; transcript_path = $t59; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t59 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn59
+New-HardState $t59 "nonce-t59-00000000"
 $st59 = Get-Content -LiteralPath "$t59.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid59" | Out-Null
 $md59 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st59.nonce
@@ -800,7 +841,7 @@ $sid59o = "77777777-6666-5555-4444-333333333333"
 $t59o = "$tRoot/t59o.jsonl"
 $stopIn59o = @{ session_id = $sid59o; transcript_path = $t59o; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t59o 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn59o
+New-HardState $t59o "nonce-t59o-00000000"
 $st59o = Get-Content -LiteralPath "$t59o.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid59o" | Out-Null
 $md59o = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st59o.nonce
@@ -857,7 +898,7 @@ $sid61 = "16161616-2727-3838-4949-606060606060"
 $t61 = "$tRoot/t61.jsonl"
 $stopIn61 = @{ session_id = $sid61; transcript_path = $t61; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t61 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn61
+New-HardState $t61 "nonce-t61-00000000"
 $st61 = Get-Content -LiteralPath "$t61.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid61" | Out-Null
 $md61 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st61.nonce
@@ -1003,7 +1044,9 @@ if (Test-Path -LiteralPath $errLog67) {
     $gateLog = [regex]::Matches((Get-Content -LiteralPath $errLog67 -Raw -Encoding UTF8), [regex]::Escape("transcript_pathがprojects_root配下の正規パスでないため")).Count
 }
 Write-Output "C67 dotdot=$(Get-OutKind $o67a)/$(Get-State $t67a) boundary=$(Get-OutKind $o67b)/$(Get-State $t67b) reset-dotdot=$surv67 gatelog=$gateLog"
+}
 
+if ($Part -eq "all" -or $Part -eq "2") {
 # C68: 包含ゲート — restore・save 4c・バイト長上限の回帰検出（issue #33 レビュー1回目 M2/L4）。
 #  a) restore: root外の実在stateはrestore後も生き残る（旧実装は最終削除で消していた）
 #  b) restore: root内の実在stateは従来どおり削除される（ゲートが正常系を壊していない）
@@ -1180,6 +1223,9 @@ for ($i = 0; $i -lt 5; $i++) {
 Remove-Item "Env:HANDOFF_TEST_NOW_EPOCH"
 Write-Output "C75 $($r75 -join ' ')"
 
+}
+
+if ($Part -eq "all" -or $Part -eq "3") {
 # C76: restoreのnow取得失敗はfail-closed（有効な未消費ポインタでも注入しない —
 # レビュー1回目 Lの失敗経路固定）
 Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Value $validPtrJson -Encoding UTF8 -NoNewline
@@ -1195,7 +1241,7 @@ $sid77 = "52525252-0707-2929-5151-737373737373"
 $t77 = "$tRoot/t77.jsonl"
 $stopIn77 = @{ session_id = $sid77; transcript_path = $t77; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
 New-UsageTranscript $t77 450
-$null = Invoke-Hook "handoff-check.ps1" $stopIn77
+New-HardState $t77 "nonce-t77-00000000"
 $st77 = Get-Content -LiteralPath "$t77.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid77" | Out-Null
 $md77 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st77.nonce
@@ -1414,7 +1460,7 @@ $sid80m = "71717171-2626-4848-7070-929292929292"
 $t80m = "$tRoot/t80m.jsonl"
 New-UsageTranscript $t80m 450
 $stopIn80m = @{ session_id = $sid80m; transcript_path = $t80m; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
-$null = Invoke-Hook "handoff-check.ps1" $stopIn80m
+New-HardState $t80m "nonce-t80m-00000000"
 $st80m = ConvertFrom-JsonPreserve (Get-Content -LiteralPath "$t80m.handoff-state.json" -Raw -Encoding UTF8)
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid80m" | Out-Null
 $md80m = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st80m.nonce
@@ -1435,7 +1481,7 @@ $sid80p = "75757575-3030-5252-7474-969696969696"
 $t80p = "$tRoot/t80p.jsonl"
 New-UsageTranscript $t80p 450
 $stopIn80p = @{ session_id = $sid80p; transcript_path = $t80p; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
-$null = Invoke-Hook "handoff-check.ps1" $stopIn80p
+New-HardState $t80p "nonce-t80p-00000000"
 $st80p = ConvertFrom-JsonPreserve (Get-Content -LiteralPath "$t80p.handoff-state.json" -Raw -Encoding UTF8)
 New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid80p" | Out-Null
 $md80p = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st80p.nonce
@@ -1466,6 +1512,287 @@ $n1 = 0
 foreach ($m in $msgs80n) { $n1 += Get-LogCount80 $m }
 $d80n = $n1 - $n0
 Write-Output "C80 ptr-unknown=$(Get-OutKind $o80a)/$d80a ptr-oldform=$(Get-OutKind $o80b)/$d80b ptr-badver=$(Get-OutKind $o80c)/$d80c ptr-wrongcase-dup=$(Get-OutKind $o80d) ptr-verfloat=$(Get-OutKind $o80e) state-unknown=$(Get-OutKind $o80f)/$(Get-State $t80f)/$d80f state-known=$(Get-OutKind $o80g)/$(Get-State $t80g) config-unknown=$(Get-OutKind $o80h)/$d80h state-oldform=$(Get-OutKind $o80i)/$(Get-State $t80i) state-badver=$(Get-OutKind $o80j)/$(Get-State $t80j)/$d80j sv-f=$sv80f sv-g=$sv80g soft-new=$(Get-OutKind $o80k)/$(Get-State $t80k)/$sv80k sv-complete=$sv80m sv-failpath=$sv80p sv-failed=$sv80q compact-oldform=$(Get-OutKind $o80m1) compact-unknown=$(Get-OutKind $o80m2) compact-badver=$(Get-OutKind $o80m3) ptr-notobj=$(Get-OutKind $o80n1)/$(Get-OutKind $o80n2)/$d80n"
+
+# C81: handoff-config.json が「1個のJSONオブジェクト」でない3態（JSON文が2つ / ルートが配列 /
+# 壊れたJSON）。いずれも機能を無効化し、診断を1件残して正常終了する。
+# 複数JSON文は、sh版のjqが各JSON文について出力するため統合パースの戻り値を先頭トークンだけで
+# 判定すると検証を通してしまい算術展開でexit 1になる回帰の防止（2026-08-30 codexレビュー High-1）。
+# 診断の文言も比較する（旧実装はsh版「不正」/PS版「パースに失敗」で分裂していた —
+# HANDOFF.mdバックログ10。出力は純ASCIIに保つため、文言そのものではなく分類を出す）。
+# ルート配列と壊れたJSONも見るのは、統合したparse経路のうち複数JSON文しか固定しておらず
+# 非object経路だけ元に戻っても通ってしまうため（codexレビュー M2）
+$sid81 = "81818181-8181-8181-8181-818181818181"
+$t81 = "$tRoot/t81.jsonl"
+New-UsageTranscript $t81 450
+$cfg81 = "$WorkDir/proj/.claude/handoff-config.json"
+$cfgBak81 = "$WorkDir/cfg81.bak"
+Copy-Item -LiteralPath $cfg81 -Destination $cfgBak81 -Force
+$cfgText81 = Get-Content -LiteralPath $cfgBak81 -Raw -Encoding UTF8
+$errLog81 = "$WorkDir/proj/.claude-handoff/error.log"
+# 文言は「[時刻] <source>: <本文>」の <本文> を**完全一致**で見る。部分一致や正規表現だと
+# 片側だけ接頭辞が増えても、`.` が任意1文字として通っても、大小が変わっても素通りして
+# 分裂の再発を見逃す（codexレビュー M1）
+$cfgParseMsg81 = "handoff-check: handoff-config.jsonのパースに失敗。機能を無効化中"
+$results81 = @()
+foreach ($case81 in @(
+        @{ Label = "multi"; Content = ($cfgText81 + $cfgText81); Sid = "81818181-8181-8181-8181-818181818181" },
+        @{ Label = "arr"; Content = ("[" + $cfgText81 + "]"); Sid = "82828282-8181-8181-8181-828282828282" },
+        @{ Label = "broken"; Content = '{"soft_threshold":'; Sid = "83838383-8181-8181-8181-838383838383" })) {
+    Set-Content -LiteralPath $cfg81 -Value $case81.Content -NoNewline -Encoding UTF8
+    $n81 = 0
+    if (Test-Path -LiteralPath $errLog81) { $n81 = @(Get-Content -LiteralPath $errLog81 -Encoding UTF8).Count }
+    $o81 = Invoke-Hook "handoff-check.ps1" @{ session_id = $case81.Sid; transcript_path = $t81; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
+    $rc81 = $LASTEXITCODE
+    $a81 = 0
+    if (Test-Path -LiteralPath $errLog81) { $a81 = @(Get-Content -LiteralPath $errLog81 -Encoding UTF8).Count }
+    $m81 = "other"
+    if (($a81 - $n81) -eq 1) {
+        $last81 = (@(Get-Content -LiteralPath $errLog81 -Encoding UTF8))[-1]
+        $ix81 = $last81.IndexOf("] ")
+        if ($ix81 -ge 0 -and [string]::Equals($last81.Substring($ix81 + 2), $cfgParseMsg81, [System.StringComparison]::Ordinal)) {
+            $m81 = "parse"
+        }
+    }
+    $results81 += ($case81.Label + "=" + (Get-OutKind $o81) + "/" + $rc81 + "/" + ($a81 - $n81) + "/" + $m81)
+}
+Copy-Item -LiteralPath $cfgBak81 -Destination $cfg81 -Force
+Write-Output ("C81 " + ($results81 -join " ") + " state=$(Get-State $t81)")
+
+# C82: session_id が「UUID + LF + 文字」のhook入力は、両実装とも何もしない
+# （HANDOFF.mdバックログ11の回帰）。sh版の ho_is_uuid は grep -Eq の**行単位一致**
+# だったため1行目のUUIDだけを見て受理し、PS版（-cmatch は非Multiline）は拒否していた。
+# MSYSのgrepはCRも行末として落とすので、内部改行がCRLFへ化けるWindowsでも再現する。
+# 末尾LFだけの値は sh側で届く前に剥がれるため両実装とも受理側で、ここでは分裂しない
+# （PS版の ^…$ を \z へ締めると逆向きに割れる）
+$t82 = "$tRoot/t82.jsonl"
+New-UsageTranscript $t82 450
+$sidLf82 = "82828282-8282-8282-8282-828282828282" + [char]10 + "x"
+$o82 = Invoke-Hook "handoff-check.ps1" @{ session_id = $sidLf82; transcript_path = $t82; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
+Write-Output ("C82 output=$(Get-OutKind $o82) state=$(Get-State $t82)")
+
+# C83: ポインタの文字列フィールドにNULを混ぜても両実装とも受理しない
+# （HANDOFF.mdバックログ13の回帰）。sh版の生の $(jq -r '.field' file) はNULを
+# シェルへ渡せず、Git shが「ignored null byte in input」としてNULを取り除いた値を
+# 返すため、<uuid> + NUL が正規UUIDへ、<sha> + NUL が正しいSHAへ縮退して検証を
+# 通っていた。PS版は.NET文字列としてNULを保持するので拒否側で、受否が分裂していた。
+# transcript_path も同じ経路で守るが、restoreのポインタ引用は
+# $HOME/.claude/projects を直接見ておりテストのfake設定ディレクトリ配下に無いため
+# ここでは観測できない（HANDOFF.mdバックログ14）
+$p83a = $validPtrJson | ConvertFrom-Json
+$p83a.session_id = $p83a.session_id + [char]0
+Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Value ($p83a | ConvertTo-Json) -Encoding UTF8
+$restoreIn83a = @{ session_id = "83838383-8383-8383-8383-838383838383"; transcript_path = "$tRoot/new83a.jsonl"; cwd = "$WorkDir/proj"; hook_event_name = "SessionStart"; source = "clear" }
+$o83a = Invoke-Hook "handoff-restore.ps1" $restoreIn83a
+$c83a = "unreadable"
+try {
+    $lp83 = Get-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($lp83.PSObject.Properties["consumed_at"] -and -not [string]::IsNullOrEmpty([string]$lp83.consumed_at)) { $c83a = "yes" }
+    else { $c83a = "no" }
+} catch { }
+$p83b = $validPtrJson | ConvertFrom-Json
+$p83b.sha256 = $p83b.sha256 + [char]0
+Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Value ($p83b | ConvertTo-Json) -Encoding UTF8
+$restoreIn83b = @{ session_id = "84848484-8383-8383-8383-848484848484"; transcript_path = "$tRoot/new83b.jsonl"; cwd = "$WorkDir/proj"; hook_event_name = "SessionStart"; source = "clear" }
+$o83b = Invoke-Hook "handoff-restore.ps1" $restoreIn83b
+Write-Output "C83 nulsid=$(Get-OutKind $o83a)/$c83a nulsha=$(Get-OutKind $o83b)"
+
+# C84: stdin側のNUL縮退（HANDOFF.mdバックログ13の回帰・その2。2026-08-30 codexレビュー Medium×2）
+#
+# a) stop_hook_active が "true" + NUL。旧sh版は ho_field の生のコマンド置換でNULが落ちて
+#    "true" と完全一致し、破損stateを消した直後に無言終了していた。PS版はNULを保持して
+#    一致せず、そのまま指示とstateを再生成する
+$t84 = "$tRoot/t84.jsonl"
+New-UsageTranscript $t84 450
+Set-Content -LiteralPath "$t84.handoff-state.json" -Value '{"mode":"soft","nonce":"nonce-t84-00000000","bogus":1}' -Encoding UTF8 -NoNewline
+$o84a = Invoke-Hook "handoff-check.ps1" @{ session_id = "84848484-1111-1111-1111-848484848484"; transcript_path = $t84; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = ("true" + [char]0) }
+#
+# b) session_id が <uuid> + NUL で、かつ別フィールド（trigger）に内部改行がある入力。
+#    バックログ12より前は、sh版が内部改行で**slow path**（フィールド別にjqを起こして
+#    コマンド置換で受ける経路）へ落ち、そこでNULが消えて正規UUIDへ縮退し受理していた。
+#    バックログ12でslow pathを廃止したので、いまは fast path 一本で、jqの @sh が
+#    NULをリテラルの \0 2文字へ符号化するため受理されない。
+#    trigger の内部改行は当時の再現条件をそのまま残してある（LFを生のまま持てることの
+#    確認も兼ねる）。PS版はNULを保持して拒否する
+$t84b = "$tRoot/t84b.jsonl"
+New-UsageTranscript $t84b 450
+$sid84b = "85858585-1111-1111-1111-858585858585" + [char]0
+$o84b = Invoke-Hook "handoff-check.ps1" @{ session_id = $sid84b; transcript_path = $t84b; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false; trigger = ("a" + [char]10 + "b") }
+Write-Output ("C84 nulactive=$(Get-OutKind $o84a)/$(Get-State $t84) nulsid=$(Get-OutKind $o84b)/$(Get-State $t84b)")
+
+# C85: ポインタ経由transcriptの引用がprojects_rootの解決関数を通ること
+# （HANDOFF.mdバックログ14の回帰）。旧実装は PS版 UserProfile直下 /
+# sh版 "$HOME/.claude/projects" の決め打ちで、CLAUDE_CONFIG_DIRを設定した環境では
+# 包含判定が常に外れ「直近のユーザーメッセージ」が無言で落ちていた。
+# この試験環境自体がCLAUDE_CONFIG_DIRを作業域へ向けているため、旧実装なら quote=no になる
+$sid85 = "12341234-5678-90ab-cdef-1234567890ab"
+$t85 = "$tRoot/t85.jsonl"
+New-UsageTranscript $t85 450
+Add-Content -LiteralPath $t85 -Value '{"type":"user","isSidechain":false,"message":{"content":"parity-c85-user-msg"}}' -Encoding UTF8
+New-HardState $t85 "nonce-t85-00000000"
+$st85 = Get-Content -LiteralPath "$t85.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid85" | Out-Null
+$md85 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st85.nonce
+Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/$sid85/current.md" -Value $md85 -Encoding UTF8
+$o = Invoke-Hook "handoff-check.ps1" @{ session_id = $sid85; transcript_path = $t85; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
+$restore85 = @{ session_id = "56785678-90ab-cdef-1234-567890abcdef"; transcript_path = "$tRoot/new85.jsonl"; cwd = "$WorkDir/proj"; hook_event_name = "SessionStart"; source = "clear" }
+$o85 = Invoke-Hook "handoff-restore.ps1" $restore85
+$quote85 = "no"
+if ($o85 -match 'parity-c85-user-msg') { $quote85 = "yes" }
+Write-Output "C85 output=$(Get-OutKind $o85) quote=$quote85"
+
+# C86: 包含判定の大小の扱いが両実装で一致すること（HANDOFF.mdバックログ15の回帰）。
+# sh版 ho_under_root は `cd`+`pwd`（論理パス）の結果をbyte比較するため、MSYSのpwdが畳む
+# **ドライブレターだけ大小無視・残りは大小区別**になる。PS版 Test-PathUnderRoot が
+# OrdinalIgnoreCase だと casevar でPS版だけが受理し、Ordinal だと drivevar で
+# PS版だけが拒否する。どちらの向きも見るため2態を並べる。
+# Windowsは大小非区別FSなのでどちらの綴りでもファイルは実在し、受否は包含判定だけで決まる。
+# 大小区別FS（Linux/macOS）では casevar のパスが実在せず、drivevar は反転対象が無いので、
+# 同じ期待値に落ち着くだけの一致確認になる（回帰検出力は無い —
+# codexレビュー Low。歯があるのはWindowsだけ）
+$sid86 = "13131313-2424-3535-4646-575757575757"
+$t86 = "$tRoot/t86.jsonl"
+New-UsageTranscript $t86 450
+Add-Content -LiteralPath $t86 -Value '{"type":"user","isSidechain":false,"message":{"content":"parity-c86-user-msg"}}' -Encoding UTF8
+New-HardState $t86 "nonce-t86-00000000"
+$st86 = Get-Content -LiteralPath "$t86.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+New-Item -ItemType Directory -Force "$WorkDir/proj/.claude-handoff/$sid86" | Out-Null
+$md86 = (Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8) -replace '\{\{NONCE\}\}', $st86.nonce
+Set-Content -LiteralPath "$WorkDir/proj/.claude-handoff/$sid86/current.md" -Value $md86 -Encoding UTF8
+$o = Invoke-Hook "handoff-check.ps1" @{ session_id = $sid86; transcript_path = $t86; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
+$latest86 = "$WorkDir/proj/.claude-handoff/latest.json"
+# 検証済みポインタのtranscript_pathだけを差し替えて未消費へ戻す（C10と同じ手口）
+function Invoke-ProbePtrQuote([string]$Tp, [string]$Sid, [string]$Marker) {
+    $ptr = Get-Content -LiteralPath $latest86 -Raw -Encoding UTF8 | ConvertFrom-Json
+    $ptr.PSObject.Properties.Remove("consumed_at")
+    $ptr.consumed = $false
+    $ptr.transcript_path = $Tp
+    Set-Content -LiteralPath $latest86 -Value ($ptr | ConvertTo-Json -Depth 10 -Compress) -Encoding UTF8
+    $outp = Invoke-Hook "handoff-restore.ps1" @{ session_id = $Sid; transcript_path = "$tRoot/newprobe.jsonl"; cwd = "$WorkDir/proj"; hook_event_name = "SessionStart"; source = "clear" }
+    $qp = "no"
+    if ($outp -match [regex]::Escape($Marker)) { $qp = "yes" }
+    return ((Get-OutKind $outp) + "/" + $qp)
+}
+# a) root部分の要素だけ大小違い（projects → Projects）: 両実装とも引用しない
+$r86case = Invoke-ProbePtrQuote "$WorkDir/claude-config/Projects/proj/t86.jsonl" "24242424-3535-4646-5757-686868686868" "parity-c86-user-msg"
+# b) ドライブレターだけ大小違い: 両実装とも引用する（先頭が「英字:」でなければ無変換）
+$tp86drive = $t86
+if ($t86.Length -ge 2 -and $t86[1] -eq [char]58) {
+    $d86 = $t86[0]
+    if ($d86 -ge [char]65 -and $d86 -le [char]90) {
+        $tp86drive = ([string]$d86).ToLowerInvariant() + $t86.Substring(1)
+    } elseif ($d86 -ge [char]97 -and $d86 -le [char]122) {
+        $tp86drive = ([string]$d86).ToUpperInvariant() + $t86.Substring(1)
+    }
+}
+$r86drive = Invoke-ProbePtrQuote $tp86drive "35353535-4646-5757-6868-797979797979" "parity-c86-user-msg"
+Write-Output "C86 casevar=$r86case drivevar=$r86drive"
+
+# C87: 経路にsymlink/junctionがあれば両実装とも拒否すること
+# （HANDOFF.mdバックログ16の回帰）。以前は sh版の `cd`+`pwd` も PS版の GetFullPath も
+# **字句解決のまま**（MSYSの pwd は既定で論理パス。物理解決は pwd -P）で、
+# projects_root 配下に置かれたjunctionをどちらも受理していた。実測: 旧実装は
+# sh/PSとも outlink=injected/yes inlink=injected/yes で、**root外のファイルを引用できた**。
+# 分裂ではなく共通の穴だったので、両実装を「経路のsymlinkは拒否」へ揃えて塞いだ。
+# リンクが作れない環境ではパスが実在せず、どちらの態も同じ `no` に落ち着く
+# （期待値は安定するが歯は無くなる）
+function New-TestLink([string]$Link, [string]$Target, [bool]$IsDir) {
+    # ディレクトリはWindowsではjunction（管理者不要。MSYSからは [ -h ] でsymlinkに見える）。
+    # ファイルsymlinkはWindowsではDeveloper Mode/管理者が要るので作れないことがある
+    try {
+        if ($IsDir -and -not (($PSVersionTable.PSEdition -eq "Core") -and (-not $IsWindows))) {
+            New-Item -ItemType Junction -Path $Link -Target $Target -ErrorAction Stop | Out-Null
+        } else {
+            New-Item -ItemType SymbolicLink -Path $Link -Target $Target -ErrorAction Stop | Out-Null
+        }
+        return $true
+    } catch { return $false }
+}
+# リンクが作れたかは**stderrに出す**（stdoutへ出すと期待値が環境依存になる）。
+# 作れなかった態は「パスが実在しない」ので同じ no に落ち着き、期待値は安定するが
+# 歯は無くなる。緑なのに空試験、という状態を見えるようにするための警告
+function Write-LinkWarn87([string]$What) {
+    [Console]::Error.WriteLine("C87: リンクを作れませんでした（この態は空試験になります）: $What")
+}
+$pRoot87 = "$WorkDir/claude-config/projects"
+New-Item -ItemType Directory -Force "$WorkDir/outside87" | Out-Null
+New-Item -ItemType Directory -Force "$pRoot87/real87" | Out-Null
+New-Item -ItemType Directory -Force "$pRoot87/leafdir87" | Out-Null
+Set-Content -LiteralPath "$WorkDir/outside87/t87o.jsonl" -Value '{"type":"user","isSidechain":false,"message":{"content":"parity-c87-outside"}}' -Encoding UTF8
+Set-Content -LiteralPath "$pRoot87/real87/t87i.jsonl" -Value '{"type":"user","isSidechain":false,"message":{"content":"parity-c87-inside"}}' -Encoding UTF8
+Set-Content -LiteralPath "$WorkDir/outside87/t87l.jsonl" -Value '{"type":"user","isSidechain":false,"message":{"content":"parity-c87-leaf"}}' -Encoding UTF8
+if (-not (New-TestLink "$pRoot87/linkout87" "$WorkDir/outside87" $true)) { Write-LinkWarn87 "outlink（ディレクトリ）" }
+if (-not (New-TestLink "$pRoot87/linkin87" "$pRoot87/real87" $true)) { Write-LinkWarn87 "inlink（ディレクトリ）" }
+# c) 対象ファイル自身がsymlink（親ディレクトリはroot配下の実ディレクトリ）。
+# 親までしか見ない実装ではここが素通りしてroot外を読めてしまう
+if (-not (New-TestLink "$pRoot87/leafdir87/t87l.jsonl" "$WorkDir/outside87/t87l.jsonl" $false)) { Write-LinkWarn87 "leaflink（ファイル）" }
+$r87out = Invoke-ProbePtrQuote "$pRoot87/linkout87/t87o.jsonl" "46464646-5757-6868-7979-808080808080" "parity-c87-outside"
+$r87in = Invoke-ProbePtrQuote "$pRoot87/linkin87/t87i.jsonl" "57575757-6868-7979-8080-919191919191" "parity-c87-inside"
+$r87leaf = Invoke-ProbePtrQuote "$pRoot87/leafdir87/t87l.jsonl" "68686868-7979-8080-9191-020202020202" "parity-c87-leaf"
+Write-Output "C87 outlink=$r87out inlink=$r87in leaflink=$r87leaf"
+
+# C88: 文字列フィールドの末尾LFを剥がさないこと（HANDOFF.mdバックログ12の回帰）。
+# 旧sh版は cwd / session_id / source / trigger の末尾LFをjq側で剥がしてから使い、
+# PS版は生値を使っていたため、同じ入力で結果が割れていた。
+# 旧実装での実測（このケースの観測値。3態とも旧shだけが違い、新実装は旧PSに揃った）:
+#   sidlf  旧sh=hard/hard/1   旧PS=none/none     新=none/none
+#   srclf  旧sh=injected/yes  旧PS=injected/no   新=injected/no
+#   stoplf 旧sh=none/none     旧PS=hard/hard/1   新=hard/hard/1
+# sidlf は「旧shが末尾LFを剥がして受理しハード指示まで進む / 旧PSは Test-Uuid を
+# 通っても後段のパス検査で落ちて無出力」という受否の分裂だった（旧記述の
+# 「受否は一致する」はこの経路では誤り）。
+# いまは両実装とも「剥がさない＝一致しない」でfail-closedに揃っている
+$t88 = "$tRoot/t88.jsonl"
+New-UsageTranscript $t88 450
+$o88a = Invoke-Hook "handoff-check.ps1" @{ session_id = "88888888-1212-3434-5656-787878787878`n"; transcript_path = $t88; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
+# b) source が「clear + 末尾LF」。有効なポインタがあっても clear 扱いにしない
+#    （C85〜C87で消費済みなので、未消費へ戻し transcript_path も実在するものへ戻す）
+$ptr88 = Get-Content -LiteralPath $latest86 -Raw -Encoding UTF8 | ConvertFrom-Json
+$ptr88.PSObject.Properties.Remove("consumed_at")
+$ptr88.consumed = $false
+$ptr88.transcript_path = $t85
+Set-Content -LiteralPath $latest86 -Value ($ptr88 | ConvertTo-Json -Depth 10 -Compress) -Encoding UTF8
+$o88b = Invoke-Hook "handoff-restore.ps1" @{ session_id = "79797979-1212-3434-5656-898989898989"; transcript_path = "$tRoot/new88.jsonl"; cwd = "$WorkDir/proj"; hook_event_name = "SessionStart"; source = "clear`n" }
+# 注入の有無では差が出ない（clear以外でも有効ポインタがあれば注入する）。
+# clearかどうかで変わるのは**ポインタの消費**なので、そちらを見る
+$cons88 = "no"
+$ptrAfter88 = Get-Content -LiteralPath $latest86 -Raw -Encoding UTF8 | ConvertFrom-Json
+if (-not [string]::IsNullOrEmpty($ptrAfter88.consumed_at)) { $cons88 = "yes" }
+# c) stop_hook_active が「true + 末尾LF」。破損stateを消した直後に無言終了しない
+$t88c = "$tRoot/t88c.jsonl"
+New-UsageTranscript $t88c 450
+Set-Content -LiteralPath "$t88c.handoff-state.json" -Value '{"mode":"soft","nonce":"nonce-t88-00000000","bogus":1}' -Encoding UTF8 -NoNewline
+$o88c = Invoke-Hook "handoff-check.ps1" @{ session_id = "70707070-1212-3434-5656-909090909090"; transcript_path = $t88c; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = "true`n" }
+Write-Output "C88 sidlf=$(Get-OutKind $o88a)/$(Get-State $t88) srclf=$(Get-OutKind $o88b)/$cons88 stoplf=$(Get-OutKind $o88c)/$(Get-State $t88c)"
+
+# C89: strfieldの新契約（内部LFも末尾LFも生のまま持つ / CRを含む値は空）を、値が実際に
+# ファイルへ落ちる `trigger` で観測する（HANDOFF.mdバックログ12の回帰）。
+# C88は session_id / source / stop_hook_active しか見ておらず、strfieldがLF・CRの
+# 扱いだけ元へ戻っても通ってしまう（2026-08-31 codexレビュー Low）。
+# 旧実装での実測（このケースの観測値。cr は旧sh・旧PSの**両方**に歯がある）:
+#   lf  旧sh=[man<CR><LF>ual]  旧PS=[man<LF>ual<LF>]  新=[man<LF>ual<LF>]
+#   cr  旧sh=[a<CR>b]          旧PS=[a<CR>b]          新=[]
+# meta.jsonのtriggerはそのままだと行を割るので、CRとLFを可視トークンへ置換して出す
+$sid89 = "89898989-1212-3434-5656-121212121212"
+$t89 = "$tRoot/t89.jsonl"
+New-UsageTranscript $t89 450
+function Get-SavedTrigger89 {
+    param($SaveInput)
+    $null = Invoke-Hook "handoff-save.ps1" $SaveInput
+    $b89 = Get-ChildItem -LiteralPath "$WorkDir/proj/.claude-handoff/$sid89/backup" -Directory |
+        Sort-Object Name -Descending | Select-Object -First 1
+    $v89 = "unreadable"
+    try {
+        $m89 = Get-Content -LiteralPath (Join-Path $b89.FullName "meta.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($m89.trigger -is [string]) {
+            $v89 = "[" + $m89.trigger.Replace([string][char]13, "<CR>").Replace([string][char]10, "<LF>") + "]"
+        } else { $v89 = "notstring" }
+    } catch { }
+    return $v89
+}
+$tg89a = Get-SavedTrigger89 @{ session_id = $sid89; transcript_path = $t89; cwd = "$WorkDir/proj"; hook_event_name = "PreCompact"; trigger = ("man" + [char]10 + "ual" + [char]10) }
+$tg89b = Get-SavedTrigger89 @{ session_id = $sid89; transcript_path = $t89; cwd = "$WorkDir/proj"; hook_event_name = "PreCompact"; trigger = ("a" + [char]13 + "b") }
+Write-Output "C89 lf=$tg89a cr=$tg89b"
+}
 
 # KEEP_WORK=1 で作業ディレクトリを残す（失敗ケースの成果物調査用。issue #16）
 if ([string]::IsNullOrEmpty($env:KEEP_WORK)) {

@@ -37,3 +37,9 @@ S6L .claude/hooks/claude-remote-handoff/
 S6L .claude/settings.local.json*
 S7 exit=0 lines=0 starred=0 rec=0 config=0
 S8 exit=0 lines=0 starred=0 rec=0 config=0
+S9 exit=1 lines=5 starred=1 rec=0 config=1
+S9L node_modules/
+S9L .claude-handoff/
+S9L .claude/handoff-config.json
+S9L .claude/hooks/claude-remote-handoff/
+S9L .claude/settings.local.json*

@@ -106,9 +106,8 @@ try {
     }
 
     # 3. メタデータ（原子的書き込み）
-    # 文字列以外のtriggerは空にする（shのho_string_fieldと同一契約 — 罠8の型固定）
-    $trigger = ""
-    if ((Test-HoProp $inp "trigger") -and ($inp.trigger -is [string])) { $trigger = $inp.trigger }
+    # 文字列以外・NUL/CRを含むtriggerは空にする（sh版 strfield と同一契約）
+    $trigger = Get-HoStrField $inp "trigger"
     $meta = @{
         saved_at        = (Get-Date).ToString("yyyy-MM-ddTHH:mm:sszzz")
         session_id      = $sessionId

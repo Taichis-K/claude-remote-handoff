@@ -120,6 +120,20 @@ $HO_POINTER_KNOWN_KEYS = @("schema_version", "session_id", "nonce", "sha256", "t
 $HO_STATE_KNOWN_KEYS = @("schema_version", "mode", "nonce", "attempts", "completed", "failed")
 $HO_CONFIG_KNOWN_KEYS = @("soft_threshold", "hard_threshold", "min_margin", "conservative_fire_pct", "autocompact_window")
 
+function Get-HoStrField {
+    param($Obj, [string]$Name)
+    # フック入力の文字列フィールド（cwd / source / trigger）の取得契約。
+    # 文字列以外・NULを含む値・**CRを含む値**は空扱い（sh版 strfield と同一契約 —
+    # HANDOFF.mdバックログ12）。CRを落とすのは「シェルが運べないから」で、
+    # sh版は @sh + eval の往復でCRが消えるため値を持てない。LFは両実装とも
+    # **剥がさず生のまま**扱う（sh版も運べることを実測済み）
+    $v = Get-HoProp $Obj $Name
+    if (-not ($v -is [string])) { return "" }
+    if ($v.IndexOf([char]0) -ge 0) { return "" }
+    if ($v.IndexOf([char]13) -ge 0) { return "" }
+    return $v
+}
+
 function Test-HoOnlyKnownKeys {
     # 閉じたスキーマ検証（issue #38）: 既知キー以外のキーが1つでもあればfalse。
     # 照合はordinal完全一致（大小違いキーは未知キー — issue #37の契約と整合）
@@ -171,8 +185,8 @@ function Get-ProjectDir {
     # CLAUDE_PROJECT_DIR優先、無ければフック入力のcwd（セッション中のcd影響に注意）
     $dir = $env:CLAUDE_PROJECT_DIR
     if ([string]::IsNullOrEmpty($dir) -and $null -ne $HookInput) {
-        $hoCwd = Get-HoProp $HookInput "cwd"
-        if ($hoCwd -is [string]) { $dir = $hoCwd }
+        # NUL/CRを含む値は空扱い（sh版 strfield と同一契約 — バックログ12）
+        $dir = Get-HoStrField $HookInput "cwd"
     }
     if ([string]::IsNullOrEmpty($dir)) { return $null }
     return $dir
@@ -234,7 +248,12 @@ function Test-Uuid {
     if (-not ($Value -is [string])) { return $false }
     if ([string]::IsNullOrEmpty($Value)) { return $false }
     # -cmatch: -matchのカルチャ依存の大小畳み込み（U+212A等が[A-Za-z]に一致）を避ける（罠8）
-    return ($Value -cmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+    # アンカーは \A…\z（^…$ ではない）。.NETの $ は「終端の直前のLF」にも一致するため、
+    # ^…$ だと「UUID + 末尾LF」を受理してしまう。sh版は ho_is_uuid の case による
+    # 全文一致で拒否するので、締めないとPS版だけが受理する分裂になる。
+    # 以前は sh側が末尾LFを剥がしてから検証していたので ^…$ で揃っていたが、
+    # バックログ12で「剥がさず生のまま持つ」へ変えたのに合わせてここも締めた
+    return ($Value -cmatch '\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z')
 }
 
 function New-TempPath {
@@ -243,18 +262,94 @@ function New-TempPath {
     return (Join-Path $Dir ("$Prefix.$PID." + [guid]::NewGuid().ToString("N") + ".tmp"))
 }
 
+function ConvertTo-HoDriveLowerPath {
+    param([string]$P)
+    # 先頭が「<ASCII英字>:」ならそのドライブレターだけ小文字へ畳む。
+    # sh版の `cd`+`pwd`（MSYS）が「D:/x」も「d:/x」も /d/x へ畳むのに合わせるため。
+    # ToLower()はカルチャ依存（トルコ語ロケールで I が dotless i になる）なので使わない
+    if ($P.Length -ge 2 -and $P[1] -eq [char]58) {
+        $d = $P[0]
+        if (($d -ge [char]65 -and $d -le [char]90) -or ($d -ge [char]97 -and $d -le [char]122)) {
+            return ([string]$d).ToLowerInvariant() + $P.Substring(1)
+        }
+    }
+    return $P
+}
+
+function Test-HoContained {
+    param([string]$Root, [string]$Path)
+    # 包含ゲートの唯一の判定規則（HANDOFF.mdバックログ16。sh版 ho_contained_strict と
+    # 同一契約）。$Root は「/」正規化済み・末尾スラッシュなし、$Path も「/」正規化済み:
+    #   連続区切り（"//"）を全域拒否 → ドライブレターを小文字へ畳んで ordinal 前方一致 →
+    #   Rootから $Path の親までの各構成要素が「実在ディレクトリかつ非reparse point」
+    # **symlink/junctionは追跡せず、経路にあれば拒否する**。以前は PS版が GetFullPath、
+    # sh版が `cd`+`pwd` で、どちらも**字句解決のまま**だった（MSYSの `pwd` は既定で
+    # 論理パスを返す。物理解決は `pwd -P` — 実測）。そのため projects_root 配下に
+    # 置かれたroot外を指すjunctionを**両実装とも受理し、root外のファイルを
+    # 引用できていた**（2026-08-31 codexレビュー Medium。ただし「sh版は物理解決するので
+    # 拒否する」という指摘の前提は誤りで、分裂ではなく共通の穴だった — C87で実測）。
+    # 経路のsymlinkを拒否する規則は組B（Get-ValidStateFilePath）が元から持っており、
+    # そちらへ揃えた。
+    # ".."は追跡しないと畳めないため、呼び出し側が Test-HandoffPathToken で先に拒否すること
+    $r = ConvertTo-HoDriveLowerPath $Root
+    $p = ConvertTo-HoDriveLowerPath $Path
+    if ($p.IndexOf("//", [System.StringComparison]::Ordinal) -ge 0) { return $false }
+    if (-not $p.StartsWith($r + "/", [System.StringComparison]::Ordinal)) { return $false }
+    if (-not (Test-Path -LiteralPath $r -PathType Container)) { return $false }
+    if (-not (Test-NotReparsePoint $r)) { return $false }
+    $ix = $p.LastIndexOf([char]47)
+    $rel = $p.Substring(0, $ix).Substring($r.Length)
+    if ($rel.StartsWith("/", [System.StringComparison]::Ordinal)) { $rel = $rel.Substring(1) }
+    $cur = $r
+    if ($rel.Length -gt 0) {
+        foreach ($seg in $rel.Split([char[]]@([char]47))) {
+            if ($seg.Length -eq 0) { return $false }
+            $cur = $cur + "/" + $seg
+            if (-not (Test-Path -LiteralPath $cur -PathType Container)) { return $false }
+            if (-not (Test-NotReparsePoint $cur)) { return $false }
+        }
+    }
+    # leaf自身がreparse point（symlink/junction）なら拒否する。親までしか見ないと
+    # 「<root>/proj/session.jsonl -> /tmp/outside.jsonl」のように**対象ファイルを**
+    # リンクに差し替えるだけでroot外を読めてしまう（後段の Test-Path も Get-Content も
+    # リンクを追跡する — 2026-08-31 codexレビュー Medium-1）。
+    # 実在しないleafは通す（書込みモードの呼び出しがあるため。sh版の `[ -h ]` と同じ扱い）
+    try {
+        $leaf = Get-Item -LiteralPath $p -Force -ErrorAction Stop
+        if (($leaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+    } catch { }
+    return $true
+}
+
 function Test-PathUnderRoot {
     param([string]$Root, [string]$Candidate)
-    # 正規化後にRoot配下であることを確認（..\ やUNC等によるroot外参照を防ぐ）
-    try {
-        $r = [System.IO.Path]::GetFullPath($Root)
-        $c = [System.IO.Path]::GetFullPath($Candidate)
-        $sep = [System.IO.Path]::DirectorySeparatorChar
-        if (-not $r.EndsWith($sep, [System.StringComparison]::Ordinal)) { $r = "$r$sep" }
-        return $c.StartsWith($r, [System.StringComparison]::OrdinalIgnoreCase)
-    } catch {
-        return $false
+    # Root配下であることを確認（..\ やUNC等によるroot外参照を防ぐ）。
+    # 判定は Test-HoContained に一本化してある（バックログ16で組A・組Bの契約を統一）。
+    # ".." は GetFullPath で畳むのをやめ、Test-HandoffPathToken で拒否する側へ移した
+    # （symlinkを追跡しない以上、字句で畳むと sh版と食い違うため）
+    if (-not (Test-HandoffNoTraversal $Candidate)) { return $false }
+    $r = $Root.Replace([char]92, [char]47).TrimEnd([char]47)
+    if ([string]::IsNullOrEmpty($r)) { return $false }
+    return (Test-HoContained -Root $r -Path $Candidate.Replace([char]92, [char]47))
+}
+
+function Test-HandoffNoTraversal {
+    param([string]$P)
+    # 組Aの前段検査（sh版 ho_no_traversal と同一契約）。制御文字（C0/DEL）と
+    # "."/".." セグメントだけを拒否する。".." は追跡しない以上ここで落とすしかない。
+    # **Test-HandoffPathToken は使わない**: あちらはWindows予約デバイス名やドライブ位置
+    # 以外のコロンも拒否するが、組Aの候補は利用者のプロジェクトパス由来で、
+    # POSIXでは /srv/aux/repo や /srv/team:blue/repo が正当な絶対パスである。
+    # 全プラットフォームでWindowsの名前規則を課すとmacOS/Linuxで復元不能になる
+    # （2026-08-31 codexレビュー Medium-3）。root外参照は包含判定と経路のsymlink拒否が塞ぐ
+    if ([string]::IsNullOrEmpty($P)) { return $false }
+    foreach ($ch in $P.ToCharArray()) {
+        if ([int]$ch -lt 0x20 -or [int]$ch -eq 0x7F) { return $false }
     }
+    foreach ($seg in $P.Replace([char]92, [char]47).Split([char[]]@([char]47))) {
+        if ($seg -eq "." -or $seg -eq "..") { return $false }
+    }
+    return $true
 }
 
 # --- transcript由来の状態ファイルパス包含ゲート（issue #33） ---
@@ -371,28 +466,23 @@ function Get-ValidStateFilePath {
     if ([System.Text.Encoding]::UTF8.GetByteCount($derived) -gt 240) { return $null }
     $root = Get-ClaudeProjectsRoot
     if ($null -eq $root) { return $null }
-    if (-not $derived.StartsWith($root + "/", [System.StringComparison]::Ordinal)) { return $null }
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return $null }
-    if (-not (Test-NotReparsePoint $root)) { return $null }
-    # rootから対象までの各構成要素を検査（中間=実在ディレクトリかつ非reparse。
-    # symlink/junction経由でroot外の実体を指す経路を遮断する）
-    $parts = $derived.Substring($root.Length + 1).Split([char[]]@([char]47))
-    $cur = $root
-    for ($i = 0; $i -lt $parts.Length; $i++) {
-        if ($parts[$i].Length -eq 0) { return $null }
-        $cur = $cur + "/" + $parts[$i]
-        if ($i -lt $parts.Length - 1) {
-            if (-not (Test-Path -LiteralPath $cur -PathType Container)) { return $null }
-            if (-not (Test-NotReparsePoint $cur)) { return $null }
-        } elseif (Test-OrdinalEqual $Mode "delete") {
-            if (-not (Test-RegularFile $cur)) { return $null }
-        } else {
-            if (Test-Path -LiteralPath $cur) {
-                if (-not (Test-RegularFile $cur)) { return $null }
-            }
+    # 包含判定は Test-HoContained に一本化してある（バックログ16で組A=Test-PathUnderRoot と
+    # 契約を揃えた）。中身は「連続区切りの全域拒否＋ドライブレターを畳んだordinal前方一致＋
+    # rootから親までの各要素が実在ディレクトリかつ非reparse」。
+    # 戻り値の $derived はドライブレターを畳まない生の形のままにする
+    if (-not (Test-HoContained -Root $root -Path $derived)) { return $null }
+    # leafの検査と戻り値は $derived そのものに対して行う（検証対象と操作対象を
+    # 同一文字列にする）。以前はrootから組み立て直した文字列を返していたが、
+    # ドライブレターの大小を畳んで前方一致するようになった以上、組み立て直すと
+    # 「rootの綴りで作った別の文字列」を返し得る（sh版は元から生の _vp を返している）
+    if (Test-OrdinalEqual $Mode "delete") {
+        if (-not (Test-RegularFile $derived)) { return $null }
+    } else {
+        if (Test-Path -LiteralPath $derived) {
+            if (-not (Test-RegularFile $derived)) { return $null }
         }
     }
-    return $cur
+    return $derived
 }
 
 function Get-HoNowEpoch {

@@ -78,3 +78,12 @@ C77 output=other msg=yes latest=intact state=completed
 C78 lf=injected zeros=injected digits19=injected valid=injected
 C79 wrongcase-consumed=none/1 wrongcase-mode=hard/hard/1 wrongcase-source=injected consumed=no content-valid=yes content-wrongcase=no
 C80 ptr-unknown=none/1 ptr-oldform=none/1 ptr-badver=none/1 ptr-wrongcase-dup=none ptr-verfloat=injected state-unknown=hard/hard/1/1 state-known=hard-retry/hard/2 config-unknown=none/1 state-oldform=hard-retry/hard/2 state-badver=hard/hard/1/1 sv-f=yes sv-g=yes soft-new=soft/soft/1/yes sv-complete=yes sv-failpath=yes sv-failed=yes compact-oldform=injected compact-unknown=refused compact-badver=refused ptr-notobj=none/none/0
+C81 multi=none/0/1/parse arr=none/0/1/parse broken=none/0/1/parse state=none
+C82 output=none state=none
+C83 nulsid=none/no nulsha=refused
+C84 nulactive=hard/hard/1 nulsid=none/none
+C85 output=injected quote=yes
+C86 casevar=injected/no drivevar=injected/yes
+C87 outlink=injected/no inlink=injected/no leaflink=injected/no
+C88 sidlf=none/none srclf=injected/no stoplf=hard/hard/1
+C89 lf=[man<LF>ual<LF>] cr=[]

@@ -56,12 +56,13 @@ emit_hard() {
 main() {
     ho_require_jq handoff-check || exit 0
     ho_read_input || exit 0
-    handoff_root=$(ho_handoff_root) || exit 0
-    project_dir=$(ho_project_dir)
+    ho_set_project || exit 0
+    handoff_root=$HO_HANDOFF_ROOT
+    project_dir=$HO_PROJECT_DIR
 
-    transcript=$(ho_path_field transcript_path)
+    transcript=$HO_TRANSCRIPT_PATH
     [ -n "$transcript" ] && [ -f "$transcript" ] || exit 0
-    session_id=$(ho_string_field session_id)
+    session_id=$HO_SESSION_ID
     ho_is_uuid "$session_id" || exit 0
 
     # --- 設定読込み（明示設定必須・値検証。不正は安全側に無効化） ---
@@ -72,46 +73,75 @@ main() {
     # 閉じたスキーマ（issue #38 — 設計文書4.4）: 既知キー以外が1つでもあれば機能無効
     # （タイポで閾値が既定値に静かに落ちる事故と、未知キー経由の将来の解釈分裂を防ぐ。
     # 大小違いキーも未知キー — issue #37の契約と整合。PS版と同一契約）
-    config_ok=$(jq -r --argjson known "$HO_CONFIG_KNOWN_KEYS" '
+    # 検証と値取得を1回のjqで行う（2026-08-30の速度対策）。以前は同じファイルを
+    # 7回パースしていた（config_ok / win_ok / soft / hard / min_margin / pct /
+    # autocompact_window）。Windowsではプロセス起動が1回70〜85msで、フック1回の
+    # 実測4.8秒の主因がこの多重パースだった。
+    # 出力形式は「状態」または「ok <soft> <hard> <min_margin> <pct> <window>」。
+    # 値は全てokint（JSON number・整数・範囲内）を通ったものだけなので、
+    # 空白・改行・引用符・null は原理的に混じらない（文字列項目は1つも無い）。
+    # 診断の順序と文言は分割時と完全に同一に保つこと（configのtype/未知キー/妥当性 →
+    # そのあとautocompact_window。C80がこの文言と件数を固定している）
+    # -s（slurp）で入力を配列にし、**JSON文がちょうど1個**であることを要求する。
+    # jqは既定で各JSON文ごとに出力するため、configに2文入っていると出力が2行になり、
+    # ${config_read%% *} が1行目の "ok" だけを拾って検証を通してしまう（分割時は
+    # config_ok が2行（ok と ok）になり「不正」で安全に停止していた — codexレビュー1回目 High-1）
+    config_read=$(jq -s -r --argjson known "$HO_CONFIG_KNOWN_KEYS" '
         def okint(min; max): type == "number" and . == floor and . >= min and . <= max;
-        if type != "object" then "bad"
+        if length != 1 then "parse" else .[0] |
+        if type != "object" then "parse"
         elif ([keys_unsorted[] | select(. as $k | $known | index($k) | not)] | length) > 0 then "unknown"
         elif (.soft_threshold | okint(1; 1000000000))
            and (.hard_threshold | okint(1; 1000000000))
            and (.soft_threshold <= .hard_threshold)
            and ((has("min_margin") | not) or (.min_margin | okint(0; 1000000000)))
            and ((has("conservative_fire_pct") | not) or (.conservative_fire_pct | okint(1; 100)))
-        then "ok" else "bad" end' "$config_path" 2>/dev/null)
+        then
+            (if (.autocompact_window | okint(1; 1000000000))
+             then "ok \(.soft_threshold) \(.hard_threshold) \(.min_margin // 10000) \(.conservative_fire_pct // 92) \(.autocompact_window)"
+             else "badwin" end)
+        else "bad" end end' "$config_path" 2>/dev/null)
+    config_ok=${config_read%% *}
     if [ "$config_ok" = "unknown" ]; then
         ho_error "$handoff_root" "handoff-check" "handoff-config.jsonに未知のキーがあります。機能を無効化中"
         exit 0
-    elif [ "$config_ok" != "ok" ]; then
-        ho_error "$handoff_root" "handoff-check" "handoff-config.jsonが不正。機能を無効化中"
-        exit 0
-    fi
-    # autocompact_window は必須（issue #32: fire-point検証のfail-closed化。windowが解決
-    # できないまま機能が有効になる「compactより確実に前で発火」の保証抜けを廃止。
-    # setupは常に書くため、無いのは旧configか手書き漏れ — 無効化+診断で気づける）
-    win_ok=$(jq -r '
-        def okint(min; max): type == "number" and . == floor and . >= min and . <= max;
-        if (type == "object") and (.autocompact_window | okint(1; 1000000000))
-        then "ok" else "bad" end' "$config_path" 2>/dev/null)
-    if [ "$win_ok" != "ok" ]; then
+    elif [ "$config_ok" = "badwin" ]; then
+        # autocompact_window は必須（issue #32: fire-point検証のfail-closed化。windowが解決
+        # できないまま機能が有効になる「compactより確実に前で発火」の保証抜けを廃止。
+        # setupは常に書くため、無いのは旧configか手書き漏れ — 無効化+診断で気づける）
         ho_error "$handoff_root" "handoff-check" "autocompact_windowが無いか不正（v0.1.3から必須。/contextの総量に合わせて設定すること）。機能を無効化中"
         exit 0
+    elif [ "$config_ok" = "bad" ]; then
+        ho_error "$handoff_root" "handoff-check" "handoff-config.jsonが不正。機能を無効化中"
+        exit 0
+    elif [ "$config_ok" != "ok" ]; then
+        # "parse"（JSON文が1個でない・ルートがobjectでない）と、jq自体が失敗して空になった場合。
+        # PS版は ConvertFrom-Json の失敗と非objectをまとめてこの文言にしているので合わせる
+        # （旧実装はここも「が不正」で、同じ入力に対する診断がPS版と分裂していた —
+        # HANDOFF.mdバックログ10。受否・件数・exit codeは従来どおり）
+        ho_error "$handoff_root" "handoff-check" "handoff-config.jsonのパースに失敗。機能を無効化中"
+        exit 0
     fi
-    soft=$(jq -r '.soft_threshold' "$config_path")
-    hard=$(jq -r '.hard_threshold' "$config_path")
-    min_margin=$(jq -r '.min_margin // 10000' "$config_path")
-    # 既定92はsetupと同一（config手書きで省略時に静かに無効化されないため。issue #8）
-    pct=$(jq -r '.conservative_fire_pct // 92' "$config_path")
+    # 値の切り出しはパラメータ展開のみで行う（プロセスを起こさない）。
+    # 既定値（min_margin=10000 / conservative_fire_pct=92）はjq側の // で解決済み。
+    # 92はsetupと同一（config手書きで省略時に静かに無効化されないため。issue #8）
+    _cfg_rest=${config_read#* }
+    soft=${_cfg_rest%% *}
+    _cfg_rest=${_cfg_rest#* }
+    hard=${_cfg_rest%% *}
+    _cfg_rest=${_cfg_rest#* }
+    min_margin=${_cfg_rest%% *}
+    _cfg_rest=${_cfg_rest#* }
+    pct=${_cfg_rest%% *}
+    _cfg_rest=${_cfg_rest#* }
+    cfg_window=$_cfg_rest
 
     # fire-point検証（常時実施 — fail-closed）: 環境変数を最優先、無効・未設定ならconfig。
     # 環境変数ゲート（issue #32）: 全体が1〜10桁のASCII数字のみ受理し、先頭ゼロ除去の
     # 10進解釈+範囲検査（先頭ゼロを残すと $(( )) が八進解釈するshellがあり、桁数無制限は
     # test の算術エラーになる）。違反は「未設定」扱いでconfigへフォールバック。
     # 検証はgrepでなくcaseで行う（grepは行単位一致のため改行混入値の1行が通ってしまう）
-    check_window=$(jq -r '.autocompact_window' "$config_path")
+    check_window=$cfg_window
     window_source="config"
     if ho_is_uint_token "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}"; then
         ev=$(printf '%s' "$CLAUDE_CODE_AUTO_COMPACT_WINDOW" | sed 's/^0*//')
@@ -164,7 +194,7 @@ main() {
             # 無言で消すと手がかりが残らない（issue #20）ためerror.logに記録する
             ho_error "$handoff_root" "handoff-check" "不正なhandoff-stateを破棄して再生成します（${state_path}）"
             rm -f "$state_path" 2>/dev/null
-            [ "$(ho_field stop_hook_active)" = "true" ] && exit 0
+            [ "$HO_STOP_ACTIVE" = "1" ] && exit 0
             state_ok="none"
         fi
     fi
@@ -256,7 +286,7 @@ main() {
     fi
 
     # ソフト: 実行中バックグラウンドタスクがあれば見送り（session_cronsは判定に使わない）
-    bg=$(printf '%s' "$HO_INPUT" | jq -r '.background_tasks | if type == "array" then length else 0 end' 2>/dev/null)
+    bg=$HO_BG_TASKS
     [ "$bg" -gt 0 ] 2>/dev/null && exit 0
 
     mkdir -p "$(dirname "$handoff_md")" 2>/dev/null

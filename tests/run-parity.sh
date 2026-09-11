@@ -2,11 +2,28 @@
 # run-parity.sh - sh版フックに共有フィクスチャのケースを流し、正規化した結果行を出力する
 # run-parity.ps1 と同一ケース・同一出力形式。run-local-check.ps1 / .sh が両者の出力を
 # 期待値と照合して2系統一致を検証する（ローカル実行）
+# 使い方: sh run-parity.sh [作業ディレクトリ] [part]
+#   part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C89）。
+#   パートは独立した作業ディレクトリで並列に実行し、出力を1〜3の順に連結すると
+#   all と同じ89行になる（run-local-check.sh がそれを行い期待値と照合する）
 set -u
 
 tests_dir=$(cd "$(dirname "$0")" && pwd)
 hooks_dir="$tests_dir/../hooks/sh"
 fixtures="$tests_dir/fixtures"
+# パート分割（シャーディング）。境界は「ケース間の依存が跨がないこと」と
+# 「フック起動回数が揃うこと」（実測 55/56/53）で決めている:
+#   C1〜C13 は既定transcriptを共有する連鎖 / C35以降は C34 が作るポインタ
+#   （validptr.json）が土台で、C34 は全パート共通の前段として無条件に走る /
+#   C67 の gatelog は C66 の診断を含めて数えるので両者は同じパートに置く /
+#   C46-C47・C59-C60・C85〜C88 は変数を持ち越すので割らない
+#   （`# C<番号>` で分割したセグメント間の持ち越しを機械抽出して確認した。
+#   C74-C75 は以前から割らない扱いだが、今回の抽出では持ち越しを検出していない）
+part="${2:-all}"
+case "$part" in
+    all|1|2|3) ;;
+    *) printf 'NG: 第2引数（part）は all / 1 / 2 / 3 のいずれか: %s\n' "$part" >&2; exit 1 ;;
+esac
 work="${1:-}"
 if [ -z "$work" ]; then
     # macOSのTMPDIRは末尾スラッシュ付き（…/T/）で、そのままmktempに渡すと作業パスに
@@ -72,9 +89,24 @@ usage_transcript() { # $1=path $2=tokens
     printf '{"type":"assistant","isSidechain":false,"message":{"usage":{"input_tokens":%s,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}\n' "$2" > "$1"
 }
 
+# hardサイクル開始直後の状態ファイルを直接書く。「nonceを得るためだけ」のフック起動を
+# 省くためで、内容は handoff-check.sh の hard発火が書く形と同じ。
+# 「450トークンでhard発火して状態を作る」こと自体は C4/C5 が確かめている
+seed_hard_state() { # $1=transcript $2=nonce
+    jq -n --arg n "$2" \
+        '{schema_version: 1, mode: "hard", nonce: $n, attempts: 1, completed: false, failed: false}' \
+        > "$1.handoff-state.json"
+}
+
 sid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 t="$troot/t.jsonl"
 
+# フックの共通ヘルパー。C15/C16 は検証関数を直接呼ぶ。**パート分割で片方のパートに
+# 閉じ込めない**ため、ケースの外側で読む。読む位置は上の自前関数より後
+# （同名があれば従来どおりヘルパー側が勝つ順序を変えない）
+. "$hooks_dir/handoff-common.sh"
+
+if [ "$part" = all ] || [ "$part" = 1 ]; then
 # C1: 閾値未満+ノイズ行（sidechain/部分行/型不正/壊れたJSON）は無発火
 cp -f "$fixtures/transcripts/mixed-below.jsonl" "$t"
 o=$(invoke_hook handoff-check.sh "$(stop_input "$sid" "$t")")
@@ -115,7 +147,7 @@ printf 'C6 output=%s state=%s latest-nonce=%s sha=%s\n' "$(out_kind "$o")" "$(ge
 sid7="11111111-2222-3333-4444-555555555555"
 t7="$troot/t7.jsonl"
 usage_transcript "$t7" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid7" "$t7")" > /dev/null
+seed_hard_state "$t7" "nonce-t7-00000000"
 nonce7=$(jq -r '.nonce' "$t7.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid7"
 sed "s/{{NONCE}}/$nonce7/" "$fixtures/md/bad-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid7/current.md"
@@ -172,15 +204,15 @@ printf 'C13 output=%s\n' "$(out_kind "$o")"
 sid14="22222222-3333-4444-5555-666666666666"
 t14="$troot/t14.jsonl"
 usage_transcript "$t14" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid14" "$t14")" > /dev/null
+seed_hard_state "$t14" "nonce-t14-00000000"
 nonce14=$(jq -r '.nonce' "$t14.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid14"
 sed "s/{{NONCE}}/$nonce14/" "$fixtures/md/good-handoff-subheadings.md.tmpl" > "$work/proj/.claude-handoff/$sid14/current.md"
 o=$(invoke_hook handoff-check.sh "$(stop_input "$sid14" "$t14")")
 printf 'C14 output=%s state=%s\n' "$(out_kind "$o")" "$(get_state "$t14")"
 
-# C15/C16 は理由数のps/sh一致も見るため、検証関数を直接呼ぶ（codexレビュー3回目 High-1）
-. "$hooks_dir/handoff-common.sh"
+# C15/C16 は理由数のps/sh一致も見るため、検証関数を直接呼ぶ（codexレビュー3回目 High-1。
+# ヘルパーの読み込みは前段で済ませてある）
 count_reasons() { # $1=file $2=nonce
     _cr=$(ho_incomplete_reasons "$1" "$2")
     if [ -z "$_cr" ]; then printf '0'; else printf '%s' "$_cr" | awk -F' / ' '{print NF}'; fi
@@ -191,7 +223,7 @@ count_reasons() { # $1=file $2=nonce
 sid15="33333333-4444-5555-6666-777777777777"
 t15="$troot/t15.jsonl"
 usage_transcript "$t15" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid15" "$t15")" > /dev/null
+seed_hard_state "$t15" "nonce-t15-00000000"
 nonce15=$(jq -r '.nonce' "$t15.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid15"
 sed "s/{{NONCE}}/$nonce15/" "$fixtures/md/bad-handoff-h3.md.tmpl" > "$work/proj/.claude-handoff/$sid15/current.md"
@@ -205,7 +237,7 @@ printf 'C15 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t
 sid16="44444444-5555-6666-7777-888888888888"
 t16="$troot/t16.jsonl"
 usage_transcript "$t16" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid16" "$t16")" > /dev/null
+seed_hard_state "$t16" "nonce-t16-00000000"
 nonce16=$(jq -r '.nonce' "$t16.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid16"
 sed "s/{{NONCE}}/$nonce16/" "$fixtures/md/bad-handoff-empty-sections.md.tmpl" > "$work/proj/.claude-handoff/$sid16/current.md"
@@ -219,7 +251,7 @@ printf 'C16 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t
 sid17="55555555-6666-7777-8888-999999999999"
 t17="$troot/t17.jsonl"
 usage_transcript "$t17" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid17" "$t17")" > /dev/null
+seed_hard_state "$t17" "nonce-t17-00000000"
 nonce17=$(jq -r '.nonce' "$t17.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid17"
 sed "s/{{NONCE}}/$nonce17/" "$fixtures/md/bad-handoff-casespace.md.tmpl" > "$work/proj/.claude-handoff/$sid17/current.md"
@@ -232,7 +264,7 @@ printf 'C17 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t
 sid18="66666666-7777-8888-9999-aaaaaaaaaaaa"
 t18="$troot/t18.jsonl"
 usage_transcript "$t18" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid18" "$t18")" > /dev/null
+seed_hard_state "$t18" "nonce-t18-00000000"
 nonce18=$(jq -r '.nonce' "$t18.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid18"
 awk 'BEGIN { s = sprintf("%0100d", 0); gsub(/0/, "x", s); for (i = 0; i < 115344; i++) print s }' \
@@ -246,7 +278,7 @@ printf 'C18 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t
 sid19="77777777-8888-9999-aaaa-bbbbbbbbbbbb"
 t19="$troot/t19.jsonl"
 usage_transcript "$t19" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid19" "$t19")" > /dev/null
+seed_hard_state "$t19" "nonce-t19-00000000"
 nonce19=$(jq -r '.nonce' "$t19.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid19"
 awk 'BEGIN { for (i = 0; i < 200001; i++) print "" }' > "$work/proj/.claude-handoff/$sid19/current.md"
@@ -259,7 +291,7 @@ printf 'C19 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t
 sid20="88888888-9999-aaaa-bbbb-cccccccccccc"
 t20="$troot/t20.jsonl"
 usage_transcript "$t20" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid20" "$t20")" > /dev/null
+seed_hard_state "$t20" "nonce-t20-00000000"
 nonce20=$(jq -r '.nonce' "$t20.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid20"
 # nonceの5文字目に\rを埋め込む（index/substrで置換し、sedの\r移植性問題を回避）
@@ -278,7 +310,7 @@ printf 'C20 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t
 sid21="99999999-aaaa-bbbb-cccc-dddddddddddd"
 t21="$troot/t21.jsonl"
 usage_transcript "$t21" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid21" "$t21")" > /dev/null
+seed_hard_state "$t21" "nonce-t21-00000000"
 nonce21=$(jq -r '.nonce' "$t21.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid21"
 sed "s/{{NONCE}}/$nonce21/" "$fixtures/md/good-handoff.md.tmpl" \
@@ -295,7 +327,7 @@ printf 'C21 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t
 sid22="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 t22="$troot/t22.jsonl"
 usage_transcript "$t22" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid22" "$t22")" > /dev/null
+seed_hard_state "$t22" "nonce-t22-00000000"
 nonce22=$(jq -r '.nonce' "$t22.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid22"
 nbsp22=$(printf '\302\240')
@@ -312,7 +344,7 @@ printf 'C22 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t
 sid23="bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 t23="$troot/t23.jsonl"
 usage_transcript "$t23" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid23" "$t23")" > /dev/null
+seed_hard_state "$t23" "nonce-t23-00000000"
 nonce23=$(jq -r '.nonce' "$t23.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid23"
 {
@@ -330,7 +362,7 @@ printf 'C23 output=%s state=%s reasons=%s\n' "$(out_kind "$o")" "$(get_state "$t
 sid24="cccccccc-dddd-eeee-ffff-000000000000"
 t24="$troot/t24.jsonl"
 usage_transcript "$t24" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid24" "$t24")" > /dev/null
+seed_hard_state "$t24" "nonce-t24-00000000"
 nonce24=$(jq -r '.nonce' "$t24.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid24"
 shy24=$(printf '\302\255')
@@ -366,7 +398,7 @@ printf 'C26 output=%s state=%s\n' "$(out_kind "$o")" "$(get_state "$t26")"
 sid27="ffffffff-0000-1111-2222-333333333333"
 t27="$troot/t27.jsonl"
 usage_transcript "$t27" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid27" "$t27")" > /dev/null
+seed_hard_state "$t27" "nonce-t27-00000000"
 nonce27=$(jq -r '.nonce' "$t27.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid27"
 sed "s/{{NONCE}}/$nonce27/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid27/current.md"
@@ -416,7 +448,7 @@ sid31="44444444-0000-1111-2222-555555555555"
 t31="$troot/t31.jsonl"
 cp "$work/proj/.claude-handoff/latest.json" "$work/pointer27.json"
 usage_transcript "$t31" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid31" "$t31")" > /dev/null
+seed_hard_state "$t31" "nonce-t31-00000000"
 nonce31=$(jq -r '.nonce' "$t31.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid31"
 sed -e "s/{{NONCE}}/$nonce31/" -e "s/機能Aの実装/機能Bの実装/" "$fixtures/md/good-handoff.md.tmpl" \
@@ -446,6 +478,7 @@ restore33=$(jq -n --arg sid "66666666-0000-1111-2222-777777777777" --arg tp "$tr
     '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "SessionStart", source: "clear"}')
 o=$(invoke_hook handoff-restore.sh "$restore33")
 printf 'C33 output=%s\n' "$(out_kind "$o")"
+fi
 
 # C34: compact経路の直近ユーザーメッセージ抽出で、typeが配列["user"]の行と
 # contentパーツのtypeが配列["text"]の要素は除外される（PSの-is [string]ガードの回帰検出）
@@ -458,7 +491,7 @@ usage_transcript "$t34" 450
     printf '%s\n' '{"type":"user","isSidechain":false,"message":{"content":[{"type":["text"],"text":"MARKER-ARRTEXT-PART"},{"type":"text","text":"MARKER-VALID-PART"},{"type":"text","text":["MARKER-ARRVAL-PART"]}]}}'
     printf '%s\n' '{"type":"user","isSidechain":false,"message":[{"content":"MARKER-ARRMSG-USER"}]}'
 } >> "$t34"
-invoke_hook handoff-check.sh "$(stop_input "$sid34" "$t34")" > /dev/null
+seed_hard_state "$t34" "nonce-t34-00000000"
 nonce34=$(jq -r '.nonce' "$t34.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid34"
 sed "s/{{NONCE}}/$nonce34/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid34/current.md"
@@ -472,11 +505,15 @@ u3=no; case "$o" in *"MARKER-ARRTEXT-PART"*) u3=yes ;; esac
 u4=no; case "$o" in *"MARKER-VALID-PART"*) u4=yes ;; esac
 u5=no; case "$o" in *"MARKER-ARRVAL-PART"*) u5=yes ;; esac
 u6=no; case "$o" in *"MARKER-ARRMSG-USER"*) u6=yes ;; esac
+if [ "$part" = all ] || [ "$part" = 1 ]; then
 printf 'C34 output=%s u1=%s u2=%s u3=%s u4=%s u5=%s u6=%s\n' "$(out_kind "$o")" "$u1" "$u2" "$u3" "$u4" "$u5" "$u6"
+fi
 
 # C35〜C37: 有効なポインタ（sid34・未消費）をベースに、ポインタのフィールド型破壊を検証する
+# このポインタはパート2・3の土台でもあるため、part の指定に関わらず作る
 cp "$work/proj/.claude-handoff/latest.json" "$work/validptr.json"
 
+if [ "$part" = all ] || [ "$part" = 1 ]; then
 # C35: sha256がboolean false → 非文字列は不一致として拒否（旧shは `// empty` でスキップし注入していた）
 jq '.sha256 = false' "$work/validptr.json" > "$work/proj/.claude-handoff/latest.json"
 restore35=$(jq -n --arg sid "88888888-0000-1111-2222-999999999999" --arg tp "$troot/new35.jsonl" --arg cwd "$work/proj" \
@@ -498,7 +535,9 @@ restore37=$(jq -n --arg sid "aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb" --arg tp "$tr
     '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "SessionStart", source: "clear"}')
 o=$(invoke_hook handoff-restore.sh "$restore37")
 printf 'C37 output=%s\n' "$(out_kind "$o")"
+fi
 
+if [ "$part" = all ] || [ "$part" = 1 ]; then
 # C38: isSidechainが文字列"false"の行は除外しない（除外はboolean trueのみ）
 sid38="bbbbbbbb-0000-1111-2222-cccccccccccc"
 t38="$troot/t38.jsonl"
@@ -577,7 +616,7 @@ printf 'C45 output=%s state=%s\n' "$(out_kind "$o")" "$(get_state "$t45")"
 sid46="efefefef-0000-1111-2222-787878787878"
 t46="$troot/t46.jsonl"
 usage_transcript "$t46" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid46" "$t46")" > /dev/null
+seed_hard_state "$t46" "nonce-t46-00000000"
 nonce46=$(jq -r '.nonce' "$t46.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid46"
 sed "s/{{NONCE}}/$nonce46/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid46/current.md"
@@ -612,7 +651,7 @@ usage_transcript "$t48" 450
     printf '%s\n' '{"type":"user","isSidechain":false,"message":{"content":"2026-01-02T03:04:05Z"}}'
     printf '%s\n' '{"type":"user","isSidechain":false,"message":{"content":[{"type":"text","text":"2026-01-02T03:04:05+09:00"}]}}'
 } >> "$t48"
-invoke_hook handoff-check.sh "$(stop_input "$sid48" "$t48")" > /dev/null
+seed_hard_state "$t48" "nonce-t48-00000000"
 nonce48=$(jq -r '.nonce' "$t48.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid48"
 sed "s/{{NONCE}}/$nonce48/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid48/current.md"
@@ -639,6 +678,9 @@ c50=$(jq -r 'if has("consumed_at") and (.consumed_at != null) and (.consumed_at 
 [ -n "$c50" ] || c50="unreadable"
 printf 'C50 output=%s consumed=%s\n' "$(out_kind "$o")" "$c50"
 
+fi
+
+if [ "$part" = all ] || [ "$part" = 2 ]; then
 # C51: ポインタのupdated_epochが0 → 契約（0 < v）違反でポインタ無効・無出力
 # （UNIXエポック原点は「時刻なし」の典型的な偽値 — issue #34でupdated_at契約から置換)
 jq '.updated_epoch = 0' "$work/validptr.json" > "$work/proj/.claude-handoff/latest.json"
@@ -665,7 +707,7 @@ usage_transcript "$t53" 450
     printf '%s\n' '{"type":"user","isSidechain":false,"message":{"content":"2026-01-02T03:04:05Z"}}'
     printf '%s\n' '{"type":"user","isSidechain":false,"message":{"content":[{"type":"text","text":"2026-01-02T03:04:05+09:00"}]}}'
 } >> "$t53"
-invoke_hook handoff-check.sh "$(stop_input "$sid53" "$t53")" > /dev/null
+seed_hard_state "$t53" "nonce-t53-00000000"
 nonce53=$(jq -r '.nonce' "$t53.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid53"
 sed "s/{{NONCE}}/$nonce53/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid53/current.md"
@@ -733,7 +775,7 @@ printf 'C58 output=%s state=%s\n' "$(out_kind "$o")" "$(get_state "$t58")"
 sid59="12121212-3434-5656-7878-909090909090"
 t59="$troot/t59.jsonl"
 usage_transcript "$t59" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid59" "$t59")" > /dev/null
+seed_hard_state "$t59" "nonce-t59-00000000"
 nonce59=$(jq -r '.nonce' "$t59.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid59"
 sed "s/{{NONCE}}/$nonce59/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid59/current.md"
@@ -743,7 +785,7 @@ sed "s/{{NONCE}}/$nonce59/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.c
 sid59o="77777777-6666-5555-4444-333333333333"
 t59o="$troot/t59o.jsonl"
 usage_transcript "$t59o" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid59o" "$t59o")" > /dev/null
+seed_hard_state "$t59o" "nonce-t59o-00000000"
 nonce59o=$(jq -r '.nonce' "$t59o.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid59o"
 sed "s/{{NONCE}}/$nonce59o/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid59o/current.md"
@@ -811,7 +853,7 @@ printf 'C60%s\n' "$results60"
 sid61="16161616-2727-3838-4949-606060606060"
 t61="$troot/t61.jsonl"
 usage_transcript "$t61" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid61" "$t61")" > /dev/null
+seed_hard_state "$t61" "nonce-t61-00000000"
 nonce61=$(jq -r '.nonce' "$t61.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid61"
 sed "s/{{NONCE}}/$nonce61/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid61/current.md"
@@ -961,7 +1003,9 @@ gate_log=$(grep -c "transcript_pathがprojects_root配下の正規パスでな�
 [ -n "$gate_log" ] || gate_log=0
 printf 'C67 dotdot=%s/%s boundary=%s/%s reset-dotdot=%s gatelog=%s
 ' "$(out_kind "$o67a")" "$(get_state "$t67a")" "$(out_kind "$o67b")" "$(get_state "$t67b")" "$surv67" "$gate_log"
+fi
 
+if [ "$part" = all ] || [ "$part" = 2 ]; then
 # C68: 包含ゲート — restore・save 4c・バイト長上限の回帰検出（issue #33 レビュー1回目 M2/L4）。
 #  a) restore: root外の実在stateはrestore後も生き残る（旧実装は最終削除で消していた）
 #  b) restore: root内の実在stateは従来どおり削除される（ゲートが正常系を壊していない）
@@ -1143,6 +1187,9 @@ done
 unset HANDOFF_TEST_NOW_EPOCH
 printf 'C75%s\n' "$r75"
 
+fi
+
+if [ "$part" = all ] || [ "$part" = 3 ]; then
 # C76: restoreのnow取得失敗はfail-closed（有効な未消費ポインタでも注入しない —
 # レビュー1回目 Lの失敗経路固定）
 cp -f "$work/validptr.json" "$work/proj/.claude-handoff/latest.json"
@@ -1159,7 +1206,7 @@ printf 'C76 output=%s\n' "$(out_kind "$o")"
 sid77="52525252-0707-2929-5151-737373737373"
 t77="$troot/t77.jsonl"
 usage_transcript "$t77" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid77" "$t77")" > /dev/null
+seed_hard_state "$t77" "nonce-t77-00000000"
 nonce77=$(jq -r '.nonce' "$t77.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid77"
 sed "s/{{NONCE}}/$nonce77/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid77/current.md"
@@ -1366,7 +1413,7 @@ sv80k=$(sv_strict80 "$t80k.handoff-state.json")
 sid80m="71717171-2626-4848-7070-929292929292"
 t80m="$troot/t80m.jsonl"
 usage_transcript "$t80m" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid80m" "$t80m")" > /dev/null
+seed_hard_state "$t80m" "nonce-t80m-00000000"
 nonce80m=$(jq -r '.nonce' "$t80m.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid80m"
 sed "s/{{NONCE}}/$nonce80m/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid80m/current.md"
@@ -1386,7 +1433,7 @@ o80m3=$(invoke_hook handoff-restore.sh "$restore80m")
 sid80p="75757575-3030-5252-7474-969696969696"
 t80p="$troot/t80p.jsonl"
 usage_transcript "$t80p" 450
-invoke_hook handoff-check.sh "$(stop_input "$sid80p" "$t80p")" > /dev/null
+seed_hard_state "$t80p" "nonce-t80p-00000000"
 nonce80p=$(jq -r '.nonce' "$t80p.handoff-state.json")
 mkdir -p "$work/proj/.claude-handoff/$sid80p"
 sed "s/{{NONCE}}/$nonce80p/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid80p/current.md"
@@ -1427,6 +1474,298 @@ printf 'C80 ptr-unknown=%s/%s ptr-oldform=%s/%s ptr-badver=%s/%s ptr-wrongcase-d
     "$sv80m" "$sv80p" "$sv80q" \
     "$(out_kind "$o80m1")" "$(out_kind "$o80m2")" "$(out_kind "$o80m3")" \
     "$(out_kind "$o80n1")" "$(out_kind "$o80n2")" "$d80n"
+
+# C81: handoff-config.json が「1個のJSONオブジェクト」でない3態（JSON文が2つ / ルートが配列 /
+# 壊れたJSON）。いずれも機能を無効化し、診断を1件残して正常終了する。
+# 複数JSON文は、sh版のjqが各JSON文について出力するため統合パースの戻り値を先頭トークンだけで
+# 判定すると検証を通してしまい算術展開でexit 1になる回帰の防止（2026-08-30 codexレビュー High-1）。
+# 診断の文言も比較する（旧実装はsh版「不正」/PS版「パースに失敗」で分裂していた —
+# HANDOFF.mdバックログ10。出力は純ASCIIに保つため、文言そのものではなく分類を出す）。
+# ルート配列と壊れたJSONも見るのは、統合したparse経路のうち複数JSON文しか固定しておらず
+# 非object経路だけ元に戻っても通ってしまうため（codexレビュー M2）
+sid81="81818181-8181-8181-8181-818181818181"
+t81="$troot/t81.jsonl"
+usage_transcript "$t81" 450
+cfg81="$work/proj/.claude/handoff-config.json"
+cp -f "$cfg81" "$work/cfg81.bak"
+errlog81="$work/proj/.claude-handoff/error.log"
+# 文言は「[時刻] <source>: <本文>」の <本文> を**完全一致**で見る。部分一致や正規表現だと
+# 片側だけ接頭辞が増えても、`.` が任意1文字として通っても、大小が変わっても素通りして
+# 分裂の再発を見逃す（codexレビュー M1）
+cfg_parse_msg81="handoff-check: handoff-config.jsonのパースに失敗。機能を無効化中"
+cfg_case81() { # $1=configの内容 $2=session_id → "種別/rc/ログ差分/文言分類"
+    printf '%s' "$1" > "$cfg81"
+    _n81=0
+    [ -f "$errlog81" ] && _n81=$(wc -l < "$errlog81" | tr -d ' 	')
+    _o81=$(invoke_hook handoff-check.sh "$(stop_input "$2" "$t81")")
+    _rc81=$?
+    _a81=0
+    [ -f "$errlog81" ] && _a81=$(wc -l < "$errlog81" | tr -d ' 	')
+    _m81=other
+    if [ "$((_a81 - _n81))" -eq 1 ]; then
+        _last81=$(tail -n 1 "$errlog81")
+        [ "${_last81#*] }" = "$cfg_parse_msg81" ] && _m81=parse
+    fi
+    printf '%s/%s/%s/%s' "$(out_kind "$_o81")" "$_rc81" "$((_a81 - _n81))" "$_m81"
+}
+cfg_orig81=$(cat "$work/cfg81.bak")
+r81multi=$(cfg_case81 "$cfg_orig81$cfg_orig81" "$sid81")
+r81arr=$(cfg_case81 "[$cfg_orig81]" "82828282-8181-8181-8181-828282828282")
+r81broken=$(cfg_case81 '{"soft_threshold":' "83838383-8181-8181-8181-838383838383")
+cp -f "$work/cfg81.bak" "$cfg81"
+printf 'C81 multi=%s arr=%s broken=%s state=%s\n' "$r81multi" "$r81arr" "$r81broken" "$(get_state "$t81")"
+
+# C82: session_id が「UUID + LF + 文字」のhook入力は、両実装とも何もしない
+# （HANDOFF.mdバックログ11の回帰）。sh版の ho_is_uuid は grep -Eq の**行単位一致**
+# だったため1行目のUUIDだけを見て受理し、PS版（-cmatch は非Multiline）は拒否していた。
+# MSYSのgrepはCRも行末として落とすので、内部改行がCRLFへ化けるWindowsでも再現する。
+# UUIDの形はcaseの全文一致で見る形に変えた。末尾LFだけの値は届く前に剥がれるため
+# 両実装とも受理側で、ここでは分裂しない（PS版の ^…$ を \z へ締めると逆向きに割れる）
+t82="$troot/t82.jsonl"
+usage_transcript "$t82" 450
+sidlf82=$(printf '82828282-8282-8282-8282-828282828282\nx')
+o82=$(invoke_hook handoff-check.sh "$(stop_input "$sidlf82" "$t82")")
+printf 'C82 output=%s state=%s\n' "$(out_kind "$o82")" "$(get_state "$t82")"
+
+# C83: ポインタの文字列フィールドにNULを混ぜても両実装とも受理しない
+# （HANDOFF.mdバックログ13の回帰）。sh版の生の `$(jq -r '.field' file)` はNULを
+# シェルへ渡せず、Git shが「ignored null byte in input」としてNULを取り除いた値を
+# 返すため、`<uuid>` + NUL が正規UUIDへ、`<sha>` + NUL が正しいSHAへ縮退して検証を
+# 通っていた。PS版は.NET文字列としてNULを保持するので拒否側で、受否が分裂していた。
+# transcript_path も同じ ho_json_str_field で守るが、restoreのポインタ引用は
+# $HOME/.claude/projects を直接見ておりテストのfake設定ディレクトリ配下に無いため
+# ここでは観測できない（HANDOFF.mdバックログ14）
+jq '.session_id = (.session_id + "\u0000")' "$work/validptr.json" > "$work/proj/.claude-handoff/latest.json"
+restore83a=$(jq -n --arg sid "83838383-8383-8383-8383-838383838383" --arg tp "$troot/new83a.jsonl" --arg cwd "$work/proj" \
+    '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "SessionStart", source: "clear"}')
+o83a=$(invoke_hook handoff-restore.sh "$restore83a")
+c83a=$(jq -r 'if has("consumed_at") and (.consumed_at != null) and (.consumed_at != "") then "yes" else "no" end' "$work/proj/.claude-handoff/latest.json" 2>/dev/null)
+[ -n "$c83a" ] || c83a="unreadable"
+jq '.sha256 = (.sha256 + "\u0000")' "$work/validptr.json" > "$work/proj/.claude-handoff/latest.json"
+restore83b=$(jq -n --arg sid "84848484-8383-8383-8383-848484848484" --arg tp "$troot/new83b.jsonl" --arg cwd "$work/proj" \
+    '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "SessionStart", source: "clear"}')
+o83b=$(invoke_hook handoff-restore.sh "$restore83b")
+printf 'C83 nulsid=%s/%s nulsha=%s\n' "$(out_kind "$o83a")" "$c83a" "$(out_kind "$o83b")"
+
+# C84: stdin側のNUL縮退（HANDOFF.mdバックログ13の回帰・その2。2026-08-30 codexレビュー Medium×2）
+#
+# a) stop_hook_active が "true" + NUL。旧sh版は ho_field の生のコマンド置換でNULが落ちて
+#    "true" と完全一致し、破損stateを消した直後に無言終了していた。PS版はNULを保持して
+#    一致せず、そのまま指示とstateを再生成する
+t84="$troot/t84.jsonl"
+usage_transcript "$t84" 450
+printf '%s' '{"mode":"soft","nonce":"nonce-t84-00000000","bogus":1}' > "$t84.handoff-state.json"
+in84a=$(jq -n --arg tp "$t84" --arg cwd "$work/proj" \
+    '{session_id: "84848484-1111-1111-1111-848484848484", transcript_path: $tp, cwd: $cwd, hook_event_name: "Stop", stop_hook_active: "true\u0000"}')
+o84a=$(invoke_hook handoff-check.sh "$in84a")
+#
+# b) session_id が <uuid> + NUL で、かつ別フィールド（trigger）に内部改行がある入力。
+#    バックログ12より前は、内部改行があると**slow path**（フィールド別にjqを起こして
+#    コマンド置換で受ける経路）へ落ち、そこでNULが消えて正規UUIDへ縮退し受理していた。
+#    バックログ12でslow pathを廃止したので、いまは fast path 一本で、jqの @sh が
+#    NULを**リテラルの `\0` 2文字**へ符号化するため受理されない。
+#    trigger の内部改行は当時の再現条件をそのまま残してある（LFを生のまま持てることの
+#    確認も兼ねる）。PS版はNULを保持して拒否する
+t84b="$troot/t84b.jsonl"
+usage_transcript "$t84b" 450
+in84b=$(jq -n --arg tp "$t84b" --arg cwd "$work/proj" \
+    '{session_id: "85858585-1111-1111-1111-858585858585\u0000", transcript_path: $tp, cwd: $cwd, hook_event_name: "Stop", stop_hook_active: false, trigger: "a\nb"}')
+o84b=$(invoke_hook handoff-check.sh "$in84b")
+printf 'C84 nulactive=%s/%s nulsid=%s/%s\n' "$(out_kind "$o84a")" "$(get_state "$t84")" "$(out_kind "$o84b")" "$(get_state "$t84b")"
+
+# C85: ポインタ経由transcriptの引用がprojects_rootの解決関数を通ること
+# （HANDOFF.mdバックログ14の回帰）。旧実装は sh版 "$HOME/.claude/projects" /
+# PS版 UserProfile直下 の決め打ちで、CLAUDE_CONFIG_DIRを設定した環境では
+# 包含判定が常に外れ「直近のユーザーメッセージ」が無言で落ちていた。
+# この試験環境自体がCLAUDE_CONFIG_DIRを作業域へ向けているため、旧実装なら quote=no になる
+sid85="12341234-5678-90ab-cdef-1234567890ab"
+t85="$troot/t85.jsonl"
+usage_transcript "$t85" 450
+printf '%s' '{"type":"user","isSidechain":false,"message":{"content":"parity-c85-user-msg"}}' >> "$t85"
+printf '\n' >> "$t85"
+seed_hard_state "$t85" "nonce-t85-00000000"
+nonce85=$(jq -r '.nonce' "$t85.handoff-state.json")
+mkdir -p "$work/proj/.claude-handoff/$sid85"
+sed "s/{{NONCE}}/$nonce85/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid85/current.md"
+o=$(invoke_hook handoff-check.sh "$(stop_input "$sid85" "$t85")")
+restore85=$(jq -n --arg sid "56785678-90ab-cdef-1234-567890abcdef" --arg tp "$troot/new85.jsonl" --arg cwd "$work/proj" \
+    '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "SessionStart", source: "clear"}')
+o85=$(invoke_hook handoff-restore.sh "$restore85")
+quote85="no"
+case "$o85" in *"parity-c85-user-msg"*) quote85="yes" ;; esac
+printf 'C85 output=%s quote=%s\n' "$(out_kind "$o85")" "$quote85"
+
+# C86: 包含判定の大小の扱いが両実装で一致すること（HANDOFF.mdバックログ15の回帰）。
+# sh版 ho_under_root は `cd`+`pwd`（論理パス）の結果をbyte比較するため、MSYSのpwdが畳む
+# **ドライブレターだけ大小無視・残りは大小区別**になる。PS版 Test-PathUnderRoot が
+# OrdinalIgnoreCase だと casevar でPS版だけが受理し、Ordinal だと drivevar で
+# PS版だけが拒否する。どちらの向きも見るため2態を並べる。
+# Windowsは大小非区別FSなのでどちらの綴りでもファイルは実在し、受否は包含判定だけで決まる。
+# sh harnessは作業パスを cygpath -m でWindows形式へ揃えるので、drivevar もMSYSの
+# ドライブ畳みを実際に通る。
+# 大小区別FS（cygpathの無いLinux/macOS）では casevar のパスが実在せず、drivevar は
+# 反転対象が無いので、同じ期待値に落ち着くだけの一致確認になる（回帰検出力は無い —
+# codexレビュー Low。歯があるのはWindowsだけ）
+sid86="13131313-2424-3535-4646-575757575757"
+t86="$troot/t86.jsonl"
+usage_transcript "$t86" 450
+printf '%s' '{"type":"user","isSidechain":false,"message":{"content":"parity-c86-user-msg"}}' >> "$t86"
+printf '\n' >> "$t86"
+seed_hard_state "$t86" "nonce-t86-00000000"
+nonce86=$(jq -r '.nonce' "$t86.handoff-state.json")
+mkdir -p "$work/proj/.claude-handoff/$sid86"
+sed "s/{{NONCE}}/$nonce86/" "$fixtures/md/good-handoff.md.tmpl" > "$work/proj/.claude-handoff/$sid86/current.md"
+o=$(invoke_hook handoff-check.sh "$(stop_input "$sid86" "$t86")")
+latest86="$work/proj/.claude-handoff/latest.json"
+# 検証済みポインタのtranscript_pathだけを差し替えて未消費へ戻す（C10と同じ手口）
+probe_ptr_quote() { # $1=差し替えるtranscript_path $2=restoreのsession_id $3=期待マーカー
+    #                    → "種別/引用有無"
+    jq --arg tp "$1" 'del(.consumed_at) | .consumed = false | .transcript_path = $tp' \
+        "$latest86" > "$latest86.new" && mv -f "$latest86.new" "$latest86"
+    _inp=$(jq -n --arg sid "$2" --arg tp "$troot/newprobe.jsonl" --arg cwd "$work/proj" \
+        '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "SessionStart", source: "clear"}')
+    _op=$(invoke_hook handoff-restore.sh "$_inp")
+    _qp=no
+    case "$_op" in *"$3"*) _qp=yes ;; esac
+    printf '%s/%s' "$(out_kind "$_op")" "$_qp"
+}
+# a) root部分の要素だけ大小違い（projects → Projects）: 両実装とも引用しない
+tp86case="$work/claude-config/Projects/proj/t86.jsonl"
+r86case=$(probe_ptr_quote "$tp86case" "24242424-3535-4646-5757-686868686868" parity-c86-user-msg)
+# b) ドライブレターだけ大小違い: 両実装とも引用する（先頭が「英字:」でなければ無変換）
+tp86drive=$t86
+case "$t86" in
+    [A-Za-z]:*)
+        d86=${t86%"${t86#?}"}
+        rest86=${t86#?}
+        case "$d86" in
+            [A-Z]) d86=$(printf '%s' "$d86" | tr 'A-Z' 'a-z') ;;
+            *) d86=$(printf '%s' "$d86" | tr 'a-z' 'A-Z') ;;
+        esac
+        tp86drive="$d86$rest86"
+        ;;
+esac
+r86drive=$(probe_ptr_quote "$tp86drive" "35353535-4646-5757-6868-797979797979" parity-c86-user-msg)
+printf 'C86 casevar=%s drivevar=%s\n' "$r86case" "$r86drive"
+
+# C87: 経路にsymlink/junctionがあれば両実装とも拒否すること
+# （HANDOFF.mdバックログ16の回帰）。以前は sh版の `cd`+`pwd` も PS版の GetFullPath も
+# **字句解決のまま**（MSYSの pwd は既定で論理パス。物理解決は pwd -P）で、
+# projects_root 配下に置かれたjunctionをどちらも受理していた。実測: 旧実装は
+# sh/PSとも outlink=injected/yes inlink=injected/yes で、**root外のファイルを引用できた**。
+# 分裂ではなく共通の穴だったので、両実装を「経路のsymlinkは拒否」へ揃えて塞いだ。
+# リンクが作れない環境ではパスが実在せず、どちらの態も同じ `no` に落ち着く
+# （期待値は安定するが歯は無くなる。作成手段は下の make_link を参照）
+make_link() { # $1=作るリンク $2=リンク先ディレクトリ → 作れたら0
+    if ln -s "$2" "$1" 2>/dev/null && [ -h "$1" ]; then return 0; fi
+    # Git Bash の ln -s は Developer Mode/管理者でないと**コピー**を作る（実測）。
+    # Windowsではjunctionで代替する（管理者不要。MSYSからは [ -h ] でsymlinkに見える）
+    rm -rf "$1" 2>/dev/null
+    command -v powershell.exe >/dev/null 2>&1 || return 1
+    command -v cygpath >/dev/null 2>&1 || return 1
+    _lw=$(cygpath -w "$1" 2>/dev/null) || return 1
+    _tw=$(cygpath -w "$2" 2>/dev/null) || return 1
+    powershell.exe -NoProfile -Command \
+        "New-Item -ItemType Junction -Path '$_lw' -Target '$_tw' | Out-Null" >/dev/null 2>&1
+    [ -h "$1" ]
+}
+proot87="$work/claude-config/projects"
+mkdir -p "$work/outside87" "$proot87/real87"
+printf '%s' '{"type":"user","isSidechain":false,"message":{"content":"parity-c87-outside"}}' > "$work/outside87/t87o.jsonl"
+printf '\n' >> "$work/outside87/t87o.jsonl"
+printf '%s' '{"type":"user","isSidechain":false,"message":{"content":"parity-c87-inside"}}' > "$proot87/real87/t87i.jsonl"
+printf '\n' >> "$proot87/real87/t87i.jsonl"
+printf '%s' '{"type":"user","isSidechain":false,"message":{"content":"parity-c87-leaf"}}' > "$work/outside87/t87l.jsonl"
+printf '\n' >> "$work/outside87/t87l.jsonl"
+mkdir -p "$proot87/leafdir87"
+# リンクが作れたかは**stderrに出す**（stdoutへ出すと期待値が環境依存になる。
+# Windowsはjunctionは作れてもファイルsymlinkはDeveloper Mode/管理者が要る）。
+# 作れなかった態は「パスが実在しない」ので同じ no に落ち着き、期待値は安定するが
+# 歯は無くなる。緑なのに空試験、という状態を見えるようにするための警告
+warn_link87() { printf 'C87: リンクを作れませんでした（この態は空試験になります）: %s\n' "$1" >&2; }
+make_link "$proot87/linkout87" "$work/outside87" || warn_link87 "outlink（ディレクトリ）"
+make_link "$proot87/linkin87" "$proot87/real87" || warn_link87 "inlink（ディレクトリ）"
+# c) 対象ファイル自身がsymlink（親ディレクトリはroot配下の実ディレクトリ）。
+# 親までしか見ない実装ではここが素通りしてroot外を読めてしまう
+make_link "$proot87/leafdir87/t87l.jsonl" "$work/outside87/t87l.jsonl" || warn_link87 "leaflink（ファイル）"
+r87out=$(probe_ptr_quote "$proot87/linkout87/t87o.jsonl" "46464646-5757-6868-7979-808080808080" parity-c87-outside)
+r87in=$(probe_ptr_quote "$proot87/linkin87/t87i.jsonl" "57575757-6868-7979-8080-919191919191" parity-c87-inside)
+r87leaf=$(probe_ptr_quote "$proot87/leafdir87/t87l.jsonl" "68686868-7979-8080-9191-020202020202" parity-c87-leaf)
+printf 'C87 outlink=%s inlink=%s leaflink=%s\n' "$r87out" "$r87in" "$r87leaf"
+
+# C88: 文字列フィールドの末尾LFを剥がさないこと（HANDOFF.mdバックログ12の回帰）。
+# 旧sh版は cwd / session_id / source / trigger の末尾LFをjq側で剥がしてから使い、
+# PS版は生値を使っていたため、同じ入力で結果が割れていた。
+# 旧実装での実測（このケースの観測値。3態とも旧shだけが違い、新実装は旧PSに揃った）:
+#   sidlf  旧sh=hard/hard/1   旧PS=none/none     新=none/none
+#   srclf  旧sh=injected/yes  旧PS=injected/no   新=injected/no
+#   stoplf 旧sh=none/none     旧PS=hard/hard/1   新=hard/hard/1
+# sidlf は「旧shが末尾LFを剥がして受理しハード指示まで進む / 旧PSは Test-Uuid を
+# 通っても後段のパス検査で落ちて無出力」という受否の分裂だった（旧記述の
+# 「受否は一致する」はこの経路では誤り）。
+# いまは両実装とも「剥がさない＝一致しない」でfail-closedに揃っている
+t88="$troot/t88.jsonl"
+usage_transcript "$t88" 450
+in88a=$(jq -n --arg tp "$t88" --arg cwd "$work/proj" \
+    '{session_id: "88888888-1212-3434-5656-787878787878\n", transcript_path: $tp, cwd: $cwd,
+      hook_event_name: "Stop", stop_hook_active: false}')
+o88a=$(invoke_hook handoff-check.sh "$in88a")
+# b) source が「clear + 末尾LF」。有効なポインタがあっても clear 扱いにしない
+#    （C85〜C87で消費済みなので、未消費へ戻し transcript_path も実在するものへ戻す）
+jq --arg tp "$t85" 'del(.consumed_at) | .consumed = false | .transcript_path = $tp' \
+    "$latest86" > "$latest86.new" && mv -f "$latest86.new" "$latest86"
+in88b=$(jq -n --arg tp "$troot/new88.jsonl" --arg cwd "$work/proj" \
+    '{session_id: "79797979-1212-3434-5656-898989898989", transcript_path: $tp, cwd: $cwd,
+      hook_event_name: "SessionStart", source: "clear\n"}')
+o88b=$(invoke_hook handoff-restore.sh "$in88b")
+# 注入の有無では差が出ない（clear以外でも有効ポインタがあれば注入する）。
+# clearかどうかで変わるのは**ポインタの消費**なので、そちらを見る
+cons88="no"
+[ -n "$(jq -r '.consumed_at // empty' "$latest86" 2>/dev/null)" ] && cons88="yes"
+# c) stop_hook_active が「true + 末尾LF」。破損stateを消した直後に無言終了しない
+t88c="$troot/t88c.jsonl"
+usage_transcript "$t88c" 450
+printf '%s' '{"mode":"soft","nonce":"nonce-t88-00000000","bogus":1}' > "$t88c.handoff-state.json"
+in88c=$(jq -n --arg tp "$t88c" --arg cwd "$work/proj" \
+    '{session_id: "70707070-1212-3434-5656-909090909090", transcript_path: $tp, cwd: $cwd,
+      hook_event_name: "Stop", stop_hook_active: "true\n"}')
+o88c=$(invoke_hook handoff-check.sh "$in88c")
+printf 'C88 sidlf=%s/%s srclf=%s/%s stoplf=%s/%s\n' \
+    "$(out_kind "$o88a")" "$(get_state "$t88")" "$(out_kind "$o88b")" "$cons88" \
+    "$(out_kind "$o88c")" "$(get_state "$t88c")"
+
+# C89: strfieldの新契約（内部LFも末尾LFも生のまま持つ / CRを含む値は空）を、値が実際に
+# ファイルへ落ちる `trigger` で観測する（HANDOFF.mdバックログ12の回帰）。
+# C88は session_id / source / stop_hook_active しか見ておらず、strfieldがLF・CRの
+# 扱いだけ元へ戻っても通ってしまう（2026-08-31 codexレビュー Low）。
+# 旧実装での実測（このケースの観測値。cr は旧sh・旧PSの**両方**に歯がある）:
+#   lf  旧sh=[man<CR><LF>ual]  旧PS=[man<LF>ual<LF>]  新=[man<LF>ual<LF>]
+#   cr  旧sh=[a<CR>b]          旧PS=[a<CR>b]          新=[]
+# meta.jsonのtriggerはそのままだと行を割るので、CRとLFを可視トークンへ置換して出す
+sid89="89898989-1212-3434-5656-121212121212"
+t89="$troot/t89.jsonl"
+usage_transcript "$t89" 450
+save_trigger89() { # $1=save入力JSON → 保存されたtriggerを可視化して返す
+    invoke_hook handoff-save.sh "$1" > /dev/null
+    _b89=$(ls -1 "$work/proj/.claude-handoff/$sid89/backup" 2>/dev/null | sort -r | head -n 1)
+    _v89=$(jq -r 'if (.trigger | type) == "string"
+            then "[" + (.trigger | split([13] | implode) | join("<CR>")
+                                 | split([10] | implode) | join("<LF>")) + "]"
+            else "notstring" end' \
+        "$work/proj/.claude-handoff/$sid89/backup/$_b89/meta.json" 2>/dev/null)
+    [ -n "$_v89" ] || _v89="unreadable"
+    printf '%s' "$_v89"
+}
+in89a=$(jq -n --arg sid "$sid89" --arg tp "$t89" --arg cwd "$work/proj" \
+    '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "PreCompact",
+      trigger: (["man", "ual", ""] | join([10] | implode))}')
+tg89a=$(save_trigger89 "$in89a")
+in89b=$(jq -n --arg sid "$sid89" --arg tp "$t89" --arg cwd "$work/proj" \
+    '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "PreCompact",
+      trigger: (["a", "b"] | join([13] | implode))}')
+tg89b=$(save_trigger89 "$in89b")
+printf 'C89 lf=%s cr=%s\n' "$tg89a" "$tg89b"
+fi
 
 # KEEP_WORK=1 で作業ディレクトリを残す（失敗ケースの成果物調査用。issue #16）
 if [ -z "${KEEP_WORK:-}" ]; then

@@ -148,6 +148,28 @@ if (-not $gitOk) {
                 Write-Host "  推奨: 既存行を $entry に更新すると、編集時に生成される .bak もカバーされます [HANDOFF-RECOMMEND-GLOB]" -ForegroundColor Yellow
             }
         } else {
+            # 末尾に改行が無い場合に備えて追記前に改行を保証する（sh版と同じ契約）。
+            # Add-Contentは値の「前」に改行を入れないため、終端改行が無いファイルへ追記すると
+            # 前の行に連結される（実測: `node_modules/` で終わる.gitignoreへ追記すると
+            # `node_modules/.claude-handoff/` の1行になり .claude-handoff/ が無視されない
+            # → transcriptを含む保存データが git add -A でステージされ得る）
+            # 最終1バイトだけ読む（sh版の `tail -c 1` と同じ計算量にする。ReadAllBytesだと
+            # エントリごとに全体を読み直し、巨大な.gitignoreでOutOfMemoryになり得る）
+            if (Test-Path -LiteralPath $giPath) {
+                $giLast = -1
+                $giFs = [System.IO.File]::Open($giPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                try {
+                    if ($giFs.Length -gt 0) {
+                        [void]$giFs.Seek(-1, [System.IO.SeekOrigin]::End)
+                        $giLast = $giFs.ReadByte()
+                    }
+                } finally {
+                    $giFs.Dispose()
+                }
+                if ($giLast -ge 0 -and $giLast -ne 10) {
+                    Add-Content -LiteralPath $giPath -Value "" -Encoding UTF8
+                }
+            }
             Add-Content -LiteralPath $giPath -Value $entry -Encoding UTF8
             $lines += $entry
             Write-Host "OK: .gitignore に $entry を追記しました"

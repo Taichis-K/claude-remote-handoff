@@ -39,8 +39,7 @@ try {
     if ($null -eq $handoffRoot) { exit 0 }
     $projectDir = Get-ProjectDir $inp
 
-    $source = ""
-    if ((Test-HoProp $inp "source") -and ($inp.source -is [string])) { $source = $inp.source }
+    $source = Get-HoStrField $inp "source"
     $ownSessionId = $null
     if ((Test-HoProp $inp "session_id") -and (Test-Uuid $inp.session_id)) {
         $ownSessionId = $inp.session_id
@@ -316,15 +315,21 @@ try {
 
     # --- 7. 直近ユーザーメッセージ（text contentのみ・最大5件・合計1,200文字） ---
     # compact: 自transcript / clear: ポインタ記録の旧transcript
-    # （ポインタのtranscript_pathは ~/.claude/projects 配下であることを検証してから読む）
+    # （ポインタのtranscript_pathはprojects_root配下であることを検証してから読む）
     $srcTranscript = $null
     if (Test-OrdinalEqual $source "clear") {
         if ($usePointer -and (Test-HoProp $pointer "transcript_path") -and
             ($pointer.transcript_path -is [string]) -and
             -not [string]::IsNullOrEmpty($pointer.transcript_path)) {
-            # $env:USERPROFILEはLinux/macOSに存在しない（CI実測でJoin-Pathが例外→出力中断）
-            $projectsRoot = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".claude/projects"
-            if ((Test-PathUnderRoot -Root $projectsRoot -Candidate $pointer.transcript_path) -and
+            # rootはissue #33の解決関数を使う（CLAUDE_CONFIG_DIR優先。UserProfile直下の
+            # 決め打ちだと設定ディレクトリを移設した利用者で引用が常に無言で落ちる。
+            # 加えてsh版$HOME / PS版UserProfileの分裂も生む）。
+            # 解決関数は USERPROFILE → HOME の順で見るので、Linux/macOSで Join-Path が
+            # 例外を投げて出力が中断する（CI実測）問題も起きない。
+            # 解決不能ならfail-closedで引用しない
+            $projectsRoot = Get-ClaudeProjectsRoot
+            if ($null -ne $projectsRoot -and
+                (Test-PathUnderRoot -Root $projectsRoot -Candidate $pointer.transcript_path) -and
                 (Test-Path -LiteralPath $pointer.transcript_path)) {
                 $srcTranscript = $pointer.transcript_path
             }

@@ -115,6 +115,14 @@ if _out8=$(sh "$setup" 2053 200 400 10 20 "$d8" 2>&1); then _ok8=1; else _ok8=0;
 if printf '%s\n' "$_out8" | grep -F -q '[HANDOFF-RECOMMEND-GLOB]'; then _rec8=1; else _rec8=0; fi
 report "S8" "$d8" "$_ok8 $_rec8"
 
+# S9: 終端改行の無い.gitignore（最終バイトが改行でない）→ 追記が前の行に連結されないこと。
+# 連結するとlines=4かつ `node_modules/.claude-handoff/` の1行になり .claude-handoff/ が
+# 無視されない（transcriptを含む保存データがgit add -Aでステージされ得る）。
+# 正しければ既存1行+4エントリでlines=5。PS版Add-Contentの終端改行漏れの回帰をここで検出する
+d9=$(new_proj s9 0 "node_modules/")
+printf 'node_modules/' > "$d9/.gitignore"
+report "S9" "$d9" "$(invoke_setup "$d9")"
+
 if [ -z "${KEEP_WORK:-}" ]; then
     rm -rf "$work"
 else

@@ -1,5 +1,81 @@
 # Changelog
 
+## v0.2.0 (2026-09-12)
+
+**挙動の変更を含みます**（これまで受理していた入力を拒否する方向）。
+多くは sh版とPS版で判定が割れていた箇所を揃えたものですが、**両実装に共通していた穴を
+塞いだものも含む**ため、正常系でも影響を受ける経路があります（下の「挙動の変更」参照）。
+
+- **追加: `/handoff-init` コマンド**（`commands/handoff-init.md`）。導入と更新を
+  コマンド1本に寄せた。プラグイン導入では `/claude-remote-handoff:handoff-init`、
+  `~/.claude/commands/`（`CLAUDE_CONFIG_DIR` を設定しているならその配下の `commands/`）へ
+  置いた場合は `/handoff-init` で呼べる。フックの配置・登録・閾値設定・`.gitignore`・
+  許可ルールをプロジェクトごとに行う。`/autocompact` の設定・workspace trust の承認・
+  `/hooks` での確認は人の操作が要るため、コマンドは案内だけを行う。
+  **取得したファイルが配布元の意図どおりかを利用者側で検証する方法は無い**という限界を
+  コマンド内の「信頼境界」節に明記している
+- **修正（配布・重大）: 公開リポジトリに `.gitattributes` が無かった**。このため
+  `git clone` した作業ツリーの改行は**cloneする人の `core.autocrlf` 次第**で、
+  `true`（Windowsの既定インストール等）だと `.sh` がCRLFになり、macOS/Linux では
+  復帰文字が混じって `command not found` で動かなかった。`* text eol=lf` を公開ツリーの
+  ルートへ置いた（実測: 置く前は `core.autocrlf=true` を明示した clone で39ファイル全部に
+  CRが入り、CRの総数は9518バイト。`.sh` は9本すべてが該当した。置いたあとは同条件でCR=0）。
+  **v0.1.4 で直したのは Release 添付zipの経路だけで、clone の経路は塞げていなかった。**
+  すでに clone して `.sh` 版が動いている環境は影響を受けていない（動いている＝LF）
+- **修正（setup・重大・Windowsのみ）: `setup.ps1` が `.gitignore` の行を連結していた**。
+  `.gitignore` の**最後の行が改行で終わっていない**場合、追記する項目のうち
+  **最初の1件**がその行の末尾へつながる。たとえば最後が `node_modules/`（改行なし）なら
+  `node_modules/.claude-handoff/` という1行になり、**元の `node_modules/` と
+  追記した項目の両方が効かなくなる**。追記する項目は
+  `.claude-handoff/` / `.claude/handoff-config.json` /
+  `.claude/hooks/claude-remote-handoff/` / `.claude/settings.local.json*` の4つで、
+  どれが連結されるかは既存の `.gitignore` の内容で決まる。
+  `.claude-handoff/` には引き継ぎ資料（会話の引用を含む）が置かれる。
+  sh版（`setup.sh`）には同じ箇所に改行を足す処理があり、**PS版だけが欠けていた**。
+  過去に `setup.ps1` を実行したプロジェクトでは、次を確認すること
+  （**新しい `setup.ps1` を実行し直しても、すでに連結された行は直らない**）:
+
+      # 追跡されてしまっていないか（.gitignore を直しても追跡済みなら無視されない）
+      git ls-files -- .claude-handoff
+      # 出力があれば追跡を外す
+      git rm -r --cached .claude-handoff
+
+  そのうえで `.gitignore` を開き、上の4項目が**それぞれ独立した行になっているか**、
+  連結されて壊れた行（`node_modules/.claude-handoff/` のような形）が無いかを見ること。
+  壊れていたら行を分ける。履歴に入ってしまっている場合の扱いはリポジトリの運用に依る
+- **修正（sh/PS一致・共通の穴）**: 同じ入力に対する受否・診断が割れていた箇所と、
+  両実装に共通していた穴を7件塞いだ
+  - `session_id` に改行を含む値（`<uuid>` + 改行 + 文字）を sh版だけが受理していた
+  - JSON文字列値の NUL。シェルはNULを運べず `<uuid>` + NUL が正規のUUIDへ縮退するため
+    sh版だけが受理していた。**NULを含む値は空扱い**に揃えた
+  - 文字列値の末尾の改行。sh版が剥がし、PS版が残していた。**剥がさず生のまま扱う**へ揃え、
+    CRを含む値は空扱いにした。この結果、末尾に改行が付いた `session_id`・
+    `stop_hook_active` の `true`・`source` の `clear` は**両実装とも無効**になる。
+    環境変数 `CLAUDE_PROJECT_DIR` の末尾の改行も sh版が剥がさなくなった（PS版に合わせた）
+  - `/clear` 復元時の旧transcriptからの引用で、包含判定に使う `~/.claude/projects` が
+    決め打ちだった。**`CLAUDE_CONFIG_DIR` で設定ディレクトリを移設している環境では
+    引用が無言で落ちていた**（注入自体は成功するため気づきにくい）。この修正で引用が戻る
+  - **symlink / junction を含むパスで `~/.claude/projects` の外を参照できた**
+    （sh/PS共通の穴）。ポインタの `transcript_path` を projects 配下の junction に
+    向けると、root外のファイルの内容が「直近のユーザーメッセージ」として引用され得た。
+    **経路に symlink / reparse があれば、指す先がroot内でも拒否する**
+    （状態ファイル側のゲートと同じ規則に統一）
+  - パス包含判定のドライブレターの大小の扱いが逆だった（PS版は全体を大小無視、
+    sh版はドライブだけ大小無視）。sh版の実挙動へ合わせたため、
+    **ドライブレター以外の綴りが大小違いのパスは PS版でも拒否**になる
+  - `handoff-config.json` の**パースに失敗したとき**の `error.log` の文言。
+    sh版は「複数のJSON文」「ルートがobjectでない」「壊れたJSON」を
+    値の不正と同じ1文言に丸めていたので、PS版と同じ「パースに失敗」に分けた。
+    **値そのものが不正なときの診断の粒度には、まだ差が残る**
+    （PS版は項目別、sh版は1文言）
+- **改善（性能）: sh版フック1回の所要が 4.8秒 → 約2.0秒**
+  （Windows 11 / Git Bash での Stop フック soft 経路の実測。
+  macOS/Linux で同じ値になる保証はない）。`handoff-config.json` の7回パースを1回に、
+  stdin の6回パースを1回に統合し、外部プロセスを 36 → 25 に減らした。
+  **PS版に変更は無い**。あわせて sh版は**連結JSON（`{"a":1}{"b":2}`）の stdin を
+  拒否する**ようになった（PS版は元から拒否していた）
+- **テスト**: パリティ 80 → 89ケース、setup 8 → 9ケース
+
 ## v0.1.5 (2026-08-30)
 
 - **追加（配布元表示）**: フック10本（ps 5 / sh 5）のヘッダコメント末尾に、配布元リポジトリの

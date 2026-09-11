@@ -6,7 +6,7 @@
 
 ho_require_jq handoff-reset || exit 0
 ho_read_input || exit 0
-tp=$(ho_path_field transcript_path)
+tp=$HO_TRANSCRIPT_PATH
 # 削除対象はprojects_root配下の包含ゲートを通った実在通常ファイルのみ（issue #33:
 # 従来は任意パス+固定サフィックスを削除できた — 挙動変更）。ゲートNGは黙って何もしない
 if sf=$(ho_valid_state_path "$tp" delete); then

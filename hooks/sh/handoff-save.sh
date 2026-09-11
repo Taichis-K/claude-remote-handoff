@@ -14,12 +14,13 @@ MAX_TOTAL_BYTES=524288000        # 500MB
 main() {
     ho_require_jq handoff-save || exit 0
     ho_read_input || exit 0
-    handoff_root=$(ho_handoff_root) || exit 0
-    project_dir=$(ho_project_dir)
+    ho_set_project || exit 0
+    handoff_root=$HO_HANDOFF_ROOT
+    project_dir=$HO_PROJECT_DIR
 
-    session_id=$(ho_string_field session_id)
+    session_id=$HO_SESSION_ID
     ho_is_uuid "$session_id" || session_id="unknown"
-    transcript=$(ho_path_field transcript_path)
+    transcript=$HO_TRANSCRIPT_PATH
 
     mkdir -p "$handoff_root" 2>/dev/null || exit 0
 
@@ -78,7 +79,7 @@ main() {
     fi
 
     # 3. メタデータ（原子的書き込み）
-    trigger=$(ho_string_field trigger)
+    trigger=$HO_TRIGGER
     jq -n --arg sa "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg sid "$session_id" --arg tg "$trigger" \
           --arg tp "$transcript" --argjson it "$items" \
         '{saved_at: $sa, session_id: $sid, trigger: $tg, transcript_path: $tp, items: $it}' \

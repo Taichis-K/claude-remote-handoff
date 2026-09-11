@@ -15,16 +15,17 @@ POINTER_MAX_AGE_DAYS=7
 main() {
     ho_require_jq handoff-restore || exit 0
     ho_read_input || exit 0
-    handoff_root=$(ho_handoff_root) || exit 0
-    project_dir=$(ho_project_dir)
+    ho_set_project || exit 0
+    handoff_root=$HO_HANDOFF_ROOT
+    project_dir=$HO_PROJECT_DIR
 
-    source_kind=$(ho_string_field source)
-    own_sid=$(ho_string_field session_id)
+    source_kind=$HO_SOURCE
+    own_sid=$HO_SESSION_ID
     ho_is_uuid "$own_sid" || own_sid=""
 
     # 削除・参照対象はprojects_root配下の包含ゲートを通った実在通常ファイルのみ
     # （issue #33 — 挙動変更）。ゲートNG・不存在は空＝従来の「stateなし」と同じ扱い
-    tp=$(ho_path_field transcript_path)
+    tp=$HO_TRANSCRIPT_PATH
     state_file=$(ho_valid_state_path "$tp" delete) || state_file=""
 
     # --- 1. ポインタ読込み（スキーマ・消費済み・有効期限を検証） ---
@@ -61,7 +62,7 @@ main() {
                and ((has("consumed_at") | not) or (.consumed_at == null) or (.consumed_at == ""))
             then "ok" else "no" end' "$latest_path" 2>/dev/null)
         if [ "$pointer_ok" = "ok" ]; then
-            p_sid=$(jq -r '.session_id' "$latest_path")
+            p_sid=$(ho_json_str_field "$latest_path" session_id)
             ho_is_uuid "$p_sid" || pointer_ok="no"
         fi
         if [ "$pointer_ok" = "ok" ]; then
@@ -174,7 +175,7 @@ main() {
                         gate="no"
                         gate_note="SHA-256不一致（ポインタのsha256が文字列でない）"
                     else
-                        p_sha=$(jq -r '.sha256' "$latest_path" 2>/dev/null)
+                        p_sha=$(ho_json_str_field "$latest_path" sha256)
                         h=$(ho_sha256 "$current_md")
                         if [ -z "$h" ] || [ "$h" != "$p_sha" ]; then
                             gate="no"
@@ -281,9 +282,13 @@ $git_text"
     src_transcript=""
     if [ "$source_kind" = "clear" ]; then
         if [ "$use_pointer" = "yes" ]; then
-            p_tp=$(jq -r '.transcript_path // empty' "$latest_path")
-            projects_root="$HOME/.claude/projects"
-            if [ -n "$p_tp" ] && [ -f "$p_tp" ] && ho_under_root "$projects_root" "$p_tp"; then
+            p_tp=$(ho_json_str_field "$latest_path" transcript_path)
+            # rootはissue #33の解決関数を使う（CLAUDE_CONFIG_DIR優先。決め打ちの
+            # "$HOME/.claude/projects" だと設定ディレクトリを移設した利用者で
+            # 引用が常に無言で落ちる。加えてsh版$HOME / PS版UserProfileの分裂も生む）。
+            # 解決不能ならfail-closedで引用しない
+            if projects_root=$(ho_projects_root) &&
+               [ -n "$p_tp" ] && [ -f "$p_tp" ] && ho_under_root "$projects_root" "$p_tp"; then
                 src_transcript="$p_tp"
             fi
         fi
@@ -327,8 +332,10 @@ $newest_backup"
             # 値は「ルートがobjectかつ文字列」の場合のみ表示（それ以外・パース不能は空欄。
             # PS版と同一契約。旧 `.saved_at // ""` はルート配列でjqエラー、非文字列を
             # JSON表現のまま表示しPS版と分裂し得た）
-            bk_saved_at=$(jq -r 'if (type == "object") and ((.saved_at | type) == "string") then .saved_at else "" end' "$newest_backup/meta.json" 2>/dev/null)
-            bk_transcript=$(jq -r 'if (type == "object") and ((.items | type) == "object") and ((.items.transcript | type) == "string") then .items.transcript else "" end' "$newest_backup/meta.json" 2>/dev/null)
+            # NULを含む値は空にする（シェルへ出すとNULが落ちてPS版と表示が分裂する —
+            # HANDOFF.mdバックログ13）
+            bk_saved_at=$(jq -r 'if (type == "object") and ((.saved_at | type) == "string") and ((.saved_at | contains("\u0000")) | not) then .saved_at else "" end' "$newest_backup/meta.json" 2>/dev/null)
+            bk_transcript=$(jq -r 'if (type == "object") and ((.items | type) == "object") and ((.items.transcript | type) == "string") and ((.items.transcript | contains("\u0000")) | not) then .items.transcript else "" end' "$newest_backup/meta.json" 2>/dev/null)
             bk="$bk
 保存: ${bk_saved_at} / transcript: ${bk_transcript}"
         fi

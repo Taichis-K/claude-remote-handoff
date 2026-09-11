@@ -14,49 +14,138 @@ ho_require_jq() {
     return 1
 }
 
-# stdin全体を$HO_INPUTへ読み込む。JSONとして不正なら1を返す
+# stdin全体を ${HO_INPUT} へ読み込み、各フックが使うフィールドをまとめて取り出す。
+# JSONとして不正・object以外なら1を返す（呼び出し側はexit 0）。
+#
+# 以前は「type=="object" の検証」と「フィールドごとの取得」で毎回jqを起こしていた
+# （handoff-checkの最小経路で stdin を6回パースしていた。cwd は ho_handoff_root と
+# ho_project_dir から2回）。Windowsではプロセス起動が1回70〜85ms、コマンド置換の
+# fork がさらに約26msかかり、フック1回の実測時間に直接効く（2026-08-30の速度対策。
+# handoff-config.json の7回パース解消と同じ趣旨）。
+# 値は @sh でシェル引用してから eval するため、空白・引用符・グロブ文字・`$`・
+# バッククォートを含む値も分割・展開・実行されずに元のまま渡る。
+#
+# 取得契約（フィールドごとにjqを起こしていた頃と同一）:
+#   - 文字列フィールド（cwd / session_id / source / trigger）は文字列以外の型を空扱い
+#     （PS版の -is [string] ガードと同一契約 — 罠8の型固定）。**NULとCRを含む値も空扱い**、
+#     **LFは剥がさず生のまま持つ**（HANDOFF.mdバックログ12）。理由は下の「運べるもの」参照
+#   - パスフィールド（transcript_path）は文字列型かつC0制御文字/DELを含まない場合のみ返す。
+#     制御文字の検査は値がシェルへ出る前にjq内で行う（codexレビュー#33-4 L2）
+#   - background_tasks は要素数（配列でなければ0）。判定側の契約は従来どおり
+#   - JSON文がちょうど1個であることを要求する（-s + length==1）。連結JSON
+#     （{"a":1}{"b":2} のような入力）はPS版の ConvertFrom-Json が
+#     「Additional text encountered」で拒否する一方、旧sh版は jq -e の終了コードが
+#     最後の出力値で決まるため「最後の文がobjectなら通す」という緩い判定だった。
+#     PS版に合わせて拒否する（fail-closed。sh/PSの受否分裂の解消）
+#   - stop_hook_active は**判定結果**（0/1）で持つ。値そのものを運ぶと
+#     コマンド置換が末尾のLFを剥がし、「true + 末尾LF」が "true" と一致してしまい、
+#     PS版（完全一致で不一致）と割れる。契約は「boolean true か 文字列 "true" のみ有効」
+#
+# **シェルが運べるもの・運べないもの**（この設計の前提。すべて実測 — バックログ12）:
+#   - LF: 運べる。jqのstdoutはテキストモードで値の中のLFをCRLFへ変えるが、
+#     MSYSのシェルは eval の解析時にCRを落とすので、往復するとLFに戻る
+#     （値が「x + LF」のJSONを @sh + eval に通すと「x + LF」のまま。末尾LFも保つ）。
+#     Linuxではそもそも変換が無く素通りする
+#   - CR: **運べない**。上記のとおり eval がCRを落とすため、「x + CR + y」が xy になる。
+#     コマンド置換なら残るが、今度は値の中のLFがCRLFに化けたままになる。
+#     どちらの経路でもCRとLFを同時に正しくは運べない
+#   - NUL: **運べない**（バックログ13）
+# したがって揃えられるのは「NUL・CRを含む値は空扱い、LFは生のまま」だけである。
+# CR入りの値は正当な入力に存在しない（session_idはUUID、sourceは clear/compact 等、
+# triggerは auto/manual、cwdはパス）ので、両実装で空へ落とす側に倒す。
+# 以前は末尾LFをjq側で剥がしていたが、PS版は生値を使うため
+#   「clear + 末尾LF」を sh版だけ clear と見る / 内部LFの値でsh版だけCRが増える
+# という分裂になっていた（実測）。剥がすのをやめ、遅い経路も廃止した
 ho_read_input() {
     HO_INPUT=$(cat)
     [ -n "$HO_INPUT" ] || return 1
-    printf '%s' "$HO_INPUT" | jq -e 'type=="object"' >/dev/null 2>&1 || return 1
+    HO_CWD=""
+    HO_TRANSCRIPT_PATH=""
+    HO_SESSION_ID=""
+    HO_SOURCE=""
+    HO_TRIGGER=""
+    HO_BG_TASKS=0
+    HO_STOP_ACTIVE=0
+    _fields=$(printf '%s' "$HO_INPUT" | jq -s -r '
+        def strfield: if type == "string" and (contains("\u0000") | not)
+                         and (contains("\r") | not) then . else "" end;
+        def pathfield: if type == "string" and (test("[\u0000-\u001f\u007f]") | not) then . else "" end;
+        if length == 1 and (.[0] | type) == "object" then .[0] |
+            "HO_CWD=\(.cwd | strfield | @sh) " +
+            "HO_TRANSCRIPT_PATH=\(.transcript_path | pathfield | @sh) " +
+            "HO_SESSION_ID=\(.session_id | strfield | @sh) " +
+            "HO_SOURCE=\(.source | strfield | @sh) " +
+            "HO_TRIGGER=\(.trigger | strfield | @sh) " +
+            "HO_BG_TASKS=\(.background_tasks | if type == "array" then length else 0 end) " +
+            "HO_STOP_ACTIVE=\(if .stop_hook_active == true then 1
+                elif (.stop_hook_active | type) == "string" and .stop_hook_active == "true" then 1
+                else 0 end)"
+        else empty end' 2>/dev/null)
+    [ -n "$_fields" ] || return 1
+    eval "$_fields"
     return 0
 }
 
-# $HO_INPUTからフィールドを取り出す（無ければ空文字）
-ho_field() {
-    printf '%s' "$HO_INPUT" | jq -r --arg k "$1" '.[$k] // empty' 2>/dev/null
+# JSONファイル（$1）から文字列フィールド（$2）を取り出す。文字列型かつNULを含まない
+# 場合だけ値を返し、それ以外は空を返す（HANDOFF.mdバックログ13）。
+#
+# 生の `$(jq -r '.field' file)` は**NULをシェルへ渡せない**。Git shは
+# 「ignored null byte in input」としてNULを取り除いた値を返すため、
+# `"<uuid>\u0000"` が正規のUUIDへ、`"<正しいSHA>\u0000"` が正しいSHAへ縮退して
+# 検証を通ってしまう（実測: ガード無しだと注入とポインタ消費まで進む）。
+# PS版は.NET文字列としてNULを保持するので拒否する側で、そのまま受否が分裂する。
+# **シェルはNULを保持できない**以上、揃えられるのは「NULを含む値は空扱い」だけである。
+#
+# 弾くのは**NULだけ**にする。他のC0制御文字やDELはシェルをそのまま通り、
+# 下流の検証（UUID正規表現・SHAの完全一致・`[ -f ]`）がPS版と同じ結果を出すため、
+# ここで落とすと逆にsh版だけが拒否する分裂を作る（DEL入りの実在パスを
+# PS版だけが引用する — 2026-08-30 codexレビュー Low）
+ho_json_str_field() {
+    jq -r --arg k "$2" \
+        '.[$k] | if type == "string" and (contains("\u0000") | not) then . else "" end' \
+        "$1" 2>/dev/null
 }
 
-# 文字列フィールド専用の取得: 文字列以外の型（配列・boolean・number等）は空扱い
-# （PS版の -is [string] ガードと同一契約。ho_fieldは非文字列をjqの出力表現で返すため、
-# パス等に使うとPS版と挙動が分裂し得る — 罠8の型固定）
-ho_string_field() {
-    printf '%s' "$HO_INPUT" | jq -r --arg k "$1" '.[$k] | if type == "string" then . else "" end' 2>/dev/null
-}
-
-# パス用フィールド取得: 文字列型かつC0制御文字/DELを含まない場合のみ返す（それ以外は空）。
-# シェルのコマンド置換は末尾LFを剥がすため、ho_string_fieldでは「末尾改行入りパス」が
-# 「改行なしの有効パス」へ化け、生値を保持して字句ゲートで拒否するPS版と受否が分裂する
-# （codexレビュー#33-4 L2）。制御文字の検査は値がシェルへ出る前にjq内で行う
-ho_path_field() {
-    printf '%s' "$HO_INPUT" | jq -r --arg k "$1" \
-        '.[$k] | if type == "string" and (test("[\u0000-\u001f\u007f]") | not) then . else "" end' 2>/dev/null
-}
-
-ho_project_dir() {
-    if [ -n "$CLAUDE_PROJECT_DIR" ]; then
-        printf '%s' "$CLAUDE_PROJECT_DIR"
-    else
-        ho_string_field cwd
-    fi
-}
-
-ho_handoff_root() {
+# プロジェクトディレクトリと引き継ぎルートを HO_PROJECT_DIR / HO_HANDOFF_ROOT に設定する。
+# 決められなければ1を返す（呼び出し側はexit 0）。値を戻り値でなく変数で返すのは
+# コマンド置換のforkを避けるため（以前は $(ho_handoff_root) と $(ho_project_dir) で
+# 2回forkし、その中で cwd を1回ずつパースしていた）。
+#
+# 挙動変更（意図的・PS版に寄せる方向。2026-08-30 codexレビュー Low-5）:
+# 旧実装は $(ho_project_dir) のコマンド置換が CLAUDE_PROJECT_DIR の末尾LFを剥がしていた。
+# PS版の Get-ProjectDir は $env:CLAUDE_PROJECT_DIR を生のまま返すので、剥がさない方が
+# 一致する。末尾LF入りの値ではPS版と同様に config が見つからず静かに無効化される
+# （fail-closed。そもそも環境変数に改行が入るのは設定ミス）
+ho_set_project() {
+    # 参照は ${x:-} 形式にする（ho_require_jq と同じ流儀）。旧実装は $( ) の中で展開して
+    # いたため set -u 環境でも「サブシェルが落ちる → 外側の || exit 0」で静かに終わったが、
+    # メインシェルで展開する形にするとフック自体が異常終了する
+    # （2026-08-30 codexレビュー2回目 Low-1）
+    HO_PROJECT_DIR=${CLAUDE_PROJECT_DIR:-}
+    [ -n "$HO_PROJECT_DIR" ] || HO_PROJECT_DIR=${HO_CWD:-}
+    [ -n "$HO_PROJECT_DIR" ] || return 1
     # ⚠️ .claude/ 配下は使わない（sensitive file保護でLLMが書けない — PS版コメント参照）
-    d=$(ho_project_dir)
-    [ -n "$d" ] || return 1
-    printf '%s/.claude-handoff' "$d"
+    # 連結前に末尾の区切りを落とす（PS版は Join-Path が畳む）。落とさないと
+    # CLAUDE_PROJECT_DIR="/srv/repo/" が "/srv/repo//.claude-handoff" になり、
+    # 包含判定の「連続区切りの全域拒否」に掛かってsh版だけ復元できなくなる
+    # （2026-08-31 codexレビュー Medium-2）。HO_PROJECT_DIR 自体は変えない
+    # （PS版も $dir を加工せず Join-Path 側で畳んでいるため）。"/" だけの場合は空にしない
+    _sp_base=$HO_PROJECT_DIR
+    while :; do
+        case "$_sp_base" in
+            ?*/|?*\\) _sp_base=${_sp_base%?} ;;
+            *) break ;;
+        esac
+    done
+    HO_HANDOFF_ROOT="$_sp_base/.claude-handoff"
+    return 0
 }
+
+# dirname(1) をパラメータ展開で置き換えるのは不可（2026-08-30 codexレビュー High-1/Medium-3）。
+# MSYS版の dirname は**バックスラッシュも区切りとして扱う**（`C:\x\y` → `C:\x`）が、
+# POSIX版は `.` を返す。素のシェルで書くとどちらかのプラットフォームで必ず割れ、
+# バックスラッシュを区切り扱いにすると今度はLinuxの「名前に \ を含むパス」を壊す。
+# `$(dirname …)` のforkは残すこと。
 
 # $1=handoffRoot $2=source $3=message
 ho_error() {
@@ -83,6 +172,10 @@ ho_write_atomic() {
     fi
     _dst="$1"
     _dir=$(dirname "$_dst")
+    # tmp名のランダム部分は外さないこと。PID＋連番の予測可能な名前にすると、
+    # 同ディレクトリへ書ける相手が書き込み前にsymlinkを置いて被害ファイルを
+    # 上書きさせられる（2026-08-30 codexレビュー Medium-4。速度目的で
+    # od+tr を外そうとして差し戻した）
     _tmp="$_dir/~ho.$$.$(od -An -N4 -tx4 /dev/urandom 2>/dev/null | tr -d ' \n' || echo $$).tmp"
     cat > "$_tmp" || { rm -f "$_tmp"; return 1; }
     mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; return 1; }
@@ -99,31 +192,159 @@ ho_is_uint_token() {
     [ ${#1} -le 10 ]
 }
 
+# UUID形式（16進 8-4-4-4-12）か。caseは全文一致なので、grep -Eq のように
+# 「改行の後ろに文字が続く値」の1行目だけが通ることがない（HANDOFF.mdバックログ11:
+# `<uuid>` + LF + `x` を sh版は受理・PS版は拒否していた。MSYSのgrepはCRも行末として
+# 落とすためWindowsでも再現する）。ho_is_uint_token で既に塞いだのと同型の罠。
+# 末尾LFだけの `<uuid>` + LF も、strfieldが末尾LFを剥がさなくなった（バックログ12）ため
+# 長さが37になってここで落ちる。PS版も Test-Uuid のアンカーを終端一致へ締めたので、
+# 両実装とも拒否側で揃う。
+# 文字クラスはロケール照合順の影響を避けるため範囲でなく列挙で書く
+# （ho_is_uint_token と同じ理由）。grepプロセスが1つ減る副次効果もある
 ho_is_uuid() {
-    printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    # 長さ36とハイフン位置を固定する（caseの ? は改行を含む任意の1文字に一致するので、
+    # 改行入りの値はここで長さが合わずに落ちる）
+    case "$1" in
+        ????????-????-????-????-????????????) ;;
+        *) return 1 ;;
+    esac
+    # ハイフンで区切り、各セグメントが16進のみ・セグメントがちょうど5個であることを見る。
+    # 5個より多ければ、上のパターンの ? のどれかがハイフンだったということ
+    _u=$1
+    _un=0
+    while :; do
+        case "${_u%%-*}" in
+            *[!0123456789abcdefABCDEF]*) return 1 ;;
+        esac
+        _un=$((_un + 1))
+        case "$_u" in
+            *-*) _u=${_u#*-} ;;
+            *) break ;;
+        esac
+    done
+    [ "$_un" -eq 5 ]
 }
 
 ho_uuid() {
     if command -v uuidgen >/dev/null 2>&1; then
         uuidgen | tr 'A-Z' 'a-z'
     else
-        _h=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-        printf '%s-%s-%s-%s-%s\n' \
-            "$(printf '%s' "$_h" | cut -c1-8)" "$(printf '%s' "$_h" | cut -c9-12)" \
-            "$(printf '%s' "$_h" | cut -c13-16)" "$(printf '%s' "$_h" | cut -c17-20)" \
-            "$(printf '%s' "$_h" | cut -c21-32)"
+        # od+awkの2プロセスで組み立てる（2026-08-30の速度対策。以前は
+        # od+tr+cut×5 の7プロセスだった。Windowsではプロセス起動が1回70〜85msで、
+        # フック1回の実測時間に直接効く）。odの出力行数に依存しないよう
+        # 全フィールドを連結してから桁位置で切る（LC_ALL=Cでlocale非依存）
+        od -An -N16 -tx1 /dev/urandom | LC_ALL=C awk '
+            { for (i = 1; i <= NF; i++) h = h $i }
+            END { print substr(h, 1, 8) "-" substr(h, 9, 4) "-" substr(h, 13, 4) "-" substr(h, 17, 4) "-" substr(h, 21, 12) }'
     fi
 }
 
-# $1=root $2=candidate: 正規化後にroot配下ならexit 0
-ho_under_root() {
-    _r=$(cd "$1" 2>/dev/null && pwd) || return 1
-    _cdir=$(dirname "$2")
-    _c=$(cd "$_cdir" 2>/dev/null && pwd) || return 1
-    case "$_c/" in
-        "$_r"/*|"$_r/") return 0 ;;
+# $1=パス: 先頭が「ASCII英字 + :」ならそのドライブレターだけ小文字にして
+# **HO_DRIVE_LOWER へ入れる**（PS版 ConvertTo-HoDriveLowerPath と同一契約）。
+# MSYSの pwd が「D:/x」も「d:/x」も /d/x へ畳むのに合わせるための正規化。
+# 標準出力ではなく変数で返すのは、包含判定がStopフックの都度経路にあり、
+# コマンド置換 $( ) のforkが1回26msかかるため（実測。docs/design参照）。
+# trも使わず case で畳むのも同じ理由
+ho_drive_lower() {
+    HO_DRIVE_LOWER=$1
+    case "$1" in
+        [A-Za-z]:*) ;;
+        *) return 0 ;;
+    esac
+    _dl_d=${1%"${1#?}"}
+    _dl_rest=${1#?}
+    case $_dl_d in
+        A) _dl_d=a ;; B) _dl_d=b ;; C) _dl_d=c ;; D) _dl_d=d ;; E) _dl_d=e ;;
+        F) _dl_d=f ;; G) _dl_d=g ;; H) _dl_d=h ;; I) _dl_d=i ;; J) _dl_d=j ;;
+        K) _dl_d=k ;; L) _dl_d=l ;; M) _dl_d=m ;; N) _dl_d=n ;; O) _dl_d=o ;;
+        P) _dl_d=p ;; Q) _dl_d=q ;; R) _dl_d=r ;; S) _dl_d=s ;; T) _dl_d=t ;;
+        U) _dl_d=u ;; V) _dl_d=v ;; W) _dl_d=w ;; X) _dl_d=x ;; Y) _dl_d=y ;;
+        Z) _dl_d=z ;;
+    esac
+    HO_DRIVE_LOWER="$_dl_d$_dl_rest"
+}
+
+# $1=root（「/」正規化済み・末尾スラッシュなし） $2=検査対象（「/」正規化済み）:
+# root配下ならexit 0。包含ゲートの唯一の判定規則（HANDOFF.mdバックログ16。
+# PS版 Test-HoContained と同一契約）:
+#   連続区切り（"//"）を全域拒否 → ドライブレターを小文字へ畳んで ordinal 前方一致 →
+#   rootから $2 の親までの各構成要素が「実在ディレクトリかつ非symlink」
+# **symlink/junctionは追跡せず、経路にあれば拒否する**。以前は sh版が `cd`+`pwd`、
+# PS版が GetFullPath で、どちらも**字句解決のまま**だった（`pwd` は既定で論理パスを返す。
+# 物理解決は `pwd -P` — 実測）。そのため projects_root 配下に置かれた
+# root外を指すjunctionを**両実装とも受理し、root外のファイルを引用できていた**
+# （2026-08-31 codexレビュー Medium。ただし「sh版は物理解決するので拒否する」という
+# 指摘の前提は誤りで、分裂ではなく共通の穴だった — C87で実測）。
+# 経路のsymlinkを拒否する規則は組B（ho_valid_state_path）が元から持っており、そちらへ揃えた。
+# ".."は追跡しないと畳めないため、呼び出し側が ho_path_token_ok で先に拒否すること
+ho_contained_strict() {
+    ho_drive_lower "$1"; _cs_root=$HO_DRIVE_LOWER
+    ho_drive_lower "$2"; _cs_p=$HO_DRIVE_LOWER
+    case "$_cs_p" in *//*) return 1 ;; esac
+    case "$_cs_p" in
+        "$_cs_root"/*) : ;;
         *) return 1 ;;
     esac
+    [ -d "$_cs_root" ] || return 1
+    if [ -h "$_cs_root" ]; then return 1; fi
+    _cs_parent="${_cs_p%/*}"
+    _cs_rel="${_cs_parent#"$_cs_root"}"
+    _cs_rel="${_cs_rel#/}"
+    _cs_walk="$_cs_root"
+    if [ -n "$_cs_rel" ]; then
+        _cs_oldifs="$IFS"; IFS='/'; set -f
+        for _cs_seg in $_cs_rel; do
+            if [ -z "$_cs_seg" ]; then IFS="$_cs_oldifs"; set +f; return 1; fi
+            _cs_walk="$_cs_walk/$_cs_seg"
+            if [ -h "$_cs_walk" ] || [ ! -d "$_cs_walk" ]; then
+                IFS="$_cs_oldifs"; set +f; return 1
+            fi
+        done
+        IFS="$_cs_oldifs"; set +f
+    fi
+    # leaf自身がsymlinkなら拒否する。親までしか見ないと
+    # 「<root>/proj/session.jsonl -> /tmp/outside.jsonl」のように**対象ファイルを**
+    # リンクに差し替えるだけでroot外を読めてしまう（後段の [ -f ] も cat/tail も
+    # リンクを追跡する — 2026-08-31 codexレビュー Medium-1）。
+    # 実在しないleafは通す（書込みモードの呼び出しがあるため）
+    if [ -h "$_cs_p" ]; then return 1; fi
+    return 0
+}
+
+# $1=root $2=candidate: root配下ならexit 0（PS版 Test-PathUnderRoot と同一契約）。
+# 判定は ho_contained_strict に一本化してある（バックログ16で組A・組Bの契約を統一）
+# $1=パス: 組Aの前段検査。制御文字（C0/DEL）と "."/".." セグメントだけを拒否する
+# （PS版 Test-HandoffNoTraversal と同一契約）。".." は追跡しない以上ここで落とすしかない。
+# **ho_path_token_ok は使わない**: あちらはWindows予約デバイス名やドライブ位置以外の
+# コロンも拒否するが、組Aの候補は利用者のプロジェクトパス由来で、
+# POSIXでは /srv/aux/repo や /srv/team:blue/repo が正当な絶対パスである。
+# 全プラットフォームでWindowsの名前規則を課すとmacOS/Linuxで復元不能になる
+# （2026-08-31 codexレビュー Medium-3）。root外参照は包含判定と経路のsymlink拒否が塞ぐ
+ho_no_traversal() {
+    case "$1" in
+        '') return 1 ;;
+    esac
+    printf '%s' "$1" | LC_ALL=C awk '
+        NR > 1 { bad = 1; exit }
+        NR == 1 {
+            p = $0
+            if (p ~ /[[:cntrl:]]/) bad = 1
+            gsub(/\\/, "/", p)
+            n = split(p, seg, "/")
+            for (i = 1; i <= n; i++) {
+                if (seg[i] == "." || seg[i] == "..") bad = 1
+            }
+        }
+        END { if (NR == 0) bad = 1; exit bad ? 1 : 0 }'
+}
+
+ho_under_root() {
+    ho_no_traversal "$2" || return 1
+    _ur_root=$(printf '%s' "$1" | tr '\\' '/')
+    while [ "${_ur_root%/}" != "$_ur_root" ]; do _ur_root="${_ur_root%/}"; done
+    [ -n "$_ur_root" ] || return 1
+    _ur_p=$(printf '%s' "$2" | tr '\\' '/')
+    ho_contained_strict "$_ur_root" "$_ur_p"
 }
 
 # --- transcript由来の状態ファイルパス包含ゲート（issue #33） ---
@@ -228,35 +449,15 @@ ho_valid_state_path() {
     _len=$(printf '%s' "$_vp" | LC_ALL=C wc -c | tr -d ' \t')
     [ "$_len" -le 240 ] 2>/dev/null || return 1
     _root=$(ho_projects_root) || return 1
-    # 連続する区切り（"//"）は全域拒否: shのIFS分割は末尾の空フィールドを落とし、
-    # ファイルシステムは"//"を畳み込むため、空要素検査だけではPS版（空要素拒否）と
-    # 分裂する（codexレビュー#33-3 L2実測: "proj//x.jsonl" をshだけ受理していた）
-    case "$_vp" in
-        *//*) return 1 ;;
-    esac
-    case "$_vp" in
-        "$_root"/*) : ;;
-        *) return 1 ;;
-    esac
-    [ -d "$_root" ] || return 1
-    if [ -h "$_root" ]; then return 1; fi
-    # rootから親ディレクトリまでの各構成要素を検査（実在ディレクトリかつ非symlink。
-    # symlink経由でroot外の実体を指す経路を遮断する）
-    _parent="${_vp%/*}"
-    _relp="${_parent#"$_root"}"
-    _relp="${_relp#/}"
-    _walk="$_root"
-    if [ -n "$_relp" ]; then
-        _oldifs="$IFS"; IFS='/'; set -f
-        for _seg in $_relp; do
-            if [ -z "$_seg" ]; then IFS="$_oldifs"; set +f; return 1; fi
-            _walk="$_walk/$_seg"
-            if [ -h "$_walk" ] || [ ! -d "$_walk" ]; then
-                IFS="$_oldifs"; set +f; return 1
-            fi
-        done
-        IFS="$_oldifs"; set +f
-    fi
+    # 包含判定は ho_contained_strict に一本化してある（HANDOFF.mdバックログ16で
+    # 組A=ho_under_root と契約を揃えた）。中身は「連続区切り（"//"）の全域拒否＋
+    # ドライブレターを畳んだordinal前方一致＋rootから親までの各要素が実在ディレクトリ
+    # かつ非symlink」。連続区切りを全域で見るのは、shのIFS分割が末尾の空フィールドを
+    # 落としFSが"//"を畳むため、空要素検査だけではPS版と分裂するから
+    # （codexレビュー#33-3 L2実測: "proj//x.jsonl" をshだけ受理していた）。
+    # 戻り値の _vp はドライブレターを畳まない生の形のままにする（判定と操作の対象を
+    # 揃えるという原則は維持しつつ、畳みは比較の中だけに閉じる）
+    ho_contained_strict "$_root" "$_vp" || return 1
     if [ "$_mode" = "delete" ]; then
         if [ -h "$_vp" ]; then return 1; fi
         [ -f "$_vp" ] || return 1
