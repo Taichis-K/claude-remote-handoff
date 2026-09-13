@@ -30,6 +30,7 @@ $TOTAL_MAX = 10000
 $GIT_TIMEOUT_MS = 10000
 $POINTER_MAX_AGE_DAYS = 7
 $POINTER_FUTURE_SKEW_SEC = 86400
+$FRESH_TAIL_LINES = 500     # 鮮度表示で使用量を測るときに読むtranscript末尾の行数（checkと同じ）
 
 $handoffRoot = $null
 try {
@@ -149,8 +150,12 @@ try {
     $resolvedSessionId = $null   # current.md/バックアップ導線を読むセッション
     $handoffOrigin = ""
     $usePointer = $false
+    # 自セッションに下書き（draft.md）だけがある場合も自セッションに解決する（v0.2.1。初回サイクルで書いている途中・
+    # 検証NG・打ち切り。HEAD は書きかけの current.md があったので自セッションに解決していた。広げないと
+    # 自セッションのバックアップ導線が消え、別セッションの資料を代わりに注入してしまう — 設計メモ 2026-09-13 S8。sh版と同一）
+    $ownDraft = ($null -ne $ownSessionId) -and (Test-Path -LiteralPath (Join-Path $handoffRoot "$ownSessionId/draft.md") -PathType Leaf)
     if (-not (Test-OrdinalEqual $source "clear") -and $null -ne $ownSessionId -and
-        (Test-Path -LiteralPath (Join-Path $handoffRoot "$ownSessionId/current.md"))) {
+        ((Test-Path -LiteralPath (Join-Path $handoffRoot "$ownSessionId/current.md")) -or $ownDraft)) {
         $resolvedSessionId = $ownSessionId
         $handoffOrigin = "セッションディレクトリ直接参照（$ownSessionId）"
     } elseif ($null -ne $pointer) {
@@ -189,6 +194,7 @@ try {
     $gateNote = ""
     if ($null -ne $currentMdPath) {
         $verifyNonce = $null
+        $verifyInfo = $null
         if ($usePointer) { $verifyNonce = $pointer.nonce }
         elseif ($null -ne $pointer -and (Test-OrdinalEqual ([string]$pointer.session_id) ([string]$resolvedSessionId))) { $verifyNonce = $pointer.nonce }
         elseif (-not (Test-OrdinalEqual $source "clear") -and $null -ne $stateFileToDelete -and
@@ -199,13 +205,12 @@ try {
                 $ownState = ConvertFrom-JsonPreserve (Get-Content -LiteralPath $stateFileToDelete -Raw -Encoding UTF8)
                 # 閉じたスキーマ（issue #38）: 未知キー入り・schema_version不正のstateは
                 # nonce源として使わない（check側の破棄契約と同一の受否 — sh版と同一契約）
+                # 完了状態なら nonce、ソフトで作った資料の書き直しを指示中なら持ち越した completed_nonce
+                # （v0.2.1。書き直しが終わる前に圧縮されても、完成済みの旧資料を検証できるように）
                 if ($null -ne $ownState -and -not ($ownState -is [System.Array]) -and
-                    (Test-HoStateClosedSchema $ownState) -and
-                    (Test-HoProp $ownState "completed") -and
-                    ($ownState.completed -is [bool]) -and $ownState.completed -and
-                    (Test-HoProp $ownState "nonce") -and ($ownState.nonce -is [string]) -and
-                    $ownState.nonce -cmatch '^[A-Za-z0-9-]{8,64}$') {
-                    $verifyNonce = $ownState.nonce
+                    (Test-HoStateClosedSchema $ownState)) {
+                    $ownInfo = Get-HoCompletionInfo $ownState
+                    if ($null -ne $ownInfo) { $verifyNonce = $ownInfo.nonce; $verifyInfo = $ownInfo }
                 }
             } catch { }
         }
@@ -237,6 +242,19 @@ try {
                         }
                     }
                 }
+                # 状態ファイルのnonceで検証した場合も、状態に記録した完成時のSHA-256があれば照合する（v0.2.1）。
+                # 完成後に current.md が書き換えられていたら注入しない（ポインタ経由と同じ扱い）。
+                # SHAが無いのは v0.2.0 以前の状態か完成時のSHA計算失敗で、完了状態・持ち越し（completed_nonce）とも
+                # 従来どおり照合しない（設計メモ 2026-09-13 の I1。フックは書き直し中も current.md を書き換えない）
+                if ($gatePassed -and $null -ne $verifyInfo) {
+                    if ($null -ne $verifyInfo.sha) {
+                        $h = Get-FileSha256 -Path $currentMdPath
+                        if ($null -eq $h -or -not (Test-OrdinalEqual $h $verifyInfo.sha)) {
+                            $gatePassed = $false
+                            $gateNote = "SHA-256不一致（完了検証後にcurrent.mdが改変されている）"
+                        }
+                    }
+                }
             } else {
                 $gateNote = "完了検証NG（マーカー/構造が不正 — 未完成か改変の可能性）"
             }
@@ -256,7 +274,10 @@ try {
     }
 
     # 注入すべきものが何も無ければ無言で終了する（状態ファイルの削除だけ行う）
-    if ($null -eq $currentMdPath -and $null -eq $newestBackup) {
+    # 自セッションの下書きに解決した場合は、HEAD（書きかけの current.md で警告を出していた）と同じく無言にしない
+    $draftResolved = (-not (Test-OrdinalEqual $source "clear")) -and $ownDraft -and
+        (Test-OrdinalEqual ([string]$resolvedSessionId) ([string]$ownSessionId))
+    if ($null -eq $currentMdPath -and $null -eq $newestBackup -and -not $draftResolved) {
         if ($null -ne $stateFileToDelete -and (Test-Path -LiteralPath $stateFileToDelete)) {
             Remove-Item -LiteralPath $stateFileToDelete -Force -ErrorAction SilentlyContinue
         }
@@ -272,10 +293,76 @@ try {
         $sections.Add("※ この資料は別セッション（$($pointer.session_id)）で作成されたものです。同一プロジェクトで複数のセッションを併用している場合は、現在の作業に対応する内容か確認してから使うこと。")
     }
 
+    # --- 4.5 資料の鮮度（v0.2.1。ゲートを通過した資料についてのみ） ---
+    # 資料の完成後も作業を続けてから圧縮・/clearに入ると、注入される資料は古い。
+    # 読み手がそれに気づけるよう、完成からの経過時間と、完成時から復元直前までの使用量の伸びを出す。
+    # 完成時の値は「注入する資料のnonceを、直近に完成した資料のnonceとして持つ状態ファイル」からだけ取る
+    # （別サイクルの状態の値を、この資料の値として出さないため）。取れなければその部分を出さない
+    $freshLine = ""
+    if ($null -ne $currentMdPath -and $gatePassed) {
+        # 鮮度行は補助情報なので、ここで何が起きても注入そのものは止めない（行を省くだけ）
+        try {
+            $fTranscript = $null
+            $fStatePath = $null
+            if ($usePointer) {
+                # ポインタ経由: 資料を作ったのはポインタのtranscriptの会話。状態ファイルはその
+                # transcriptに対応する（clear後は削除機会が無く残っている）。検証は引用と同じ
+                if ((Test-HoProp $pointer "transcript_path") -and ($pointer.transcript_path -is [string]) -and
+                    -not [string]::IsNullOrEmpty($pointer.transcript_path)) {
+                    $fRoot = Get-ClaudeProjectsRoot
+                    if ($null -ne $fRoot -and
+                        (Test-PathUnderRoot -Root $fRoot -Candidate $pointer.transcript_path) -and
+                        (Test-Path -LiteralPath $pointer.transcript_path)) {
+                        $fTranscript = $pointer.transcript_path
+                        $fStatePath = Get-ValidStateFilePath -TranscriptPath $pointer.transcript_path -Mode "delete"
+                    }
+                }
+            } elseif (-not (Test-OrdinalEqual $source "clear")) {
+                # compactで自セッション直接参照: 自分のtranscriptと、削除前の状態ファイル
+                if ((Test-HoProp $inp "transcript_path") -and ($inp.transcript_path -is [string]) -and
+                    -not [string]::IsNullOrEmpty($inp.transcript_path) -and
+                    (Test-Path -LiteralPath $inp.transcript_path)) {
+                    $fTranscript = $inp.transcript_path
+                }
+                $fStatePath = $stateFileToDelete
+            }
+            $fDoneTokens = $null
+            $fDoneEpoch = $null
+            if ($null -ne $fStatePath -and (Test-Path -LiteralPath $fStatePath)) {
+                $fState = ConvertFrom-JsonPreserve (Get-Content -LiteralPath $fStatePath -Raw -Encoding UTF8)
+                if ($null -ne $fState -and -not ($fState -is [System.Array]) -and (Test-HoStateClosedSchema $fState)) {
+                    $fInfo = Get-HoCompletionInfo $fState
+                    if ($null -ne $fInfo -and (Test-OrdinalEqual $fInfo.nonce ([string]$verifyNonce))) {
+                        $fDoneTokens = $fInfo.tokens
+                        $fDoneEpoch = $fInfo.epoch
+                    }
+                }
+            }
+            if ($null -eq $fDoneEpoch -and $null -ne $pointer -and (Test-OrdinalEqual ([string]$pointer.nonce) ([string]$verifyNonce))) {
+                # 状態ファイルに記録が無い（前サイクルの資料・旧形式）がポインタで検証した資料: ポインタの
+                # updated_epoch（完成時刻。上の鮮度ゲートで整数値・範囲を検証済み）から経過時間だけ出す。
+                # 使用量は圧縮をまたぐと比べられないので出さない（設計メモ §8.4。sh版と同一契約）
+                $fDoneEpoch = [long][double]$pointer.updated_epoch
+            }
+            $fNowTokens = $null
+            if ($null -ne $fTranscript -and $null -ne $fDoneTokens) {
+                $u = Get-LastUsageFromTranscript -TranscriptPath $fTranscript -TailLines $FRESH_TAIL_LINES
+                if ($u -ge 1 -and $u -le $HO_TOKENS_MAX) { $fNowTokens = [long]$u }
+            }
+            $fNowEpoch = $null
+            if ($null -ne $fDoneEpoch) { $fNowEpoch = Get-HoNowEpoch }
+            $freshLine = Format-HoFreshnessLine -DoneEpoch $fDoneEpoch -NowEpoch $fNowEpoch -DoneTokens $fDoneTokens -NowTokens $fNowTokens -Source $source
+            if ($null -eq $freshLine) { $freshLine = "" }
+        } catch {
+            $freshLine = ""
+        }
+    }
+
     # --- 5. current.md（検証ゲートを通過した場合のみ内容を注入する） ---
     if ($null -ne $currentMdPath -and $gatePassed) {
         $mdText = Get-Content -LiteralPath $currentMdPath -Raw -Encoding UTF8
         $sections.Add("## 引き継ぎ資料 current.md（$handoffOrigin / 検証済み）")
+        if ($freshLine.Length -gt 0) { $sections.Add($freshLine) }
         $sections.Add((Limit-TextHeadTail -Text $mdText -Head $BUDGET_CURRENT_HEAD -Tail $BUDGET_CURRENT_TAIL))
     } elseif ($null -ne $currentMdPath) {
         $sections.Add("## 引き継ぎ資料 current.md: ⚠️ 検証に失敗したため注入しない（$gateNote）。必要なら下記バックアップから状況を確認すること")

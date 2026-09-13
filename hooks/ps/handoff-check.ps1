@@ -15,64 +15,15 @@ $ErrorActionPreference = "Stop"
 $TAIL_LINES = 500           # usage探索でtranscript末尾から読む行数（全行走査の回避）
 $MAX_ATTEMPTS = 3           # 初回1回+リトライ最大2回（ハードのみ）
 $MAX_TOKEN_VALUE = [long]1000000000   # 設定値の実用上限（オーバーフロー・非現実値の排除）
-$USAGE_KEYS = @("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+# usage計測（Get-UsageTotal / Get-LastUsageFromTranscript）は restore も使うので common にある
 
 function Get-ConfigLong {
     # config数値の共通検証: JSON number（文字列・bool不可）かつ整数かつ範囲内のみ通す。
     # sh版のjq検証（type=="number" and .==floor and 範囲）と同一契約
     # （codexレビュー3回目 Medium-3: 型・整数性・上限の検証がps/shで分裂していた）
     param($Value, [long]$Min, [long]$Max)
-    if ($null -eq $Value) { return $null }
-    if (-not ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal])) { return $null }
-    $d = [double]$Value
-    if ([double]::IsNaN($d) -or [double]::IsInfinity($d)) { return $null }
-    if ($d -ne [math]::Floor($d)) { return $null }
-    if ($d -lt $Min -or $d -gt $Max) { return $null }
-    return [long]$d
-}
-
-function Get-UsageTotal {
-    param($Usage)
-    # 4キーがすべて非負整数で揃った「完全なusage」のみ合算を返す。それ以外は0（不採用）
-    if ($null -eq $Usage) { return 0 }
-    $total = [long]0
-    foreach ($k in $USAGE_KEYS) {
-        if (-not (Test-HoProp $Usage $k)) { return 0 }
-        $v = $Usage.$k
-        # boolや小数・文字列は不採用（型不正の部分行で実測値を上書きしないため）
-        if ($v -is [bool]) { return 0 }
-        if (-not ($v -is [int] -or $v -is [long])) { return 0 }
-        if ($v -lt 0) { return 0 }
-        $total = $total + [long]$v
-    }
-    return $total
-}
-
-function Get-LastUsageFromTranscript {
-    param([string]$TranscriptPath, [int]$TailLines)
-    # メインチェーン（isSidechainでない）assistant行のうち、最後の完全なusageの合算を返す
-    $tokens = [long]0
-    $lines = Get-Content -LiteralPath $TranscriptPath -Tail $TailLines -Encoding UTF8 -ErrorAction SilentlyContinue
-    foreach ($line in $lines) {
-        try {
-            # 行全体が配列のJSONは不正行として無視（jqのselect(type=="object")と同一契約。
-            # パイプラインの ConvertFrom-Json はpwshで1要素配列が縮退するため使わない — 罠8）
-            $e = ConvertFrom-JsonPreserve $line
-            if ($null -eq $e -or ($e -is [System.Array]) -or -not (Test-HoProp $e "type")) { continue }
-            if (-not ($e.type -is [string]) -or -not (Test-OrdinalEqual $e.type "assistant")) { continue }
-            # 除外はboolean trueのみ（jqの `.isSidechain != true` と同一契約。文字列"false"は
-            # truthyのため旧実装は誤除外していた — 罠8の型固定）
-            if ((Test-HoProp $e "isSidechain") -and ($e.isSidechain -is [bool]) -and $e.isSidechain) { continue }
-            if (-not (Test-HoProp $e "message")) { continue }
-            # messageが配列の行は不正として無視（jqは配列への .usage アクセスがエラーで行ごと落ちる）
-            if ($e.message -is [System.Array]) { continue }
-            $u = $null
-            if ($null -ne $e.message -and (Test-HoProp $e.message "usage")) { $u = $e.message.usage }
-            $t = Get-UsageTotal $u
-            if ($t -gt 0) { $tokens = $t }
-        } catch { }
-    }
-    return $tokens
+    # 実装は状態ファイルの数値キーと共通（common の ConvertTo-HoStateLong）。1本にしておく
+    return ConvertTo-HoStateLong $Value $Min $Max
 }
 
 function Test-ValidState {
@@ -95,13 +46,84 @@ function Test-ValidState {
     if ($State.attempts -lt 1 -or $State.attempts -gt 9) { return $false }
     if ((Test-HoProp $State "completed") -and -not ($State.completed -is [bool])) { return $false }
     if ((Test-HoProp $State "failed") -and -not ($State.failed -is [bool])) { return $false }
+    # v0.2.1の additive キー。無い（旧版が書いた状態）のは通し、あるなら型・範囲を検証する
+    # （数値は「JSON number・整数値・範囲内」。1.0 / 1e3 も通す — sh版の jq と同一契約）
+    if ((Test-HoProp $State "completed_tokens") -and $null -eq (ConvertTo-HoStateLong $State.completed_tokens 1 $HO_TOKENS_MAX)) { return $false }
+    if ((Test-HoProp $State "completed_epoch") -and $null -eq (ConvertTo-HoStateLong $State.completed_epoch 1 $HO_EPOCH_MAX)) { return $false }
+    if ((Test-HoProp $State "completed_nonce") -and
+        (-not ($State.completed_nonce -is [string]) -or $State.completed_nonce -cnotmatch '\A[A-Za-z0-9-]{8,64}\z')) { return $false }
+    if ((Test-HoProp $State "completed_sha256") -and
+        (-not ($State.completed_sha256 -is [string]) -or $State.completed_sha256 -cnotmatch '\A[0-9A-F]{64}\z')) { return $false }
     return $true
 }
 
+function Get-CompletionCarry {
+    # 状態を書き換えるときに持ち越す「直近に完成した資料」の情報（v0.2.1）。
+    # 完了状態からの書き直し指示なら、その資料（nonce）が持ち越し元。書き直し中の再試行・打ち切りなら、
+    # すでに持ち越している completed_nonce をそのまま引き継ぐ。無ければ $null
+    param($State)
+    $info = Get-HoCompletionInfo $State
+    if ($null -eq $info) { return $null }
+    $c = @{ completed_nonce = $info.nonce }
+    if ($null -ne $info.tokens) { $c.completed_tokens = $info.tokens }
+    if ($null -ne $info.epoch) { $c.completed_epoch = $info.epoch }
+    if ($null -ne $info.sha) { $c.completed_sha256 = $info.sha }
+    return $c
+}
+
+function New-CompletedState {
+    param($State, [string]$TranscriptPath, $Epoch, $Sha)
+    # 完了時に書く状態。完了時点の使用量と時刻を併記する（v0.2.1）。
+    # 使用量は「資料を書き終えた直後のStop」で測る＝資料が覆っている会話の量。
+    # どちらも取れない・範囲外なら**キーごと書かない**（書いた値が検証で弾かれると、
+    # 状態ファイルが破棄されて指示が出直すため。sh版と同一契約）
+    $s = @{ schema_version = 1; mode = $State.mode; nonce = $State.nonce; attempts = $State.attempts; completed = $true; failed = $false }
+    $ct = Get-LastUsageFromTranscript -TranscriptPath $TranscriptPath -TailLines $TAIL_LINES
+    if ($ct -ge 1 -and $ct -le $MAX_TOKEN_VALUE) { $s.completed_tokens = [long]$ct }
+    if ($null -ne $Epoch -and $Epoch -ge 1 -and $Epoch -le $HO_EPOCH_MAX) { $s.completed_epoch = [long]$Epoch }
+    # 完成した資料のSHA-256（ポインタに書くものと同じ値）。restoreが状態ファイルのnonceで検証するとき、
+    # 資料が完成後に書き換えられていないことの照合に使う（書き直し指示の途中の資料を「検証済み」にしないため）
+    if (($Sha -is [string]) -and $Sha -cmatch '\A[0-9A-F]{64}\z') { $s.completed_sha256 = $Sha }
+    return $s
+}
+
+function Get-DraftPath {
+    param([string]$HandoffMd)
+    # current.md と同じディレクトリの draft.md。区切り文字は current.md のパスの表記に合わせる（sh版 ${1%/*}/draft.md 相当）
+    $i = [Math]::Max($HandoffMd.LastIndexOf([char]47), $HandoffMd.LastIndexOf([char]92))
+    return ($HandoffMd.Substring(0, $i + 1) + "draft.md")
+}
+
+function Move-HandoffDraft {
+    # 完了検証に通った下書きを current.md へ置き換える（設計メモ 2026-09-13 §10.2。sh版は mv -f）。
+    # current.md があれば File.Replace（NTFS の ReplaceFile で置き換えが1操作）。Move-Item -Force は宛先を
+    # 消してから移すので、その間に restore が読むと「資料が見つからない」になり得る。
+    # 第3引数（バックアップ先）に $null を渡すと PS が空文字へ変換して ArgumentException になるため
+    # [NullString]::Value を渡す（PS 5.1 で実測）。読み取り専用の current.md / draft.md は Replace が
+    # UnauthorizedAccessException になるが sh の mv -f は置き換えるので、両方の属性を外してから置き換える。
+    # 失敗は例外のまま呼び出し側へ返す（呼び出し側は未完了として扱う）
+    param([string]$Draft, [string]$Current)
+    if (Test-Path -LiteralPath $Current -PathType Container) { throw "current.md is a directory" }
+    if (-not (Test-Path -LiteralPath $Current)) {
+        [System.IO.File]::Move($Draft, $Current)
+        return
+    }
+    $ro = [System.IO.FileAttributes]::ReadOnly
+    foreach ($p in @($Current, $Draft)) {
+        $attr = [System.IO.File]::GetAttributes($p)
+        if (($attr -band $ro) -eq $ro) { [System.IO.File]::SetAttributes($p, ($attr -bxor $ro)) }
+    }
+    [System.IO.File]::Replace($Draft, $Current, [NullString]::Value)
+}
+
 function New-InstructionText {
-    param([string]$Mode, [string]$HandoffMd, [string]$Nonce, [int]$Attempt, [int]$MaxAttempts, [string]$FailReasons = "")
+    param([string]$Mode, [string]$HandoffMd, [string]$Nonce, [int]$Attempt, [int]$MaxAttempts, [string]$FailReasons = "", [switch]$Refresh)
+    # 書き先は下書き（current.md と同じディレクトリの draft.md）。完了検証に通った下書きだけを check が
+    # current.md へ置き換えるので、書いている途中・検証NGの間も current.md は直前の検証済み資料のまま
+    # （設計メモ docs/design/2026-09-13-refresh-and-freshness.md。sh版と同一文言）
+    $draftMd = Get-DraftPath $HandoffMd
     $common = @(
-        "書き先は次の絶対パス固定: $HandoffMd （このパス以外の既存ファイル、特にプロジェクトルートのHANDOFF.mdには書かないこと）。",
+        "書き先は次の絶対パス固定: ${draftMd} （完了検証に通ると自動で ${HandoffMd} に置き換わる。このパス以外の既存ファイル、特にプロジェクトルートのHANDOFF.mdには書かないこと）。",
         "記載セクション（この7見出しをすべて `## 見出し名` の形で含め、各セクションに本文を書くこと）: Goal / Completed / Not Yet Done / Failed Approaches / Key Decisions / Current State / Resume Instructions。",
         "分量の目安: 全体で5000文字以内。長い資料は再注入時に中央（Failed Approaches / Key Decisions付近）から省略されるため、失敗した方法と決定理由ほど簡潔・確実に残すこと。",
         "ファイルの最終行として完了マーカー行 <!-- handoff-complete: $Nonce --> を必ず書くこと。",
@@ -117,18 +139,26 @@ function New-InstructionText {
             if (-not [string]::IsNullOrEmpty($FailReasons)) { $reasonPart = "前回の検証NG理由: ${FailReasons}。" }
             $retryNote = "（${reasonPart}完了マーカーのnonceは試行ごとに更新される — 必ず今回の指示にある値を使うこと。試行 $Attempt/$MaxAttempts）`n"
         }
-        return "コンテキスト使用量がハード閾値を超えました。auto compactで作業精度が落ちる前に、今の作業を一旦止めて引き継ぎ資料を作成してください。`n$retryNote$common"
+        $refreshNote = ""
+        if ($Refresh) {
+            $refreshNote = "（この会話にはハード閾値に達する前に作った引き継ぎ資料 ${HandoffMd} がありますが、その後の作業が反映されていません。それを読み、いまの状態に合わせて書き直したものを下記の書き先へ書いてください）`n"
+        }
+        return "コンテキスト使用量がハード閾値を超えました。auto compactで作業精度が落ちる前に、今の作業を一旦止めて引き継ぎ資料を作成してください。`n$retryNote$refreshNote$common"
     }
     return "コンテキスト使用量がソフト閾値を超えました。**作業が区切りの良いところまで来ていれば**、圧縮後も継続できるよう引き継ぎ資料を作成してください。中途半端な場合は今は作らなくてよい（次の区切りで作ること。ハード閾値到達時は強制になります）。`n作成する場合:`n$common"
 }
 
 function Write-HardInstruction {
-    param([string]$StatePath, [string]$HandoffMd, [int]$Attempt, [int]$MaxAttempts, [string]$FailReasons = "")
-    # 新しいnonceでハード指示を発行し、状態ファイルを原子的に更新する
+    param([string]$StatePath, [string]$HandoffMd, [int]$Attempt, [int]$MaxAttempts, [string]$FailReasons = "", [switch]$Refresh, $Carry = $null)
+    # 新しいnonceでハード指示を発行し、状態ファイルを原子的に更新する。
+    # $Carry は直近に完成した資料の情報（Get-CompletionCarry）。書き直しの指示中も旧資料を
+    # restoreが検証・鮮度表示できるよう、新しい状態へ持ち越す
     New-Item -ItemType Directory -Force -Path (Split-Path $HandoffMd -Parent) | Out-Null
     $nonce = [guid]::NewGuid().ToString()
-    Write-FileAtomic -Path $StatePath -Content (@{ schema_version = 1; mode = "hard"; nonce = $nonce; attempts = $Attempt; completed = $false; failed = $false } | ConvertTo-Json)
-    $text = New-InstructionText -Mode "hard" -HandoffMd $HandoffMd -Nonce $nonce -Attempt $Attempt -MaxAttempts $MaxAttempts -FailReasons $FailReasons
+    $newState = @{ schema_version = 1; mode = "hard"; nonce = $nonce; attempts = $Attempt; completed = $false; failed = $false }
+    if ($null -ne $Carry) { foreach ($k in $Carry.Keys) { $newState[$k] = $Carry[$k] } }
+    Write-FileAtomic -Path $StatePath -Content ($newState | ConvertTo-Json)
+    $text = New-InstructionText -Mode "hard" -HandoffMd $HandoffMd -Nonce $nonce -Attempt $Attempt -MaxAttempts $MaxAttempts -FailReasons $FailReasons -Refresh:$Refresh
     Write-Output (@{ hookSpecificOutput = @{ hookEventName = "Stop"; additionalContext = $text } } | ConvertTo-Json -Depth 4)
 }
 
@@ -269,8 +299,53 @@ try {
 
     # --- 発行済みhandoff指示がある場合: 完了検証 ---
     if ($null -ne $state) {
-        if ((Test-HoProp $state "completed") -and $state.completed) { exit 0 }
-        if (Test-HandoffComplete -HandoffPath $handoffMd -Nonce $state.nonce) {
+        if ((Test-HoProp $state "completed") -and $state.completed) {
+            # 完了済み。原則はこのサイクルで何もしない（状態ファイルはcompact/clear/resumeの
+            # restoreが消す）が、**ソフト閾値で作った資料は、ハード閾値を越えたら1度だけ
+            # 書き直させる**（v0.2.1）。以前は完了した時点で以後の指示が一切出ず、
+            # ソフト段階で資料を作ったあとも作業を続けると、その作業が資料に無いまま圧縮に入っていた。
+            # 対象は mode が soft の完了だけ。hard の完了は（閾値の設定をあとから変えても）書き直さない。
+            # soft でも完成時の使用量（completed_tokens）がハード閾値以上なら書き直さない。
+            # completed_tokens が無いのは v0.2.0 以前が書いた状態で、そのときは書き直す
+            # （完成がハード閾値以上だった場合に1回余計に書くことがあるが、安全側）。
+            # 書き直しは**ハード閾値の時点に限る**: そこはmin_marginを残して圧縮より前に
+            # 書き終えられる地点として検証済みで、それより後で指示を出すと書いている最中に圧縮が来得る。
+            # 書き直しの指示中に圧縮されても旧資料を復元できるよう、旧資料の nonce と値を
+            # 新しい状態へ持ち越す（Get-CompletionCarry。restoreがそれで検証する）
+            $needMeasure = $false
+            if (Test-OrdinalEqual ([string]$state.mode) "soft") {
+                $doneTokens = $null
+                if ((Test-HoProp $state "completed_tokens")) { $doneTokens = ConvertTo-HoStateLong $state.completed_tokens 1 $HO_TOKENS_MAX }
+                if ($null -eq $doneTokens -or $doneTokens -lt $hardThreshold) { $needMeasure = $true }
+            }
+            if ($needMeasure) {
+                $tokensNow = Get-LastUsageFromTranscript -TranscriptPath $transcript -TailLines $TAIL_LINES
+                if ($tokensNow -ge $hardThreshold) {
+                    Write-HardInstruction -StatePath $statePath -HandoffMd $handoffMd -Attempt 1 -MaxAttempts $MAX_ATTEMPTS -Refresh -Carry (Get-CompletionCarry $state)
+                }
+            }
+            exit 0
+        }
+        # 完了判定（設計メモ §10.1）: まず下書きを検証し、通れば current.md へ置き換えてから完了にする。
+        # 下書きが通らなくても current.md が今回の nonce で通れば完了（v0.2.0 の指示を受けた途中のサイクルと、
+        # モデルが current.md へ直接書いた場合。HEAD と同じ扱い。書き直し指示中の current.md は旧 nonce なので通らない）
+        $draftMd = Get-DraftPath $handoffMd
+        $completeNow = $false
+        $replaceFailed = $false
+        if (Test-HandoffComplete -HandoffPath $draftMd -Nonce $state.nonce) {
+            try {
+                Move-HandoffDraft -Draft $draftMd -Current $handoffMd
+                $completeNow = $true
+            } catch {
+                # 完了にしない。未完了として下へ進む（hard は再試行に数えて打ち切り・通知の経路に乗せる。
+                # soft は追わない）。current.md は置き換え前の検証済み資料のまま。打ち切り（failed）後は Stop ごとに増えるので記録しない
+                $replaceFailed = $true
+                if (-not ((Test-HoProp $state "failed") -and $state.failed)) { Write-HandoffError $handoffRoot "handoff-check" "検証済みの下書きをcurrent.mdへ置き換えられませんでした（session=$sessionId / $($_.Exception.GetBaseException().GetType().Name)）" }
+            }
+        } elseif (Test-HandoffComplete -HandoffPath $handoffMd -Nonce $state.nonce) {
+            $completeNow = $true
+        }
+        if ($completeNow) {
             # 完了確定: まずSHA-256を計算し、失敗時はポインタを更新しない（issue #31:
             # sha256=nullは「整合性ゲートの明示的無効化」経路でproducer失敗と改竄を
             # 区別できないため廃止）。stateはcompletedへ進める（AVロック等は再試行しても
@@ -289,7 +364,7 @@ try {
                 # 通知はstate書き込み（completed遷移）の成功後のみ出す: 遷移前に通知すると
                 # 次のStopでも完了検証から再突入して同じ通知を繰り返す（sh版と同一契約）
                 try {
-                    Write-FileAtomic -Path $statePath -Content (@{ schema_version = 1; mode = $state.mode; nonce = $state.nonce; attempts = $state.attempts; completed = $true; failed = $false } | ConvertTo-Json)
+                    Write-FileAtomic -Path $statePath -Content ((New-CompletedState -State $state -TranscriptPath $transcript -Epoch $ue -Sha $sha) | ConvertTo-Json)
                 } catch {
                     Write-HandoffError $handoffRoot "handoff-check" "${failKind}失敗後のstate書き込みにも失敗しました（session=$sessionId）"
                     exit 0
@@ -316,7 +391,7 @@ try {
                 size            = (Get-Item -LiteralPath $handoffMd).Length
             }
             Write-FileAtomic -Path (Join-Path $handoffRoot "latest.json") -Content ($pointer | ConvertTo-Json)
-            Write-FileAtomic -Path $statePath -Content (@{ schema_version = 1; mode = $state.mode; nonce = $state.nonce; attempts = $state.attempts; completed = $true; failed = $false } | ConvertTo-Json)
+            Write-FileAtomic -Path $statePath -Content ((New-CompletedState -State $state -TranscriptPath $transcript -Epoch $ue -Sha $sha) | ConvertTo-Json)
             exit 0
         }
         # 未完了の場合
@@ -325,15 +400,23 @@ try {
             if ($attempts -ge $MAX_ATTEMPTS) {
                 # 打ち切り。無言で止めず、初回のみユーザーへ通知する（failed遷移を記録）
                 if (-not ((Test-HoProp $state "failed") -and $state.failed)) {
-                    Write-FileAtomic -Path $statePath -Content (@{ schema_version = 1; mode = "hard"; nonce = $state.nonce; attempts = $attempts; completed = $false; failed = $true } | ConvertTo-Json)
+                    $failedState = @{ schema_version = 1; mode = "hard"; nonce = $state.nonce; attempts = $attempts; completed = $false; failed = $true }
+                    $carry = Get-CompletionCarry $state
+                    if ($null -ne $carry) { foreach ($k in $carry.Keys) { $failedState[$k] = $carry[$k] } }
+                    Write-FileAtomic -Path $statePath -Content ($failedState | ConvertTo-Json)
                     Write-HandoffError $handoffRoot "handoff-check" "ハードhandoffが${MAX_ATTEMPTS}回失敗して打ち切り（session=$sessionId）"
                     Write-Output (@{ systemMessage = "claude-remote-handoff: 引き継ぎ資料の作成が${MAX_ATTEMPTS}回失敗し打ち切りました。このまま/clearすると意味的な引き継ぎなしになります。原因（書き込み権限等）を確認し、必要なら手動でhandoff作成を指示してください。" } | ConvertTo-Json)
                 }
                 exit 0
             }
             # 検証NGの理由を次の指示文へ含める（同じ書き方の再試行で枠を浪費させない。issue #5）
-            $failReasons = (@(Get-HandoffIncompleteReasons -HandoffPath $handoffMd -Nonce $state.nonce)) -join " / "
-            Write-HardInstruction -StatePath $statePath -HandoffMd $handoffMd -Attempt ($attempts + 1) -MaxAttempts $MAX_ATTEMPTS -FailReasons $failReasons
+            # 理由は指示の書き先（下書き）について出す。下書きが通っていて置き換えだけ失敗した場合はその旨を出す
+            if ($replaceFailed) {
+                $failReasons = "下書きは検証に通ったが current.md へ置き換えられない（current.md が他のプロセスに開かれている・権限が無い等を確認すること）"
+            } else {
+                $failReasons = (@(Get-HandoffIncompleteReasons -HandoffPath $draftMd -Nonce $state.nonce)) -join " / "
+            }
+            Write-HardInstruction -StatePath $statePath -HandoffMd $handoffMd -Attempt ($attempts + 1) -MaxAttempts $MAX_ATTEMPTS -FailReasons $failReasons -Carry (Get-CompletionCarry $state)
             exit 0
         }
         # ソフト未完了は追わない（提案のみ）。ただしハード閾値到達ならエスカレーション

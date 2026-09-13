@@ -117,7 +117,17 @@ function Get-HoProp {
 # ポインタの handoff_path / size は移行期間用の受理専用キー（無検証・不使用）
 $HO_POINTER_KNOWN_KEYS = @("schema_version", "session_id", "nonce", "sha256", "transcript_path",
     "updated_epoch", "updated_at", "consumed", "consumed_at", "handoff_path", "size")
-$HO_STATE_KNOWN_KEYS = @("schema_version", "mode", "nonce", "attempts", "completed", "failed")
+# completed_tokens / completed_epoch / completed_nonce / completed_sha256 は additive キー（v0.2.1）。
+# いずれも「このサイクルで直近に完成した資料」の情報で、completed=true なら nonce の資料、
+# completed=false（ソフトで作った資料の書き直しを指示中）なら completed_nonce の資料を指す。
+# checkは「ソフトで作った資料を、ハード閾値を越えたら書き直させる」判定に、
+# restoreは書き直しが終わる前に圧縮されたときの旧資料の検証（nonce + SHA-256）と、鮮度表示に使う
+$HO_STATE_KNOWN_KEYS = @("schema_version", "mode", "nonce", "attempts", "completed", "failed",
+    "completed_tokens", "completed_epoch", "completed_nonce", "completed_sha256")
+# completed_epoch の上限（10桁 = 2286年まで）。範囲外は書かない・読んだら不正扱い（sh版と同一契約）
+$HO_EPOCH_MAX = [long]9999999999
+# completed_tokens の上限（checkの設定値上限 MAX_TOKEN_VALUE と同じ）
+$HO_TOKENS_MAX = [long]1000000000
 $HO_CONFIG_KNOWN_KEYS = @("soft_threshold", "hard_threshold", "min_margin", "conservative_fire_pct", "autocompact_window")
 
 function Get-HoStrField {
@@ -161,6 +171,130 @@ function Test-HoStateClosedSchema {
         if (([double]$sv) -ne 1) { return $false }
     }
     return $true
+}
+
+# usage合算の対象4キー（check と restore で共有する。sh版 ho_last_usage と同一契約）
+$HO_USAGE_KEYS = @("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+
+function Get-UsageTotal {
+    param($Usage)
+    # 4キーがすべて非負整数で揃った「完全なusage」のみ合算を返す。それ以外は0（不採用）
+    if ($null -eq $Usage) { return 0 }
+    $total = [long]0
+    foreach ($k in $HO_USAGE_KEYS) {
+        if (-not (Test-HoProp $Usage $k)) { return 0 }
+        $v = $Usage.$k
+        # boolや小数・文字列は不採用（型不正の部分行で実測値を上書きしないため）
+        if ($v -is [bool]) { return 0 }
+        if (-not ($v -is [int] -or $v -is [long])) { return 0 }
+        if ($v -lt 0) { return 0 }
+        $total = $total + [long]$v
+    }
+    return $total
+}
+
+function Get-LastUsageFromTranscript {
+    param([string]$TranscriptPath, [int]$TailLines)
+    # メインチェーン（isSidechainでない）assistant行のうち、最後の完全なusageの合算を返す。
+    # restore から呼ぶと「圧縮直前（clearなら /clear 直前）の使用量」になる: SessionStart
+    # フックが走る時点では、圧縮後のassistant行はまだ書かれていない（実測で確認済み）
+    $tokens = [long]0
+    $lines = Get-Content -LiteralPath $TranscriptPath -Tail $TailLines -Encoding UTF8 -ErrorAction SilentlyContinue
+    foreach ($line in $lines) {
+        try {
+            # 行全体が配列のJSONは不正行として無視（jqのselect(type=="object")と同一契約。
+            # パイプラインの ConvertFrom-Json はpwshで1要素配列が縮退するため使わない — 罠8）
+            $e = ConvertFrom-JsonPreserve $line
+            if ($null -eq $e -or ($e -is [System.Array]) -or -not (Test-HoProp $e "type")) { continue }
+            if (-not ($e.type -is [string]) -or -not (Test-OrdinalEqual $e.type "assistant")) { continue }
+            # 除外はboolean trueのみ（jqの `.isSidechain != true` と同一契約。文字列"false"は
+            # truthyのため旧実装は誤除外していた — 罠8の型固定）
+            if ((Test-HoProp $e "isSidechain") -and ($e.isSidechain -is [bool]) -and $e.isSidechain) { continue }
+            if (-not (Test-HoProp $e "message")) { continue }
+            # messageが配列の行は不正として無視（jqは配列への .usage アクセスがエラーで行ごと落ちる）
+            if ($e.message -is [System.Array]) { continue }
+            $u = $null
+            if ($null -ne $e.message -and (Test-HoProp $e.message "usage")) { $u = $e.message.usage }
+            $t = Get-UsageTotal $u
+            if ($t -gt 0) { $tokens = $t }
+        } catch { }
+    }
+    return $tokens
+}
+
+function ConvertTo-HoStateLong {
+    # 状態ファイルの数値キーの検証: JSON number（文字列・bool不可）かつ整数値かつ範囲内なら [long]、
+    # それ以外は $null。1.0 / 1e3 のような整数値の表記も通す（jq の type=="number" and .==floor と
+    # 同一契約。sh版は floor|tostring で整数表記へ揃えてから使う）
+    param($Value, [long]$Min, [long]$Max)
+    if ($null -eq $Value) { return $null }
+    if (-not ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal])) { return $null }
+    $d = [double]$Value
+    if ([double]::IsNaN($d) -or [double]::IsInfinity($d)) { return $null }
+    if ($d -ne [math]::Floor($d)) { return $null }
+    if ($d -lt $Min -or $d -gt $Max) { return $null }
+    return [long]$d
+}
+
+function Get-HoCompletionInfo {
+    # 状態から「このサイクルで直近に完成した資料」の nonce と完成時の値を返す（sh版 ho_completion_info と同一契約）。
+    # completed=true なら nonce、そうでなければ completed_nonce（書き直しの指示中）。
+    # どちらも無ければ $null。値（tokens / epoch）は取れなければ $null。sha はキーが無ければ $null、形式外なら "INVALID"。
+    # 閉じたスキーマの検証は呼び出し側で済ませていること
+    param($State)
+    if ($null -eq $State) { return $null }
+    $n = $null
+    if ((Test-HoProp $State "completed") -and ($State.completed -is [bool]) -and $State.completed) {
+        if ((Test-HoProp $State "nonce") -and ($State.nonce -is [string]) -and $State.nonce -cmatch '\A[A-Za-z0-9-]{8,64}\z') { $n = $State.nonce }
+    } elseif ((Test-HoProp $State "completed_nonce") -and ($State.completed_nonce -is [string]) -and
+              $State.completed_nonce -cmatch '\A[A-Za-z0-9-]{8,64}\z') {
+        $n = $State.completed_nonce
+    }
+    if ($null -eq $n) { return $null }
+    $info = @{ nonce = $n; tokens = $null; epoch = $null; sha = $null }
+    if ((Test-HoProp $State "completed_tokens")) { $info.tokens = ConvertTo-HoStateLong $State.completed_tokens 1 $HO_TOKENS_MAX }
+    if ((Test-HoProp $State "completed_epoch")) { $info.epoch = ConvertTo-HoStateLong $State.completed_epoch 1 $HO_EPOCH_MAX }
+    if (Test-HoProp $State "completed_sha256") {
+        # キーがあるのに形式外なら照合を飛ばさず、どの資料とも一致しない値にして拒否させる（sh版 "INVALID" と同一）
+        $info.sha = "INVALID"
+        if (($State.completed_sha256 -is [string]) -and $State.completed_sha256 -cmatch '\A[0-9A-F]{64}\z') {
+            $info.sha = $State.completed_sha256
+        }
+    }
+    return $info
+}
+
+function Format-HoFreshnessLine {
+    # 復元する資料の鮮度行（v0.2.1。sh版 ho_freshness_line と同一契約・同一文言）。
+    # 材料（完成時刻と現在時刻 / 完成時と復元直前の使用量）のどちらも揃わなければ空文字を返す。
+    # 未知の値は $null で渡す。使用量は「復元直前 >= 完成時」かつ「復元直前 >= 1」のときだけ出す
+    param($DoneEpoch, $NowEpoch, $DoneTokens, $NowTokens, [string]$Source)
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $DoneEpoch -and $null -ne $NowEpoch -and $NowEpoch -ge $DoneEpoch) {
+        # 整数除算は DivRem で行う（doubleを経由すると大きな値で丸まり、shの $(( )) と分裂する）
+        $secRem = [long]0
+        $mins = [Math]::DivRem([long]($NowEpoch - $DoneEpoch), [long]60, [ref]$secRem)
+        if ($mins -lt 1) {
+            $elapsed = "1分未満"
+        } elseif ($mins -lt 60) {
+            $elapsed = "${mins}分"
+        } else {
+            $rem = [long]0
+            $hrs = [Math]::DivRem([long]$mins, [long]60, [ref]$rem)
+            $elapsed = "${hrs}時間${rem}分"
+        }
+        $parts.Add("完成から${elapsed}経過")
+    }
+    # 使用量は上限（HO_TOKENS_MAX）以下のときだけ。非現実な値で整数幅を越えさせない（sh版と同一）
+    if ($null -ne $DoneTokens -and $null -ne $NowTokens -and $NowTokens -ge 1 -and $NowTokens -ge $DoneTokens -and
+        $DoneTokens -le $HO_TOKENS_MAX -and $NowTokens -le $HO_TOKENS_MAX) {
+        $grown = $NowTokens - $DoneTokens
+        $parts.Add("完成時の使用量 ${DoneTokens} → 復元直前 ${NowTokens}（+${grown}）")
+    }
+    if ($parts.Count -eq 0) { return "" }
+    $crossCheck = "圧縮要約・git状態・直近のユーザーメッセージ"
+    if (Test-OrdinalEqual $Source "clear") { $crossCheck = "git状態・直近のユーザーメッセージ" }
+    return "※ 資料の鮮度: " + ($parts -join " / ") + "。完成後に行った作業はこの資料に含まれていないため、${crossCheck}と突き合わせて現状を確認すること。"
 }
 
 function Read-HookInput {

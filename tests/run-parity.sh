@@ -3,9 +3,9 @@
 # run-parity.ps1 と同一ケース・同一出力形式。run-local-check.ps1 / .sh が両者の出力を
 # 期待値と照合して2系統一致を検証する（ローカル実行）
 # 使い方: sh run-parity.sh [作業ディレクトリ] [part]
-#   part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C89）。
+#   part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C92）。
 #   パートは独立した作業ディレクトリで並列に実行し、出力を1〜3の順に連結すると
-#   all と同じ89行になる（run-local-check.sh がそれを行い期待値と照合する）
+#   all と同じ92行になる（run-local-check.sh がそれを行い期待値と照合する）
 set -u
 
 tests_dir=$(cd "$(dirname "$0")" && pwd)
@@ -1765,6 +1765,447 @@ in89b=$(jq -n --arg sid "$sid89" --arg tp "$t89" --arg cwd "$work/proj" \
       trigger: (["a", "b"] | join([13] | implode))}')
 tg89b=$(save_trigger89 "$in89b")
 printf 'C89 lf=%s cr=%s\n' "$tg89a" "$tg89b"
+
+# C90: 資料の書き直しと下書き（check 側。設計メモ docs/design/2026-09-13-refresh-and-freshness.md）。
+# 指示の書き先は下書き draft.md。完了検証に通った下書きだけを current.md へ置き換える。
+# ソフト閾値で作った資料は、ハード閾値を越えたら1度だけ書き直させる（mode soft の完了で、
+# completed_tokens がハード閾値未満か、キーの無い旧形式のとき）。
+#   a  : 完成250（soft）。使用量250のままなら何もしない / 450でハード指示＋書き直しの注記
+#   b  : 完成450（hard）。900になっても何もしない
+#   hh : 完成250（hard）。450でも何もしない（閾値をあとから上げた状況。hard の完了は書き直さない — I5）
+#   c  : 完成420（soft指示だが完成がハード閾値以上）。450でも何もしない
+#   ls : completed_tokens の無い soft 完了（v0.2.0以前が書いた状態）。450で書き直し
+#   lh : completed_tokens の無い hard 完了。450でも何もしない
+#   flt/exp: completed_tokens の表記が 250.0 / 2.5e2（整数値の number）。受理して書き直し（PS/sh同一）
+#   bad: completed_tokens が文字列。状態は不正として破棄（error.log 1件）→ 450なので通常のハード指示
+#   dr : 下書きが検証を通る → current.md が下書きの内容に置き換わり、下書きは消え、ポインタのSHAは current.md のもの
+#   fb : 下書きが無く current.md が今回のnonceで通る（v0.2.0の指示を受けた途中のサイクル等）→ 完了（HEADと同じ）
+#   mf : 下書きは通るが置き換えに失敗（current.md がディレクトリ）→ 完了にしない・soft なので指示も出さない・下書きはそのまま・error.log 1件
+#   pr : 下書きと current.md の両方が今回のnonceで通る → 下書きが勝つ
+#   ro : current.md が読み取り専用 → 置き換えて完了（PS も sh の mv -f と揃える）
+#   mfh: hard で置き換えに失敗し続ける（試行ごとの新nonceで下書きを書き直しても通らない）→ 再試行に数え（理由を指示文に出す）、3回で打ち切り・通知。error.log は Stop ごとに1件
+#   ch : 通し。soft完了 → 450で書き直し指示（旧資料の nonce・SHA・完成時の値を持ち越す）→ 書かずにStop
+#        （指示文の書き先が draft.md であることも見る）→ 再試行（持ち越し維持）→ 新nonceの下書きを書いてStop → 完了（完成時の値450・持ち越しキーは消える・
+#        current.md は新しい資料・ポインタは新nonce）→ 900でも何もしない
+#   fl : 書き直し中に3回失敗して打ち切り（failed）になっても、持ち越した旧資料の情報は残る
+seed_done90() { # $1=transcript $2=mode $3=completed_tokens（JSON表記。空なら書かない）
+    if [ -n "$3" ]; then
+        printf '{"schema_version":1,"mode":"%s","nonce":"nonce-t90-00000000","attempts":1,"completed":true,"failed":false,"completed_tokens":%s}' "$2" "$3" > "$1.handoff-state.json"
+    else
+        printf '{"schema_version":1,"mode":"%s","nonce":"nonce-t90-00000000","attempts":1,"completed":true,"failed":false}' "$2" > "$1.handoff-state.json"
+    fi
+}
+note90() { # $1=output
+    case "$1" in
+        *"ハード閾値に達する前に作った引き継ぎ資料"*) printf 'note' ;;
+        *) printf 'plain' ;;
+    esac
+}
+check90() { # $1=transcript $2=mode $3=completed_tokens $4=usage → out_kind/note
+    usage_transcript "$1" "$4"
+    seed_done90 "$1" "$2" "$3"
+    _o90=$(invoke_hook handoff-check.sh "$(stop_input "$sid90" "$1")")
+    printf '%s/%s' "$(out_kind "$_o90")" "$(note90 "$_o90")"
+}
+doc90() { # $1=path $2=nonce。良い資料を書く
+    mkdir -p "${1%/*}"
+    sed "s/{{NONCE}}/$2/" "$fixtures/md/good-handoff.md.tmpl" > "$1"
+}
+soft_state90() { # $1=transcript $2=nonce。ソフト指示を出した直後の状態
+    printf '{"schema_version":1,"mode":"soft","nonce":"%s","attempts":1,"completed":false,"failed":false}' "$2" > "$1.handoff-state.json"
+}
+carry90() { # $1=transcript → 「completed_nonce/completed_tokens/sha有無」（無ければ none / nosha）
+    jq -r '(if has("completed_nonce") then .completed_nonce else "none" end) + "/"
+           + (if has("completed_tokens") then (.completed_tokens | tostring) else "none" end) + "/"
+           + (if has("completed_sha256") then "sha" else "nosha" end)' "$1.handoff-state.json" 2>/dev/null
+}
+errcount90() { # $1=pattern
+    _n90=$(grep -c "$1" "$work/proj/.claude-handoff/error.log" 2>/dev/null)
+    [ -n "$_n90" ] || _n90=0
+    printf '%s' "$_n90"
+}
+sid90="90909090-1111-2222-3333-444444444444"
+t90a="$troot/t90a.jsonl"
+usage_transcript "$t90a" 250
+seed_done90 "$t90a" soft 250
+o90a1=$(invoke_hook handoff-check.sh "$(stop_input "$sid90" "$t90a")")
+usage_transcript "$t90a" 450
+o90a2=$(invoke_hook handoff-check.sh "$(stop_input "$sid90" "$t90a")")
+a90="$(out_kind "$o90a1")/$(out_kind "$o90a2")/$(note90 "$o90a2")/$(get_state "$t90a")"
+t90b="$troot/t90b.jsonl"
+usage_transcript "$t90b" 900
+seed_done90 "$t90b" hard 450
+o90b=$(invoke_hook handoff-check.sh "$(stop_input "$sid90" "$t90b")")
+b90="$(out_kind "$o90b")/$(get_state "$t90b")"
+hh90=$(check90 "$troot/t90hh.jsonl" hard 250 450)
+c90=$(check90 "$troot/t90c.jsonl" soft 420 450)
+ls90=$(check90 "$troot/t90l.jsonl" soft "" 450)
+lh90=$(check90 "$troot/t90h.jsonl" hard "" 450)
+flt90=$(check90 "$troot/t90flt.jsonl" soft 250.0 450)
+exp90=$(check90 "$troot/t90exp.jsonl" soft 2.5e2 450)
+n90a=$(errcount90 "不正なhandoff-stateを破棄")
+bad90=$(check90 "$troot/t90x.jsonl" soft '"250"' 450)
+bad90="$bad90/$(( $(errcount90 "不正なhandoff-stateを破棄") - n90a ))"
+# dr: 下書きの置き換え
+sid90d="90909090-2222-3333-4444-555555555555"
+t90d="$troot/t90d.jsonl"
+dir90d="$work/proj/.claude-handoff/$sid90d"
+usage_transcript "$t90d" 250
+soft_state90 "$t90d" "nonce-t90d-00000000"
+doc90 "$dir90d/current.md" "nonce-t90d-99999999"
+doc90 "$dir90d/draft.md" "nonce-t90d-00000000"
+invoke_hook handoff-check.sh "$(stop_input "$sid90d" "$t90d")" > /dev/null
+dr90="$(get_state "$t90d")"
+case "$(cat "$dir90d/current.md" 2>/dev/null)" in *"handoff-complete: nonce-t90d-00000000 -->"*) dr90="$dr90/moved" ;; *) dr90="$dr90/notmoved" ;; esac
+[ -e "$dir90d/draft.md" ] && dr90="$dr90/draftleft" || dr90="$dr90/draftgone"
+[ "$(jq -r '.sha256' "$work/proj/.claude-handoff/latest.json" 2>/dev/null)" = "$(ho_sha256 "$dir90d/current.md")" ] && dr90="$dr90/ptrsha" || dr90="$dr90/ptrstale"
+# fb: current.md への直接書き込み
+sid90b="90909090-3333-4444-5555-666666666666"
+t90fb="$troot/t90fb.jsonl"
+usage_transcript "$t90fb" 250
+soft_state90 "$t90fb" "nonce-t90fb-00000000"
+doc90 "$work/proj/.claude-handoff/$sid90b/current.md" "nonce-t90fb-00000000"
+invoke_hook handoff-check.sh "$(stop_input "$sid90b" "$t90fb")" > /dev/null
+fb90="$(get_state "$t90fb")"
+# mf: 置き換えの失敗
+sid90m="90909090-4444-5555-6666-777777777777"
+t90m="$troot/t90m.jsonl"
+dir90m="$work/proj/.claude-handoff/$sid90m"
+usage_transcript "$t90m" 250
+soft_state90 "$t90m" "nonce-t90m-00000000"
+mkdir -p "$dir90m/current.md"
+doc90 "$dir90m/draft.md" "nonce-t90m-00000000"
+n90m=$(errcount90 "置き換えられませんでした")
+o90m=$(invoke_hook handoff-check.sh "$(stop_input "$sid90m" "$t90m")")
+mf90="$(out_kind "$o90m")/$(get_state "$t90m")"
+[ -f "$dir90m/draft.md" ] && mf90="$mf90/draftleft" || mf90="$mf90/draftgone"
+mf90="$mf90/$(( $(errcount90 "置き換えられませんでした") - n90m ))"
+# pr: 下書きと current.md の両方が今回のnonceで通る → 下書きが勝つ（current.md を先に見る実装だと落ちる）
+sid90p="90909090-6666-7777-8888-999999999999"
+t90p="$troot/t90p.jsonl"
+dir90p="$work/proj/.claude-handoff/$sid90p"
+usage_transcript "$t90p" 250
+soft_state90 "$t90p" "nonce-t90p-00000000"
+doc90 "$dir90p/current.md" "nonce-t90p-00000000"
+sed "s/機能Yの実装が残っている/CURRENT-DIRECT/" "$dir90p/current.md" > "$t90p.tmp" && mv -f "$t90p.tmp" "$dir90p/current.md"
+doc90 "$dir90p/draft.md" "nonce-t90p-00000000"
+invoke_hook handoff-check.sh "$(stop_input "$sid90p" "$t90p")" > /dev/null
+pr90="$(get_state "$t90p")"
+case "$(cat "$dir90p/current.md" 2>/dev/null)" in *"CURRENT-DIRECT"*) pr90="$pr90/curwon" ;; *) pr90="$pr90/draftwon" ;; esac
+# ro: current.md が読み取り専用でも置き換える（sh の mv -f と PS の File.Replace で割れないこと）
+sid90o="90909090-7777-8888-9999-aaaaaaaaaaaa"
+t90o="$troot/t90o.jsonl"
+dir90o="$work/proj/.claude-handoff/$sid90o"
+usage_transcript "$t90o" 250
+soft_state90 "$t90o" "nonce-t90o-00000000"
+doc90 "$dir90o/current.md" "nonce-t90o-99999999"
+chmod a-w "$dir90o/current.md"
+doc90 "$dir90o/draft.md" "nonce-t90o-00000000"
+chmod a-w "$dir90o/draft.md"
+invoke_hook handoff-check.sh "$(stop_input "$sid90o" "$t90o")" > /dev/null
+ro90="$(get_state "$t90o")"
+case "$(cat "$dir90o/current.md" 2>/dev/null)" in *"handoff-complete: nonce-t90o-00000000 -->"*) ro90="$ro90/moved" ;; *) ro90="$ro90/notmoved" ;; esac
+chmod u+w "$dir90o/current.md" 2>/dev/null
+# mfh: hard で置き換えに失敗し続ける → 再試行に数え、理由を指示文に出し、3回で打ち切り（failed）
+sid90h="90909090-8888-9999-aaaa-bbbbbbbbbbbb"
+t90h="$troot/t90mh.jsonl"
+dir90h="$work/proj/.claude-handoff/$sid90h"
+usage_transcript "$t90h" 450
+seed_hard_state "$t90h" "nonce-t90h-00000000"
+mkdir -p "$dir90h/current.md"
+doc90 "$dir90h/draft.md" "nonce-t90h-00000000"
+n90h=$(errcount90 "置き換えられませんでした")
+o90h1=$(invoke_hook handoff-check.sh "$(stop_input "$sid90h" "$t90h")")
+rs90h="noreason"; case "$o90h1" in *"下書きは検証に通ったが current.md へ置き換えられない"*) rs90h="reason" ;; esac
+mfh90="$(out_kind "$o90h1")/$rs90h/$(get_state "$t90h")"
+doc90 "$dir90h/draft.md" "$(jq -r '.nonce' "$t90h.handoff-state.json" 2>/dev/null)"
+invoke_hook handoff-check.sh "$(stop_input "$sid90h" "$t90h")" > /dev/null
+doc90 "$dir90h/draft.md" "$(jq -r '.nonce' "$t90h.handoff-state.json" 2>/dev/null)"
+o90h3=$(invoke_hook handoff-check.sh "$(stop_input "$sid90h" "$t90h")")
+fl90h=$(jq -r 'if .failed == true then "failed" else "open" end' "$t90h.handoff-state.json" 2>/dev/null)
+nt90h="nonotice"; case "$o90h3" in *"回失敗し打ち切りました"*) nt90h="notice" ;; esac
+mfh90="$mfh90/$fl90h/$nt90h/$(( $(errcount90 "置き換えられませんでした") - n90h ))"
+invoke_hook handoff-check.sh "$(stop_input "$sid90h" "$t90h")" > /dev/null
+mfh90="$mfh90/$(( $(errcount90 "置き換えられませんでした") - n90h ))"
+# ch: 通し
+sid90r="90909090-5555-6666-7777-888888888888"
+t90r="$troot/t90r.jsonl"
+dir90r="$work/proj/.claude-handoff/$sid90r"
+usage_transcript "$t90r" 250
+soft_state90 "$t90r" "nonce-t90r-00000000"
+doc90 "$dir90r/draft.md" "nonce-t90r-00000000"
+invoke_hook handoff-check.sh "$(stop_input "$sid90r" "$t90r")" > /dev/null
+usage_transcript "$t90r" 450
+o90r1=$(invoke_hook handoff-check.sh "$(stop_input "$sid90r" "$t90r")")
+cr90r1="drop"; [ "$(carry90 "$t90r")" = "nonce-t90r-00000000/250/sha" ] && cr90r1="keep"
+o90r2=$(invoke_hook handoff-check.sh "$(stop_input "$sid90r" "$t90r")")
+cr90r2="drop"; [ "$(carry90 "$t90r")" = "nonce-t90r-00000000/250/sha" ] && cr90r2="keep"
+n90r=$(jq -r '.nonce' "$t90r.handoff-state.json")
+doc90 "$dir90r/draft.md" "$n90r"
+o90r3=$(invoke_hook handoff-check.sh "$(stop_input "$sid90r" "$t90r")")
+st90r=$(jq -r '(if .completed == true then "completed" else "open" end) + "/"
+               + (if has("completed_tokens") then (.completed_tokens | tostring) else "none" end) + "/"
+               + (if has("completed_nonce") then "cn" else "nocn" end)' "$t90r.handoff-state.json" 2>/dev/null)
+case "$(cat "$dir90r/current.md" 2>/dev/null)" in *"handoff-complete: $n90r -->"*) st90r="$st90r/newdoc" ;; *) st90r="$st90r/olddoc" ;; esac
+ptr90r="stale"; [ "$(jq -r '.nonce' "$work/proj/.claude-handoff/latest.json" 2>/dev/null)" = "$n90r" ] && ptr90r="ptr"
+usage_transcript "$t90r" 900
+o90r4=$(invoke_hook handoff-check.sh "$(stop_input "$sid90r" "$t90r")")
+dp90="nodraft"; case "$o90r1" in *"draft.md （完了検証に通ると自動で"*) dp90="draft" ;; esac
+ch90="$(out_kind "$o90r1")/$(note90 "$o90r1")/$dp90/$cr90r1/$(out_kind "$o90r2")/$cr90r2/$(out_kind "$o90r3")/$st90r/$ptr90r/$(out_kind "$o90r4")"
+# fl: 打ち切りでも持ち越しは残る（このセッションには下書きも資料も無いので完了検証は必ずNG）
+sid90f="90909090-9999-aaaa-bbbb-cccccccccccc"
+t90f="$troot/t90f.jsonl"
+usage_transcript "$t90f" 450
+printf '{"schema_version":1,"mode":"hard","nonce":"nonce-t90f-00000001","attempts":3,"completed":false,"failed":false,"completed_nonce":"nonce-t90f-00000000","completed_tokens":250,"completed_epoch":1700000000}' > "$t90f.handoff-state.json"
+invoke_hook handoff-check.sh "$(stop_input "$sid90f" "$t90f")" > /dev/null
+fl90=$(jq -r '(if .failed == true then "failed" else "open" end) + "/" + .completed_nonce + "/"
+              + (.completed_tokens | tostring) + "/" + (.completed_epoch | tostring)' "$t90f.handoff-state.json" 2>/dev/null)
+printf 'C90 a=%s b=%s hh=%s c=%s ls=%s lh=%s flt=%s exp=%s bad=%s dr=%s fb=%s mf=%s pr=%s ro=%s mfh=%s ch=%s fl=%s\n' "$a90" "$b90" "$hh90" "$c90" "$ls90" "$lh90" "$flt90" "$exp90" "$bad90" "$dr90" "$fb90" "$mf90" "$pr90" "$ro90" "$mfh90" "$ch90" "$fl90"
+
+# C91: 復元の期待挙動の表（設計メモ §7 の案Cの列）と鮮度表示。
+# 経路: R1=compact・ポインタが自セッション / R2=compact・ポインタが無効か別セッション（状態ファイルで検証）/
+#       C1=clear・ポインタ経由。clear はポインタを消費するので、C1 のあとの compact は R2 になる。
+# 各マスは「注入した資料（old=書き直し前 / new=書き直し後 / none=注入しない）+ 鮮度行の種類
+# （full=経過と使用量 / time=経過のみ / nofresh）」。none のときは拒否理由（sha / marker / info / other）。
+#   s1: 資料A完成・書き換えなし。R1 は鮮度行の全文と位置（見出し→鮮度行→本文・1回だけ）・状態ファイル削除も見る。
+#       C1 は clear の文言（圧縮要約を含まない）の全文。R2 は C1 のあと
+#   s2: 書き直し指示中・下書きは書きかけ（構造NG）。R1 / C1 / R2 とも old（S2とS3をまとめて見る）
+#   s4: 書き直しの下書きは検証を通る状態だが、まだStopしていない。C1 / R2 とも old
+#   s5: 書き直しが3回失敗して打ち切り（failed）。C1 / R2 とも old
+#   s6: 書き直しが検証済み。C1 / R2 とも new
+#   s7: 2サイクル目（圧縮で状態ファイルは削除済み）に新しい指示が出て下書きが書きかけ。R1 / C1 は old で、鮮度行は
+#       ポインタの時刻から経過のみ。R2 は none（非目標: 信頼できる nonce 源が無い）
+#   s8: 初回サイクル（前の資料が無い）でハード指示が出て下書きが書きかけ・current.md は無い・ポインタは別セッション。
+#       R1/R2 とも他セッションの資料に置き換えず、自セッションに解決して「見つからない」＋自セッションのバックアップ導線（HEAD と同じ）。
+#       PreCompact の保存ありとなしの2通り（なしでも無言にしない）
+#   pe: 書き直し指示中にモデルが current.md を直接書き換えた（マーカーは旧nonceのまま）→ C1 / R2 とも none（SHA不一致）
+#   ce: 完了状態のまま current.md を書き換えた → C1 / R2 とも none（SHA不一致。R2 は HEAD では注入していた — 意図的な変更）
+#   other : R1（ポインタは自セッション）で、状態のnonceが資料のnonceと違う → old。鮮度行の値は状態から取らず、
+#           ポインタの時刻から経過のみ（I4: 別の記録の値をこの資料の値として出さない）
+#   legacy: 新キーの無い完了状態（v0.2.0以前）で R2（ポインタは別セッション）→ old・鮮度行なし
+#   bs: 完了状態の completed_sha256 が形式外 → R2 で none:sha（キーがあるのに形式外なら照合を飛ばさない）
+# 時刻はテスト用シーム HANDOFF_TEST_NOW_EPOCH で固定する
+grow91() { # $1=transcript $2=tokens。usage行を追記する（checkは起動しない）
+    printf '{"type":"assistant","isSidechain":false,"message":{"usage":{"input_tokens":%s,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}\n' "$2" >> "$1"
+}
+dir91() { # $1=sid
+    printf '%s' "$work/proj/.claude-handoff/$1"
+}
+done91() { # $1=sid $2=transcript $3=nonce。ソフト指示の状態から、下書きを書いてStop（current.md へ置き換わって完了）
+    usage_transcript "$2" 250
+    soft_state90 "$2" "$3"
+    doc90 "$(dir91 "$1")/draft.md" "$3"
+    invoke_hook handoff-check.sh "$(stop_input "$1" "$2")" > /dev/null
+}
+refresh91() { # $1=sid $2=transcript。使用量450でStop（書き直し指示）。新しいnonceを出力する
+    grow91 "$2" 450
+    invoke_hook handoff-check.sh "$(stop_input "$1" "$2")" > /dev/null
+    jq -r '.nonce' "$2.handoff-state.json" 2>/dev/null
+}
+partial91() { # $1=sid $2=nonce。構造NGの下書き（書きかけ）
+    mkdir -p "$(dir91 "$1")"
+    sed "s/{{NONCE}}/$2/" "$fixtures/md/bad-handoff.md.tmpl" > "$(dir91 "$1")/draft.md"
+}
+restore91() { # $1=sid $2=transcript $3=source
+    invoke_hook handoff-restore.sh "$(jq -n --arg sid "$1" --arg tp "$2" --arg cwd "$work/proj" --arg src "$3" \
+        '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "SessionStart", source: $src}')"
+}
+clear91() { # 新しいセッションとして clear
+    restore91 "91919191-ffff-ffff-ffff-ffffffffffff" "$troot/new91.jsonl" clear
+}
+cell91() { # $1=output $2=旧資料のnonce $3=新資料のnonce
+    _c91=$(printf '%s' "$1" | tr -d '\r')
+    _d91="none"
+    case "$_c91" in *"handoff-complete: $2 -->"*) _d91="old" ;; esac
+    [ -n "$3" ] && case "$_c91" in *"handoff-complete: $3 -->"*) _d91="new" ;; esac
+    if [ "$_d91" = "none" ]; then
+        case "$_c91" in
+            *"SHA-256不一致"*) printf 'none:sha' ;;
+            *"完了検証NG"*) printf 'none:marker' ;;
+            *"検証情報なし"*) printf 'none:info' ;;
+            *) printf 'none:other' ;;
+        esac
+        return
+    fi
+    case "$_c91" in
+        *"※ 資料の鮮度: "*"完成時の使用量"*) printf '%s+full' "$_d91" ;;
+        *"※ 資料の鮮度: 完成から"*) printf '%s+time' "$_d91" ;;
+        *) printf '%s+nofresh' "$_d91" ;;
+    esac
+}
+layout91() { # $1=output $2=期待する鮮度行 → yes/no（見出し→鮮度行→本文の並びで、鮮度行はちょうど1回）
+    # Windows の jq -r は行末をCRLFで出すので、CRを除いてから並びを見る（PS版はLFで連結済み）
+    _o91=$(printf '%s' "$1" | tr -d '\r')
+    _nl91='
+'
+    _rest91=${_o91#*資料の鮮度}
+    case "$_rest91" in *"資料の鮮度"*) printf 'no'; return ;; esac
+    case "$_o91" in
+        *"検証済み）${_nl91}${_nl91}${2}${_nl91}${_nl91}# Handoff: parity test"*) printf 'yes' ;;
+        *) printf 'no' ;;
+    esac
+}
+HANDOFF_TEST_NOW_EPOCH=1700000000
+export HANDOFF_TEST_NOW_EPOCH
+# s1
+sid91a="91919191-1111-1111-1111-111111111111"; t91a="$troot/t91a.jsonl"
+done91 "$sid91a" "$t91a" "nonce-t91a-00000000"
+grow91 "$t91a" 380
+HANDOFF_TEST_NOW_EPOCH=1700005430
+o91=$(restore91 "$sid91a" "$t91a" compact)
+s1r1=$(layout91 "$o91" "※ 資料の鮮度: 完成から1時間30分経過 / 完成時の使用量 250 → 復元直前 380（+130）。完成後に行った作業はこの資料に含まれていないため、圧縮要約・git状態・直近のユーザーメッセージと突き合わせて現状を確認すること。")
+[ -f "$t91a.handoff-state.json" ] && s1r1="$s1r1/kept" || s1r1="$s1r1/deleted"
+HANDOFF_TEST_NOW_EPOCH=1700000000
+sid91b="91919191-2222-2222-2222-222222222222"; t91b="$troot/t91b.jsonl"
+done91 "$sid91b" "$t91b" "nonce-t91b-00000000"
+grow91 "$t91b" 300
+HANDOFF_TEST_NOW_EPOCH=1700000300
+o91=$(clear91)
+s1c1=$(layout91 "$o91" "※ 資料の鮮度: 完成から5分経過 / 完成時の使用量 250 → 復元直前 300（+50）。完成後に行った作業はこの資料に含まれていないため、git状態・直近のユーザーメッセージと突き合わせて現状を確認すること。")
+s1r2=$(cell91 "$(restore91 "$sid91b" "$t91b" compact)" "nonce-t91b-00000000" "")
+# s2（S2+S3）
+HANDOFF_TEST_NOW_EPOCH=1700000000
+sid91c="91919191-3333-3333-3333-333333333333"; t91c="$troot/t91c.jsonl"
+done91 "$sid91c" "$t91c" "nonce-t91c-00000000"
+n91c=$(refresh91 "$sid91c" "$t91c")
+partial91 "$sid91c" "$n91c"
+s2r1=$(cell91 "$(restore91 "$sid91c" "$t91c" compact)" "nonce-t91c-00000000" "$n91c")
+sid91d="91919191-4444-4444-4444-444444444444"; t91d="$troot/t91d.jsonl"
+done91 "$sid91d" "$t91d" "nonce-t91d-00000000"
+n91d=$(refresh91 "$sid91d" "$t91d")
+partial91 "$sid91d" "$n91d"
+s2c1=$(cell91 "$(clear91)" "nonce-t91d-00000000" "$n91d")
+s2r2=$(cell91 "$(restore91 "$sid91d" "$t91d" compact)" "nonce-t91d-00000000" "$n91d")
+# s4
+sid91e="91919191-5555-5555-5555-555555555555"; t91e="$troot/t91e.jsonl"
+done91 "$sid91e" "$t91e" "nonce-t91e-00000000"
+n91e=$(refresh91 "$sid91e" "$t91e")
+doc90 "$(dir91 "$sid91e")/draft.md" "$n91e"
+s4c1=$(cell91 "$(clear91)" "nonce-t91e-00000000" "$n91e")
+s4r2=$(cell91 "$(restore91 "$sid91e" "$t91e" compact)" "nonce-t91e-00000000" "$n91e")
+# s5
+sid91f="91919191-6666-6666-6666-666666666666"; t91f="$troot/t91f.jsonl"
+done91 "$sid91f" "$t91f" "nonce-t91f-00000000"
+refresh91 "$sid91f" "$t91f" > /dev/null
+invoke_hook handoff-check.sh "$(stop_input "$sid91f" "$t91f")" > /dev/null
+invoke_hook handoff-check.sh "$(stop_input "$sid91f" "$t91f")" > /dev/null
+invoke_hook handoff-check.sh "$(stop_input "$sid91f" "$t91f")" > /dev/null
+s5st=$(jq -r 'if .failed == true then "failed" else "open" end' "$t91f.handoff-state.json" 2>/dev/null)
+s5c1=$(cell91 "$(clear91)" "nonce-t91f-00000000" "")
+s5r2=$(cell91 "$(restore91 "$sid91f" "$t91f" compact)" "nonce-t91f-00000000" "")
+# s6
+sid91g="91919191-7777-7777-7777-777777777777"; t91g="$troot/t91g.jsonl"
+done91 "$sid91g" "$t91g" "nonce-t91g-00000000"
+n91g=$(refresh91 "$sid91g" "$t91g")
+doc90 "$(dir91 "$sid91g")/draft.md" "$n91g"
+invoke_hook handoff-check.sh "$(stop_input "$sid91g" "$t91g")" > /dev/null
+grow91 "$t91g" 500
+s6c1=$(cell91 "$(clear91)" "nonce-t91g-00000000" "$n91g")
+s6r2=$(cell91 "$(restore91 "$sid91g" "$t91g" compact)" "nonce-t91g-00000000" "$n91g")
+# s7: 1サイクル目を圧縮で終える → 新しいソフト指示 → 書きかけの下書き
+sid91h="91919191-8888-8888-8888-888888888888"; t91h="$troot/t91h.jsonl"
+done91 "$sid91h" "$t91h" "nonce-t91h-00000000"
+restore91 "$sid91h" "$t91h" compact > /dev/null
+usage_transcript "$t91h" 250
+invoke_hook handoff-check.sh "$(stop_input "$sid91h" "$t91h")" > /dev/null
+partial91 "$sid91h" "$(jq -r '.nonce' "$t91h.handoff-state.json" 2>/dev/null)"
+HANDOFF_TEST_NOW_EPOCH=1700000600
+s7r1=$(cell91 "$(restore91 "$sid91h" "$t91h" compact)" "nonce-t91h-00000000" "")
+HANDOFF_TEST_NOW_EPOCH=1700000000
+sid91i="91919191-9999-9999-9999-999999999999"; t91i="$troot/t91i.jsonl"
+done91 "$sid91i" "$t91i" "nonce-t91i-00000000"
+restore91 "$sid91i" "$t91i" compact > /dev/null
+usage_transcript "$t91i" 250
+invoke_hook handoff-check.sh "$(stop_input "$sid91i" "$t91i")" > /dev/null
+partial91 "$sid91i" "$(jq -r '.nonce' "$t91i.handoff-state.json" 2>/dev/null)"
+HANDOFF_TEST_NOW_EPOCH=1700000600
+s7c1=$(cell91 "$(clear91)" "nonce-t91i-00000000" "")
+s7r2=$(cell91 "$(restore91 "$sid91i" "$t91i" compact)" "nonce-t91i-00000000" "")
+# pe / ce
+HANDOFF_TEST_NOW_EPOCH=1700000000
+sid91j="91919191-aaaa-aaaa-aaaa-aaaaaaaaaaaa"; t91j="$troot/t91j.jsonl"
+done91 "$sid91j" "$t91j" "nonce-t91j-00000000"
+refresh91 "$sid91j" "$t91j" > /dev/null
+sed "s/機能Yの実装が残っている/PARTIAL-REWRITE/" "$(dir91 "$sid91j")/current.md" > "$t91j.tmp" && mv -f "$t91j.tmp" "$(dir91 "$sid91j")/current.md"
+pec1=$(cell91 "$(clear91)" "nonce-t91j-00000000" "")
+per2=$(cell91 "$(restore91 "$sid91j" "$t91j" compact)" "nonce-t91j-00000000" "")
+sid91k="91919191-bbbb-bbbb-bbbb-bbbbbbbbbbbb"; t91k="$troot/t91k.jsonl"
+done91 "$sid91k" "$t91k" "nonce-t91k-00000000"
+sed "s/機能Yの実装が残っている/EDITED-AFTER-DONE/" "$(dir91 "$sid91k")/current.md" > "$t91k.tmp" && mv -f "$t91k.tmp" "$(dir91 "$sid91k")/current.md"
+cec1=$(cell91 "$(clear91)" "nonce-t91k-00000000" "")
+cer2=$(cell91 "$(restore91 "$sid91k" "$t91k" compact)" "nonce-t91k-00000000" "")
+# other（R1）→ legacy（ポインタを別セッションにしてから R2）
+sid91o="91919191-dddd-dddd-dddd-dddddddddddd"; t91o="$troot/t91o.jsonl"
+done91 "$sid91o" "$t91o" "nonce-t91o-00000000"
+jq '.nonce = "nonce-t91o-99999999"' "$t91o.handoff-state.json" > "$t91o.tmp" && mv -f "$t91o.tmp" "$t91o.handoff-state.json"
+other91=$(cell91 "$(restore91 "$sid91o" "$t91o" compact)" "nonce-t91o-00000000" "")
+sid91l="91919191-cccc-cccc-cccc-cccccccccccc"; t91l="$troot/t91l.jsonl"
+done91 "$sid91l" "$t91l" "nonce-t91l-00000000"
+jq 'del(.completed_tokens, .completed_epoch, .completed_sha256)' "$t91l.handoff-state.json" > "$t91l.tmp" && mv -f "$t91l.tmp" "$t91l.handoff-state.json"
+done91 "91919191-eeee-eeee-eeee-eeeeeeeeeeee" "$troot/t91z.jsonl" "nonce-t91z-00000000"
+legacy91=$(cell91 "$(restore91 "$sid91l" "$t91l" compact)" "nonce-t91l-00000000" "")
+# s8: 初回サイクルの書きかけ（ポインタは直前の legacy で作った別セッションのもの）
+HANDOFF_TEST_NOW_EPOCH=1700000000
+s8cell91() { # $1=output $2=別セッション資料のnonce
+    _c91=$(printf '%s' "$1" | tr -d '\r')
+    case "$_c91" in
+        *"handoff-complete: $2 -->"*) printf 'other' ;;
+        *"current.md: 見つからない"*) printf 'missing' ;;
+        *) [ -z "$(printf '%s' "$_c91" | tr -d '[:space:]')" ] && printf 'silent' || printf 'else' ;;
+    esac
+    case "$_c91" in *"## 全文バックアップ導線"*"$3"*) printf '+backup' ;; esac
+}
+sid91s="91919191-5858-5858-5858-585858585858"; t91s="$troot/t91s.jsonl"
+usage_transcript "$t91s" 450
+invoke_hook handoff-check.sh "$(stop_input "$sid91s" "$t91s")" > /dev/null
+partial91 "$sid91s" "$(jq -r '.nonce' "$t91s.handoff-state.json" 2>/dev/null)"
+invoke_hook handoff-save.sh "$(jq -n --arg sid "$sid91s" --arg tp "$t91s" --arg cwd "$work/proj" \
+    '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "PreCompact", trigger: "auto"}')" > /dev/null
+s8b91=$(s8cell91 "$(restore91 "$sid91s" "$t91s" compact)" "nonce-t91z-00000000" "$sid91s")
+sid91t="91919191-5959-5959-5959-595959595959"; t91t="$troot/t91t.jsonl"
+usage_transcript "$t91t" 450
+invoke_hook handoff-check.sh "$(stop_input "$sid91t" "$t91t")" > /dev/null
+partial91 "$sid91t" "$(jq -r '.nonce' "$t91t.handoff-state.json" 2>/dev/null)"
+s8n91=$(s8cell91 "$(restore91 "$sid91t" "$t91t" compact)" "nonce-t91z-00000000" "$sid91t")
+# bs: 完了状態の completed_sha256 が形式外（手で壊した）→ R2 で照合を飛ばさず拒否（sh/PS 同一）
+sid91m="91919191-5a5a-5a5a-5a5a-5a5a5a5a5a5a"; t91m="$troot/t91m.jsonl"
+done91 "$sid91m" "$t91m" "nonce-t91m-00000000"
+jq '.completed_sha256 = "abc"' "$t91m.handoff-state.json" > "$t91m.tmp" && mv -f "$t91m.tmp" "$t91m.handoff-state.json"
+done91 "91919191-eeee-eeee-eeee-eeeeeeeeeeee" "$troot/t91z.jsonl" "nonce-t91z-00000000"
+bs91=$(cell91 "$(restore91 "$sid91m" "$t91m" compact)" "nonce-t91m-00000000" "")
+unset HANDOFF_TEST_NOW_EPOCH
+printf 'C91 s1=%s/%s/%s s2=%s/%s/%s s4=%s/%s s5=%s/%s/%s s6=%s/%s s7=%s/%s/%s s8=%s/%s pe=%s/%s ce=%s/%s legacy=%s other=%s bs=%s\n' \
+    "$s1r1" "$s1c1" "$s1r2" "$s2r1" "$s2c1" "$s2r2" "$s4c1" "$s4r2" "$s5st" "$s5c1" "$s5r2" "$s6c1" "$s6r2" \
+    "$s7r1" "$s7c1" "$s7r2" "$s8b91" "$s8n91" "$pec1" "$per2" "$cec1" "$cer2" "$legacy91" "$other91" "$bs91"
+
+# C92: 鮮度行の整形の境界（共通ヘルパーを直接呼ぶ。v0.2.1）。
+#   lt1/m59/h1: 59秒=1分未満 / 3599秒=59分 / 3600秒=1時間0分
+#   past  : 現在時刻が完成時刻より前（時計のずれ）なら経過を出さない → 材料が無く空
+#   shrink: 復元直前の使用量が完成時より小さければ伸びを出さない → 空
+#   zero  : 復元直前の使用量が0（測れなかった）なら伸びを出さない → 空
+#   huge  : 復元直前の使用量が上限（1,000,000,000）を超えたら伸びを出さない → 空
+#   big   : 18桁のepochでも整数のまま割る（doubleを経由すると丸まってshと割れる）
+#   compact/clear: 文言の全文一致（clearは「圧縮要約」を含まない）
+exact92() { # $1=actual $2=expected
+    if [ "$1" = "$2" ]; then printf 'yes'; else printf 'no'; fi
+}
+empty92() { # $1=actual
+    if [ -z "$1" ]; then printf 'empty'; else printf 'nonempty'; fi
+}
+has92() { # $1=actual $2=needle
+    case "$1" in *"$2"*) printf 'yes' ;; *) printf 'no' ;; esac
+}
+lt192=$(has92 "$(ho_freshness_line 1000 1059 "" "" compact)" "完成から1分未満経過")
+m5992=$(has92 "$(ho_freshness_line 1000 4599 "" "" compact)" "完成から59分経過")
+h192=$(has92 "$(ho_freshness_line 1000 4600 "" "" compact)" "完成から1時間0分経過")
+past92=$(empty92 "$(ho_freshness_line 1000 999 "" "" compact)")
+shrink92=$(empty92 "$(ho_freshness_line "" "" 500 400 compact)")
+zero92=$(empty92 "$(ho_freshness_line "" "" 1 0 compact)")
+huge92=$(empty92 "$(ho_freshness_line "" "" 1 1000000001 compact)")
+big92=$(has92 "$(ho_freshness_line 1 999999999999999961 "" "" compact)" "完成から277777777777777時間46分経過")
+compact92=$(exact92 "$(ho_freshness_line "" "" 250 380 compact)" "※ 資料の鮮度: 完成時の使用量 250 → 復元直前 380（+130）。完成後に行った作業はこの資料に含まれていないため、圧縮要約・git状態・直近のユーザーメッセージと突き合わせて現状を確認すること。")
+clear92=$(exact92 "$(ho_freshness_line 1000 1300 250 300 clear)" "※ 資料の鮮度: 完成から5分経過 / 完成時の使用量 250 → 復元直前 300（+50）。完成後に行った作業はこの資料に含まれていないため、git状態・直近のユーザーメッセージと突き合わせて現状を確認すること。")
+printf 'C92 lt1=%s m59=%s h1=%s past=%s shrink=%s zero=%s huge=%s big=%s compact=%s clear=%s\n' "$lt192" "$m5992" "$h192" "$past92" "$shrink92" "$zero92" "$huge92" "$big92" "$compact92" "$clear92"
 fi
 
 # KEEP_WORK=1 で作業ディレクトリを残す（失敗ケースの成果物調査用。issue #16）

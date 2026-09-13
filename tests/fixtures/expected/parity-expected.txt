@@ -87,3 +87,6 @@ C86 casevar=injected/no drivevar=injected/yes
 C87 outlink=injected/no inlink=injected/no leaflink=injected/no
 C88 sidlf=none/none srclf=injected/no stoplf=hard/hard/1
 C89 lf=[man<LF>ual<LF>] cr=[]
+C90 a=none/hard/note/hard/1 b=none/completed hh=none/plain c=none/plain ls=hard/note lh=none/plain flt=hard/note exp=hard/note bad=hard/plain/1 dr=completed/moved/draftgone/ptrsha fb=completed mf=none/soft/1/draftleft/1 pr=completed/draftwon ro=completed/moved mfh=hard-retry/reason/hard/2/failed/notice/3/3 ch=hard/note/draft/keep/hard-retry/keep/none/completed/450/nocn/newdoc/ptr/none fl=failed/nonce-t90f-00000000/250/1700000000
+C91 s1=yes/deleted/yes/old+full s2=old+full/old+full/old+full s4=old+full/old+full s5=failed/old+full/old+full s6=new+full/new+full s7=old+time/old+time/none:info s8=missing+backup/missing pe=none:sha/none:sha ce=none:sha/none:sha legacy=old+nofresh other=old+time bs=none:sha
+C92 lt1=yes m59=yes h1=yes past=empty shrink=empty zero=empty huge=empty big=yes compact=yes clear=yes

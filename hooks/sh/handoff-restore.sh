@@ -11,6 +11,7 @@ BUDGET_GIT=2000
 TOTAL_MAX=10000
 GIT_TIMEOUT_SEC=10
 POINTER_MAX_AGE_DAYS=7
+FRESH_TAIL_LINES=500    # 鮮度表示で使用量を測るときに読むtranscript末尾の行数（checkと同じ）
 
 main() {
     ho_require_jq handoff-restore || exit 0
@@ -104,7 +105,13 @@ main() {
     resolved_sid=""
     origin=""
     use_pointer="no"
-    if [ "$source_kind" != "clear" ] && [ -n "$own_sid" ] && [ -f "$handoff_root/$own_sid/current.md" ]; then
+    # 自セッションに下書き（draft.md）だけがある場合も自セッションに解決する（v0.2.1。初回サイクルで書いている途中・
+    # 検証NG・打ち切り。HEAD は書きかけの current.md があったので自セッションに解決していた。広げないと
+    # 自セッションのバックアップ導線が消え、別セッションの資料を代わりに注入してしまう — 設計メモ 2026-09-13 S8）
+    own_draft="no"
+    [ -n "$own_sid" ] && [ -f "$handoff_root/$own_sid/draft.md" ] && own_draft="yes"
+    if [ "$source_kind" != "clear" ] && [ -n "$own_sid" ] &&
+       { [ -f "$handoff_root/$own_sid/current.md" ] || [ "$own_draft" = "yes" ]; }; then
         resolved_sid="$own_sid"
         origin="セッションディレクトリ直接参照（${own_sid}）"
     elif [ "$pointer_ok" = "ok" ]; then
@@ -139,20 +146,19 @@ main() {
     gate_note=""
     if [ -n "$current_md" ]; then
         verify_nonce=""
+        own_ci=""
         if [ "$use_pointer" = "yes" ]; then
             verify_nonce=$(jq -r '.nonce' "$latest_path")
         elif [ "$pointer_ok" = "ok" ] && [ "$p_sid" = "$resolved_sid" ]; then
             verify_nonce=$(jq -r '.nonce' "$latest_path")
         elif [ "$source_kind" != "clear" ] && [ -n "$state_file" ] && [ -f "$state_file" ]; then
-            # compactで自セッション参照時: 削除前の状態ファイル（completed済み）のnonceで検証。
+            # compactで自セッション参照時: 削除前の状態ファイルのnonceで検証。完了状態なら nonce、
+            # ソフトで作った資料の書き直しを指示中なら持ち越した completed_nonce
+            # （v0.2.1。書き直しが終わる前に圧縮されても、完成済みの旧資料を検証できるように）。
             # 閉じたスキーマ（issue #38）: 未知キー入り・schema_version不正のstateは
             # nonce源として使わない（check側の破棄契約と同一の受否 — PS版と同一契約）
-            verify_nonce=$(jq -r --argjson known "$HO_STATE_KNOWN_KEYS" '
-                if type == "object" and .completed == true
-                   and ([keys_unsorted[] | select(. as $k | $known | index($k) | not)] | length == 0)
-                   and ((has("schema_version") | not) or (.schema_version == 1))
-                   and (.nonce | type == "string" and test("^[A-Za-z0-9-]{8,64}$"))
-                then .nonce else "" end' "$state_file" 2>/dev/null)
+            own_ci=$(ho_completion_info "$state_file")
+            verify_nonce=${own_ci%% *}
         fi
         if [ -n "$verify_nonce" ]; then
             if ho_test_complete "$current_md" "$verify_nonce"; then
@@ -183,6 +189,20 @@ main() {
                         fi
                     fi
                 fi
+                # 状態ファイルのnonceで検証した場合も、状態に記録した完成時のSHA-256があれば照合する
+                # （v0.2.1。PS版と同一契約）。SHAが無いのは v0.2.0 以前の状態か完成時のSHA計算失敗で、
+                # 完了状態・持ち越しとも従来どおり照合しない（設計メモ 2026-09-13 の I1）
+                if [ "$gate" = "yes" ] && [ -n "$own_ci" ]; then
+                    # shellcheck disable=SC2086
+                    set -- $own_ci
+                    if [ "$4" != "-" ]; then
+                        h=$(ho_sha256 "$current_md")
+                        if [ -z "$h" ] || [ "$h" != "$4" ]; then
+                            gate="no"
+                            gate_note="SHA-256不一致（完了検証後にcurrent.mdが改変されている）"
+                        fi
+                    fi
+                fi
             else
                 gate_note="完了検証NG（マーカー/構造が不正 — 未完成か改変の可能性）"
             fi
@@ -199,7 +219,9 @@ main() {
     fi
 
     # 注入対象が無ければ無言終了（状態ファイル削除のみ）
-    if [ -z "$current_md" ] && [ -z "$newest_backup" ]; then
+    # 自セッションの下書きに解決した場合は、HEAD（書きかけの current.md で警告を出していた）と同じく無言にしない
+    if [ -z "$current_md" ] && [ -z "$newest_backup" ] &&
+       ! { [ "$source_kind" != "clear" ] && [ "$resolved_sid" = "$own_sid" ] && [ "$own_draft" = "yes" ]; }; then
         [ -n "$state_file" ] && rm -f "$state_file" 2>/dev/null
         exit 0
     fi
@@ -212,6 +234,56 @@ main() {
         out="$out
 
 ※ この資料は別セッション（${p_sid}）で作成されたものです。同一プロジェクトで複数のセッションを併用している場合は、現在の作業に対応する内容か確認してから使うこと。"
+    fi
+
+    # --- 4.5 資料の鮮度（v0.2.1。ゲートを通過した資料についてのみ。PS版と同一契約） ---
+    # 完成時の値は「注入する資料のnonceを、直近に完成した資料のnonceとして持つ状態ファイル」からだけ取る
+    fresh_line=""
+    if [ -n "$current_md" ] && [ "$gate" = "yes" ]; then
+        f_transcript=""
+        f_state=""
+        if [ "$use_pointer" = "yes" ]; then
+            # ポインタ経由: 資料を作ったのはポインタのtranscriptの会話（検証は引用と同じ）
+            f_tp=$(ho_json_str_field "$latest_path" transcript_path)
+            if f_root=$(ho_projects_root) &&
+               [ -n "$f_tp" ] && [ -f "$f_tp" ] && ho_under_root "$f_root" "$f_tp"; then
+                f_transcript="$f_tp"
+                f_state=$(ho_valid_state_path "$f_tp" delete) || f_state=""
+            fi
+        elif [ "$source_kind" != "clear" ]; then
+            # compactで自セッション直接参照: 自分のtranscriptと、削除前の状態ファイル
+            [ -n "$tp" ] && [ -f "$tp" ] && f_transcript="$tp"
+            f_state="$state_file"
+        fi
+        f_done_tokens=""
+        f_done_epoch=""
+        if [ -n "$f_state" ] && [ -f "$f_state" ]; then
+            # 出力は「nonce 完成時使用量 完成時刻 SHA」。取れない項目は - （ハイフン）
+            f_ci=$(ho_completion_info "$f_state")
+            if [ -n "$f_ci" ] && [ "${f_ci%% *}" = "$verify_nonce" ]; then
+                # shellcheck disable=SC2086
+                set -- $f_ci
+                f_done_tokens=$2
+                f_done_epoch=$3
+                [ "$f_done_tokens" = "-" ] && f_done_tokens=""
+                [ "$f_done_epoch" = "-" ] && f_done_epoch=""
+            fi
+        fi
+        if [ -z "$f_done_epoch" ] && [ "$pointer_ok" = "ok" ]; then
+            # 状態ファイルに記録が無い（前サイクルの資料・旧形式）がポインタで検証した資料: ポインタの
+            # updated_epoch（完成時刻。上の鮮度ゲートで検証済み）から経過時間だけ出す（PS版と同一契約）
+            f_done_epoch=$(jq -r --arg n "$verify_nonce" 'if .nonce == $n then (.updated_epoch | floor | tostring) else "" end' "$latest_path" 2>/dev/null)
+            case "$f_done_epoch" in ''|*[!0-9]*) f_done_epoch="" ;; esac
+        fi
+        f_now_tokens=""
+        if [ -n "$f_transcript" ] && [ -n "$f_done_tokens" ]; then
+            f_now_tokens=$(ho_last_usage "$f_transcript" "$FRESH_TAIL_LINES")
+        fi
+        f_now_epoch=""
+        if [ -n "$f_done_epoch" ]; then
+            f_now_epoch=$(ho_now_epoch) || f_now_epoch=""
+        fi
+        fresh_line=$(ho_freshness_line "$f_done_epoch" "$f_now_epoch" "$f_done_tokens" "$f_now_tokens" "$source_kind")
     fi
 
     # --- 5. current.md（ゲート通過時のみ内容を注入） ---
@@ -234,7 +306,13 @@ main() {
             end' "$current_md" | jq -r .)
         out="$out
 
-## 引き継ぎ資料 current.md（$origin / 検証済み）
+## 引き継ぎ資料 current.md（$origin / 検証済み）"
+        if [ -n "$fresh_line" ]; then
+            out="$out
+
+$fresh_line"
+        fi
+        out="$out
 
 $md_body"
     elif [ -n "$current_md" ]; then

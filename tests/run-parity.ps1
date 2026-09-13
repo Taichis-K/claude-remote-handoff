@@ -3,9 +3,9 @@
 # 期待値と照合して2系統一致を検証する（ローカル実行）
 # 出力形式: "C<番号> <key>=<value> ..."（1ケース1行）
 # 使い方: -WorkDir <作業ディレクトリ> -Part <all|1|2|3>
-#   Part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C89）。
+#   Part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C92）。
 #   パートは独立した作業ディレクトリで並列に実行し、出力を1〜3の順に連結すると
-#   all と同じ89行になる（run-local-check.ps1 がそれを行い期待値と照合する）
+#   all と同じ92行になる（run-local-check.ps1 がそれを行い期待値と照合する）
 param([string]$WorkDir = "", [string]$Part = "all")
 
 $ErrorActionPreference = "Stop"
@@ -1792,6 +1792,482 @@ function Get-SavedTrigger89 {
 $tg89a = Get-SavedTrigger89 @{ session_id = $sid89; transcript_path = $t89; cwd = "$WorkDir/proj"; hook_event_name = "PreCompact"; trigger = ("man" + [char]10 + "ual" + [char]10) }
 $tg89b = Get-SavedTrigger89 @{ session_id = $sid89; transcript_path = $t89; cwd = "$WorkDir/proj"; hook_event_name = "PreCompact"; trigger = ("a" + [char]13 + "b") }
 Write-Output "C89 lf=$tg89a cr=$tg89b"
+
+# C90: 資料の書き直しと下書き（check 側。設計メモ docs/design/2026-09-13-refresh-and-freshness.md）。
+# 指示の書き先は下書き draft.md。完了検証に通った下書きだけを current.md へ置き換える。
+# ソフト閾値で作った資料は、ハード閾値を越えたら1度だけ書き直させる（mode soft の完了で、
+# completed_tokens がハード閾値未満か、キーの無い旧形式のとき）。
+#   a  : 完成250（soft）。使用量250のままなら何もしない / 450でハード指示＋書き直しの注記
+#   b  : 完成450（hard）。900になっても何もしない
+#   hh : 完成250（hard）。450でも何もしない（閾値をあとから上げた状況。hard の完了は書き直さない — I5）
+#   c  : 完成420（soft指示だが完成がハード閾値以上）。450でも何もしない
+#   ls : completed_tokens の無い soft 完了（v0.2.0以前が書いた状態）。450で書き直し
+#   lh : completed_tokens の無い hard 完了。450でも何もしない
+#   flt/exp: completed_tokens の表記が 250.0 / 2.5e2（整数値の number）。受理して書き直し（PS/sh同一）
+#   bad: completed_tokens が文字列。状態は不正として破棄（error.log 1件）→ 450なので通常のハード指示
+#   dr : 下書きが検証を通る → current.md が下書きの内容に置き換わり、下書きは消え、ポインタのSHAは current.md のもの
+#   fb : 下書きが無く current.md が今回のnonceで通る（v0.2.0の指示を受けた途中のサイクル等）→ 完了（HEADと同じ）
+#   mf : 下書きは通るが置き換えに失敗（current.md がディレクトリ）→ 完了にしない・soft なので指示も出さない・下書きはそのまま・error.log 1件
+#   pr : 下書きと current.md の両方が今回のnonceで通る → 下書きが勝つ
+#   ro : current.md が読み取り専用 → 置き換えて完了（PS も sh の mv -f と揃える）
+#   mfh: hard で置き換えに失敗し続ける（試行ごとの新nonceで下書きを書き直しても通らない）→ 再試行に数え（理由を指示文に出す）、3回で打ち切り・通知。error.log は Stop ごとに1件
+#   ch : 通し。soft完了 → 450で書き直し指示（旧資料の nonce・SHA・完成時の値を持ち越す）→ 書かずにStop
+#        （指示文の書き先が draft.md であることも見る）→ 再試行（持ち越し維持）→ 新nonceの下書きを書いてStop
+#        → 完了（完成時の値450・持ち越しキーは消える・current.md は新しい資料・ポインタは新nonce）→ 900でも何もしない
+#   fl : 書き直し中に3回失敗して打ち切り（failed）になっても、持ち越した旧資料の情報は残る
+function New-DoneState90([string]$Transcript, [string]$Mode, [string]$CompletedTokensJson) {
+    $json = '{"schema_version":1,"mode":"' + $Mode + '","nonce":"nonce-t90-00000000","attempts":1,"completed":true,"failed":false'
+    if ($CompletedTokensJson.Length -gt 0) { $json += ',"completed_tokens":' + $CompletedTokensJson }
+    $json += '}'
+    Set-Content -LiteralPath "$Transcript.handoff-state.json" -Value $json -Encoding UTF8
+}
+function Get-Note90([string]$Out) {
+    if ($Out.Contains("ハード閾値に達する前に作った引き継ぎ資料")) { return "note" }
+    return "plain"
+}
+function Invoke-Stop90([string]$Sid, [string]$Transcript) {
+    return Invoke-Hook "handoff-check.ps1" @{ session_id = $Sid; transcript_path = $Transcript; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false }
+}
+function Test-Check90([string]$Transcript, [string]$Mode, [string]$CompletedTokensJson, [int]$Usage) {
+    New-UsageTranscript $Transcript $Usage
+    New-DoneState90 $Transcript $Mode $CompletedTokensJson
+    $o = Invoke-Stop90 $sid90 $Transcript
+    return "$(Get-OutKind $o)/$(Get-Note90 $o)"
+}
+$tmpl90 = Get-Content -LiteralPath (Join-Path $fixtures "md/good-handoff.md.tmpl") -Raw -Encoding UTF8
+$badTmpl90 = Get-Content -LiteralPath (Join-Path $fixtures "md/bad-handoff.md.tmpl") -Raw -Encoding UTF8
+function Write-Doc90([string]$Path, [string]$Nonce) {
+    New-Item -ItemType Directory -Force ([System.IO.Path]::GetDirectoryName($Path)) | Out-Null
+    Set-Content -LiteralPath $Path -Value ($tmpl90 -replace '\{\{NONCE\}\}', $Nonce) -Encoding UTF8
+}
+function New-SoftState90([string]$Transcript, [string]$Nonce) {
+    Set-Content -LiteralPath "$Transcript.handoff-state.json" -Value ('{"schema_version":1,"mode":"soft","nonce":"' + $Nonce + '","attempts":1,"completed":false,"failed":false}') -Encoding UTF8
+}
+function Read-StateObj90([string]$Transcript) {
+    try { return (Get-Content -LiteralPath "$Transcript.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+}
+function Get-Carry90([string]$Transcript) {
+    $s = Read-StateObj90 $Transcript
+    if ($null -eq $s) { return "unreadable" }
+    $cn = "none"; $ct = "none"; $sh = "nosha"
+    if (Test-HoProp $s "completed_nonce") { $cn = [string]$s.completed_nonce }
+    if (Test-HoProp $s "completed_tokens") { $ct = [string]$s.completed_tokens }
+    if (Test-HoProp $s "completed_sha256") { $sh = "sha" }
+    return "$cn/$ct/$sh"
+}
+function Get-ErrCount90([string]$Pattern) {
+    $p = "$WorkDir/proj/.claude-handoff/error.log"
+    if (-not (Test-Path -LiteralPath $p)) { return 0 }
+    return ([regex]::Matches((Get-Content -LiteralPath $p -Raw -Encoding UTF8), [regex]::Escape($Pattern))).Count
+}
+function Get-PointerField90([string]$Name) {
+    try {
+        $p = Get-Content -LiteralPath "$WorkDir/proj/.claude-handoff/latest.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+        return [string]$p.$Name
+    } catch { return "" }
+}
+function Test-DocNonce90([string]$Path, [string]$Nonce) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8).Contains("handoff-complete: $Nonce -->")
+}
+$sid90 = "90909090-1111-2222-3333-444444444444"
+$t90a = "$tRoot/t90a.jsonl"
+New-UsageTranscript $t90a 250
+New-DoneState90 $t90a "soft" "250"
+$o90a1 = Invoke-Stop90 $sid90 $t90a
+New-UsageTranscript $t90a 450
+$o90a2 = Invoke-Stop90 $sid90 $t90a
+$a90 = "$(Get-OutKind $o90a1)/$(Get-OutKind $o90a2)/$(Get-Note90 $o90a2)/$(Get-State $t90a)"
+$t90b = "$tRoot/t90b.jsonl"
+New-UsageTranscript $t90b 900
+New-DoneState90 $t90b "hard" "450"
+$o90b = Invoke-Stop90 $sid90 $t90b
+$b90 = "$(Get-OutKind $o90b)/$(Get-State $t90b)"
+$hh90 = Test-Check90 "$tRoot/t90hh.jsonl" "hard" "250" 450
+$c90 = Test-Check90 "$tRoot/t90c.jsonl" "soft" "420" 450
+$ls90 = Test-Check90 "$tRoot/t90l.jsonl" "soft" "" 450
+$lh90 = Test-Check90 "$tRoot/t90h.jsonl" "hard" "" 450
+$flt90 = Test-Check90 "$tRoot/t90flt.jsonl" "soft" "250.0" 450
+$exp90 = Test-Check90 "$tRoot/t90exp.jsonl" "soft" "2.5e2" 450
+$n90a = Get-ErrCount90 "不正なhandoff-stateを破棄"
+$bad90 = Test-Check90 "$tRoot/t90x.jsonl" "soft" '"250"' 450
+$bad90 = "$bad90/$((Get-ErrCount90 "不正なhandoff-stateを破棄") - $n90a)"
+# dr: 下書きの置き換え
+$sid90d = "90909090-2222-3333-4444-555555555555"
+$t90d = "$tRoot/t90d.jsonl"
+$dir90d = "$WorkDir/proj/.claude-handoff/$sid90d"
+New-UsageTranscript $t90d 250
+New-SoftState90 $t90d "nonce-t90d-00000000"
+Write-Doc90 "$dir90d/current.md" "nonce-t90d-99999999"
+Write-Doc90 "$dir90d/draft.md" "nonce-t90d-00000000"
+Invoke-Stop90 $sid90d $t90d | Out-Null
+$dr90 = Get-State $t90d
+if (Test-DocNonce90 "$dir90d/current.md" "nonce-t90d-00000000") { $dr90 += "/moved" } else { $dr90 += "/notmoved" }
+if (Test-Path -LiteralPath "$dir90d/draft.md") { $dr90 += "/draftleft" } else { $dr90 += "/draftgone" }
+if ((Get-PointerField90 "sha256") -ceq (Get-FileSha256 -Path "$dir90d/current.md")) { $dr90 += "/ptrsha" } else { $dr90 += "/ptrstale" }
+# fb: current.md への直接書き込み
+$sid90fb = "90909090-3333-4444-5555-666666666666"
+$t90fb = "$tRoot/t90fb.jsonl"
+New-UsageTranscript $t90fb 250
+New-SoftState90 $t90fb "nonce-t90fb-00000000"
+Write-Doc90 "$WorkDir/proj/.claude-handoff/$sid90fb/current.md" "nonce-t90fb-00000000"
+Invoke-Stop90 $sid90fb $t90fb | Out-Null
+$fb90 = Get-State $t90fb
+# mf: 置き換えの失敗
+$sid90m = "90909090-4444-5555-6666-777777777777"
+$t90m = "$tRoot/t90m.jsonl"
+$dir90m = "$WorkDir/proj/.claude-handoff/$sid90m"
+New-UsageTranscript $t90m 250
+New-SoftState90 $t90m "nonce-t90m-00000000"
+New-Item -ItemType Directory -Force "$dir90m/current.md" | Out-Null
+Write-Doc90 "$dir90m/draft.md" "nonce-t90m-00000000"
+$n90m = Get-ErrCount90 "置き換えられませんでした"
+$o90m = Invoke-Stop90 $sid90m $t90m
+$mf90 = "$(Get-OutKind $o90m)/$(Get-State $t90m)"
+if (Test-Path -LiteralPath "$dir90m/draft.md" -PathType Leaf) { $mf90 += "/draftleft" } else { $mf90 += "/draftgone" }
+$mf90 += "/$((Get-ErrCount90 "置き換えられませんでした") - $n90m)"
+# pr: 下書きと current.md の両方が今回のnonceで通る → 下書きが勝つ（current.md を先に見る実装だと落ちる）
+$sid90p = "90909090-6666-7777-8888-999999999999"
+$t90p = "$tRoot/t90p.jsonl"
+$dir90p = "$WorkDir/proj/.claude-handoff/$sid90p"
+New-UsageTranscript $t90p 250
+New-SoftState90 $t90p "nonce-t90p-00000000"
+Write-Doc90 "$dir90p/current.md" "nonce-t90p-00000000"
+$cur90p = Get-Content -LiteralPath "$dir90p/current.md" -Raw -Encoding UTF8
+Set-Content -LiteralPath "$dir90p/current.md" -Value $cur90p.Replace("機能Yの実装が残っている", "CURRENT-DIRECT") -Encoding UTF8
+Write-Doc90 "$dir90p/draft.md" "nonce-t90p-00000000"
+Invoke-Stop90 $sid90p $t90p | Out-Null
+$pr90 = Get-State $t90p
+if ((Get-Content -LiteralPath "$dir90p/current.md" -Raw -Encoding UTF8).Contains("CURRENT-DIRECT")) { $pr90 += "/curwon" } else { $pr90 += "/draftwon" }
+# ro: current.md が読み取り専用でも置き換える（sh の mv -f と PS の File.Replace で割れないこと）
+$sid90o = "90909090-7777-8888-9999-aaaaaaaaaaaa"
+$t90o = "$tRoot/t90o.jsonl"
+$dir90o = "$WorkDir/proj/.claude-handoff/$sid90o"
+New-UsageTranscript $t90o 250
+New-SoftState90 $t90o "nonce-t90o-00000000"
+Write-Doc90 "$dir90o/current.md" "nonce-t90o-99999999"
+[System.IO.File]::SetAttributes("$dir90o/current.md", [System.IO.FileAttributes]::ReadOnly)
+Write-Doc90 "$dir90o/draft.md" "nonce-t90o-00000000"
+[System.IO.File]::SetAttributes("$dir90o/draft.md", [System.IO.FileAttributes]::ReadOnly)
+Invoke-Stop90 $sid90o $t90o | Out-Null
+$ro90 = Get-State $t90o
+if (Test-DocNonce90 "$dir90o/current.md" "nonce-t90o-00000000") { $ro90 += "/moved" } else { $ro90 += "/notmoved" }
+try { [System.IO.File]::SetAttributes("$dir90o/current.md", [System.IO.FileAttributes]::Normal) } catch { }
+# mfh: hard で置き換えに失敗し続ける（試行ごとの新nonceで下書きを書き直しても通らない）→ 再試行に数え、理由を指示文に出し、3回で打ち切り（failed）
+$sid90h = "90909090-8888-9999-aaaa-bbbbbbbbbbbb"
+$t90h = "$tRoot/t90mh.jsonl"
+$dir90h = "$WorkDir/proj/.claude-handoff/$sid90h"
+New-UsageTranscript $t90h 450
+New-HardState $t90h "nonce-t90h-00000000"
+New-Item -ItemType Directory -Force "$dir90h/current.md" | Out-Null
+Write-Doc90 "$dir90h/draft.md" "nonce-t90h-00000000"
+$n90h = Get-ErrCount90 "置き換えられませんでした"
+$o90h1 = Invoke-Stop90 $sid90h $t90h
+$rs90h = "noreason"
+if ($o90h1.Contains("下書きは検証に通ったが current.md へ置き換えられない")) { $rs90h = "reason" }
+$mfh90 = "$(Get-OutKind $o90h1)/$rs90h/$(Get-State $t90h)"
+Write-Doc90 "$dir90h/draft.md" ([string](Read-StateObj90 $t90h).nonce)
+Invoke-Stop90 $sid90h $t90h | Out-Null
+Write-Doc90 "$dir90h/draft.md" ([string](Read-StateObj90 $t90h).nonce)
+$o90h3 = Invoke-Stop90 $sid90h $t90h
+$fl90h = "open"
+if ((Read-StateObj90 $t90h).failed -eq $true) { $fl90h = "failed" }
+$nt90h = "nonotice"
+if ($o90h3.Contains("回失敗し打ち切りました")) { $nt90h = "notice" }
+$mfh90 += "/$fl90h/$nt90h/$((Get-ErrCount90 "置き換えられませんでした") - $n90h)"
+Invoke-Stop90 $sid90h $t90h | Out-Null
+$mfh90 += "/$((Get-ErrCount90 "置き換えられませんでした") - $n90h)"
+# ch: 通し
+$sid90r = "90909090-5555-6666-7777-888888888888"
+$t90r = "$tRoot/t90r.jsonl"
+$dir90r = "$WorkDir/proj/.claude-handoff/$sid90r"
+New-UsageTranscript $t90r 250
+New-SoftState90 $t90r "nonce-t90r-00000000"
+Write-Doc90 "$dir90r/draft.md" "nonce-t90r-00000000"
+Invoke-Stop90 $sid90r $t90r | Out-Null
+New-UsageTranscript $t90r 450
+$o90r1 = Invoke-Stop90 $sid90r $t90r
+$cr90r1 = "drop"; if ((Get-Carry90 $t90r) -ceq "nonce-t90r-00000000/250/sha") { $cr90r1 = "keep" }
+$o90r2 = Invoke-Stop90 $sid90r $t90r
+$cr90r2 = "drop"; if ((Get-Carry90 $t90r) -ceq "nonce-t90r-00000000/250/sha") { $cr90r2 = "keep" }
+$n90r = [string](Read-StateObj90 $t90r).nonce
+Write-Doc90 "$dir90r/draft.md" $n90r
+$o90r3 = Invoke-Stop90 $sid90r $t90r
+$st90r = "unreadable"
+$s90r = Read-StateObj90 $t90r
+if ($null -ne $s90r) {
+    $st90r = "open"; if ((Test-HoProp $s90r "completed") -and $s90r.completed -eq $true) { $st90r = "completed" }
+    if (Test-HoProp $s90r "completed_tokens") { $st90r += "/" + [string]$s90r.completed_tokens } else { $st90r += "/none" }
+    if (Test-HoProp $s90r "completed_nonce") { $st90r += "/cn" } else { $st90r += "/nocn" }
+}
+if (Test-DocNonce90 "$dir90r/current.md" $n90r) { $st90r += "/newdoc" } else { $st90r += "/olddoc" }
+$ptr90r = "stale"; if ((Get-PointerField90 "nonce") -ceq $n90r) { $ptr90r = "ptr" }
+New-UsageTranscript $t90r 900
+$o90r4 = Invoke-Stop90 $sid90r $t90r
+$dp90 = "nodraft"; if ($o90r1.Contains("draft.md （完了検証に通ると自動で")) { $dp90 = "draft" }
+$ch90 = "$(Get-OutKind $o90r1)/$(Get-Note90 $o90r1)/$dp90/$cr90r1/$(Get-OutKind $o90r2)/$cr90r2/$(Get-OutKind $o90r3)/$st90r/$ptr90r/$(Get-OutKind $o90r4)"
+# fl: 打ち切りでも持ち越しは残る（このセッションには下書きも資料も無いので完了検証は必ずNG）
+$sid90f = "90909090-9999-aaaa-bbbb-cccccccccccc"
+$t90f = "$tRoot/t90f.jsonl"
+New-UsageTranscript $t90f 450
+Set-Content -LiteralPath "$t90f.handoff-state.json" -Value '{"schema_version":1,"mode":"hard","nonce":"nonce-t90f-00000001","attempts":3,"completed":false,"failed":false,"completed_nonce":"nonce-t90f-00000000","completed_tokens":250,"completed_epoch":1700000000}' -Encoding UTF8
+Invoke-Stop90 $sid90f $t90f | Out-Null
+$fl90 = "unreadable"
+$s90f = Read-StateObj90 $t90f
+if ($null -ne $s90f) {
+    $fl90 = "open"; if ((Test-HoProp $s90f "failed") -and $s90f.failed -eq $true) { $fl90 = "failed" }
+    $fl90 += "/" + [string]$s90f.completed_nonce + "/" + [string]$s90f.completed_tokens + "/" + [string]$s90f.completed_epoch
+}
+Write-Output "C90 a=$a90 b=$b90 hh=$hh90 c=$c90 ls=$ls90 lh=$lh90 flt=$flt90 exp=$exp90 bad=$bad90 dr=$dr90 fb=$fb90 mf=$mf90 pr=$pr90 ro=$ro90 mfh=$mfh90 ch=$ch90 fl=$fl90"
+
+# C91: 復元の期待挙動の表（設計メモ §7 の案Cの列）と鮮度表示。
+# 経路: R1=compact・ポインタが自セッション / R2=compact・ポインタが無効か別セッション（状態ファイルで検証）/
+#       C1=clear・ポインタ経由。clear はポインタを消費するので、C1 のあとの compact は R2 になる。
+# 各マスは「注入した資料（old=書き直し前 / new=書き直し後 / none=注入しない）+ 鮮度行の種類
+# （full=経過と使用量 / time=経過のみ / nofresh）」。none のときは拒否理由（sha / marker / info / other）。
+#   s1: 資料A完成・書き換えなし。R1 は鮮度行の全文と位置（見出し→鮮度行→本文・1回だけ）・状態ファイル削除も見る。
+#       C1 は clear の文言（圧縮要約を含まない）の全文。R2 は C1 のあと
+#   s2: 書き直し指示中・下書きは書きかけ（構造NG）。R1 / C1 / R2 とも old（S2とS3をまとめて見る）
+#   s4: 書き直しの下書きは検証を通る状態だが、まだStopしていない。C1 / R2 とも old
+#   s5: 書き直しが3回失敗して打ち切り（failed）。C1 / R2 とも old
+#   s6: 書き直しが検証済み。C1 / R2 とも new
+#   s7: 2サイクル目（圧縮で状態ファイルは削除済み）に新しい指示が出て下書きが書きかけ。R1 / C1 は old で、鮮度行は
+#       ポインタの時刻から経過のみ。R2 は none（非目標: 信頼できる nonce 源が無い）
+#   s8: 初回サイクル（前の資料が無い）でハード指示が出て下書きが書きかけ・current.md は無い・ポインタは別セッション。
+#       R1/R2 とも他セッションの資料に置き換えず、自セッションに解決して「見つからない」＋自セッションのバックアップ導線（HEAD と同じ）。
+#       PreCompact の保存ありとなしの2通り（なしでも無言にしない）
+#   pe: 書き直し指示中にモデルが current.md を直接書き換えた（マーカーは旧nonceのまま）→ C1 / R2 とも none（SHA不一致）
+#   ce: 完了状態のまま current.md を書き換えた → C1 / R2 とも none（SHA不一致。R2 は HEAD では注入していた — 意図的な変更）
+#   other : R1（ポインタは自セッション）で、状態のnonceが資料のnonceと違う → old。鮮度行の値は状態から取らず、
+#           ポインタの時刻から経過のみ（I4: 別の記録の値をこの資料の値として出さない）
+#   legacy: 新キーの無い完了状態（v0.2.0以前）で R2（ポインタは別セッション）→ old・鮮度行なし
+#   bs: 完了状態の completed_sha256 が形式外 → R2 で none:sha（キーがあるのに形式外なら照合を飛ばさない）
+# 時刻はテスト用シーム HANDOFF_TEST_NOW_EPOCH で固定する
+function Add-Usage91([string]$Transcript, [int]$Tokens) {
+    Add-Content -LiteralPath $Transcript -Value ('{"type":"assistant","isSidechain":false,"message":{"usage":{"input_tokens":' + $Tokens + ',"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}') -Encoding UTF8
+}
+function Get-Dir91([string]$Sid) { return "$WorkDir/proj/.claude-handoff/$Sid" }
+function Complete-Soft91([string]$Sid, [string]$Transcript, [string]$Nonce) {
+    New-UsageTranscript $Transcript 250
+    New-SoftState90 $Transcript $Nonce
+    Write-Doc90 "$(Get-Dir91 $Sid)/draft.md" $Nonce
+    Invoke-Stop90 $Sid $Transcript | Out-Null
+}
+function Invoke-Refresh91([string]$Sid, [string]$Transcript) {
+    Add-Usage91 $Transcript 450
+    Invoke-Stop90 $Sid $Transcript | Out-Null
+    return [string](Read-StateObj90 $Transcript).nonce
+}
+function Write-Partial91([string]$Sid, [string]$Nonce) {
+    New-Item -ItemType Directory -Force (Get-Dir91 $Sid) | Out-Null
+    Set-Content -LiteralPath "$(Get-Dir91 $Sid)/draft.md" -Value ($badTmpl90 -replace '\{\{NONCE\}\}', $Nonce) -Encoding UTF8
+}
+function Invoke-Restore91([string]$Sid, [string]$Transcript, [string]$Source) {
+    return Invoke-Hook "handoff-restore.ps1" @{ session_id = $Sid; transcript_path = $Transcript; cwd = "$WorkDir/proj"; hook_event_name = "SessionStart"; source = $Source }
+}
+function Invoke-Clear91 {
+    return Invoke-Restore91 "91919191-ffff-ffff-ffff-ffffffffffff" "$tRoot/new91.jsonl" "clear"
+}
+function Get-Cell91([string]$Out, [string]$OldNonce, [string]$NewNonce) {
+    $c = $Out.Replace([string][char]13, "")
+    $d = "none"
+    if ($c.Contains("handoff-complete: $OldNonce -->")) { $d = "old" }
+    if ($NewNonce.Length -gt 0 -and $c.Contains("handoff-complete: $NewNonce -->")) { $d = "new" }
+    if ($d -eq "none") {
+        if ($c.Contains("SHA-256不一致")) { return "none:sha" }
+        if ($c.Contains("完了検証NG")) { return "none:marker" }
+        if ($c.Contains("検証情報なし")) { return "none:info" }
+        return "none:other"
+    }
+    $i = $c.IndexOf("※ 資料の鮮度: ", [System.StringComparison]::Ordinal)
+    if ($i -ge 0 -and $c.IndexOf("完成時の使用量", $i, [System.StringComparison]::Ordinal) -ge 0) { return "$d+full" }
+    if ($c.Contains("※ 資料の鮮度: 完成から")) { return "$d+time" }
+    return "$d+nofresh"
+}
+function Test-Layout91([string]$Out, [string]$Line) {
+    # 見出し→鮮度行→本文の並びで、鮮度行はちょうど1回（sh版はCRを除いてから同じ判定）
+    $o = $Out.Replace([string][char]13, "")
+    $first = $o.IndexOf("資料の鮮度", [System.StringComparison]::Ordinal)
+    if ($first -lt 0) { return "no" }
+    if ($o.IndexOf("資料の鮮度", $first + 1, [System.StringComparison]::Ordinal) -ge 0) { return "no" }
+    $nl = [string][char]10
+    if ($o.Contains("検証済み）" + $nl + $nl + $Line + $nl + $nl + "# Handoff: parity test")) { return "yes" }
+    return "no"
+}
+function Edit-Doc91([string]$Path, [string]$NewText) {
+    $t = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    Set-Content -LiteralPath $Path -Value $t.Replace("機能Yの実装が残っている", $NewText) -Encoding UTF8
+}
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000000"
+# s1
+$sid91a = "91919191-1111-1111-1111-111111111111"; $t91a = "$tRoot/t91a.jsonl"
+Complete-Soft91 $sid91a $t91a "nonce-t91a-00000000"
+Add-Usage91 $t91a 380
+$env:HANDOFF_TEST_NOW_EPOCH = "1700005430"
+$o91 = Invoke-Restore91 $sid91a $t91a "compact"
+$s1r1 = Test-Layout91 $o91 "※ 資料の鮮度: 完成から1時間30分経過 / 完成時の使用量 250 → 復元直前 380（+130）。完成後に行った作業はこの資料に含まれていないため、圧縮要約・git状態・直近のユーザーメッセージと突き合わせて現状を確認すること。"
+if (Test-Path -LiteralPath "$t91a.handoff-state.json") { $s1r1 += "/kept" } else { $s1r1 += "/deleted" }
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000000"
+$sid91b = "91919191-2222-2222-2222-222222222222"; $t91b = "$tRoot/t91b.jsonl"
+Complete-Soft91 $sid91b $t91b "nonce-t91b-00000000"
+Add-Usage91 $t91b 300
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000300"
+$o91 = Invoke-Clear91
+$s1c1 = Test-Layout91 $o91 "※ 資料の鮮度: 完成から5分経過 / 完成時の使用量 250 → 復元直前 300（+50）。完成後に行った作業はこの資料に含まれていないため、git状態・直近のユーザーメッセージと突き合わせて現状を確認すること。"
+$s1r2 = Get-Cell91 (Invoke-Restore91 $sid91b $t91b "compact") "nonce-t91b-00000000" ""
+# s2（S2+S3）
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000000"
+$sid91c = "91919191-3333-3333-3333-333333333333"; $t91c = "$tRoot/t91c.jsonl"
+Complete-Soft91 $sid91c $t91c "nonce-t91c-00000000"
+$n91c = Invoke-Refresh91 $sid91c $t91c
+Write-Partial91 $sid91c $n91c
+$s2r1 = Get-Cell91 (Invoke-Restore91 $sid91c $t91c "compact") "nonce-t91c-00000000" $n91c
+$sid91d = "91919191-4444-4444-4444-444444444444"; $t91d = "$tRoot/t91d.jsonl"
+Complete-Soft91 $sid91d $t91d "nonce-t91d-00000000"
+$n91d = Invoke-Refresh91 $sid91d $t91d
+Write-Partial91 $sid91d $n91d
+$s2c1 = Get-Cell91 (Invoke-Clear91) "nonce-t91d-00000000" $n91d
+$s2r2 = Get-Cell91 (Invoke-Restore91 $sid91d $t91d "compact") "nonce-t91d-00000000" $n91d
+# s4
+$sid91e = "91919191-5555-5555-5555-555555555555"; $t91e = "$tRoot/t91e.jsonl"
+Complete-Soft91 $sid91e $t91e "nonce-t91e-00000000"
+$n91e = Invoke-Refresh91 $sid91e $t91e
+Write-Doc90 "$(Get-Dir91 $sid91e)/draft.md" $n91e
+$s4c1 = Get-Cell91 (Invoke-Clear91) "nonce-t91e-00000000" $n91e
+$s4r2 = Get-Cell91 (Invoke-Restore91 $sid91e $t91e "compact") "nonce-t91e-00000000" $n91e
+# s5
+$sid91f = "91919191-6666-6666-6666-666666666666"; $t91f = "$tRoot/t91f.jsonl"
+Complete-Soft91 $sid91f $t91f "nonce-t91f-00000000"
+Invoke-Refresh91 $sid91f $t91f | Out-Null
+Invoke-Stop90 $sid91f $t91f | Out-Null
+Invoke-Stop90 $sid91f $t91f | Out-Null
+Invoke-Stop90 $sid91f $t91f | Out-Null
+$s5st = "open"
+$s91f = Read-StateObj90 $t91f
+if ($null -ne $s91f -and (Test-HoProp $s91f "failed") -and $s91f.failed -eq $true) { $s5st = "failed" }
+$s5c1 = Get-Cell91 (Invoke-Clear91) "nonce-t91f-00000000" ""
+$s5r2 = Get-Cell91 (Invoke-Restore91 $sid91f $t91f "compact") "nonce-t91f-00000000" ""
+# s6
+$sid91g = "91919191-7777-7777-7777-777777777777"; $t91g = "$tRoot/t91g.jsonl"
+Complete-Soft91 $sid91g $t91g "nonce-t91g-00000000"
+$n91g = Invoke-Refresh91 $sid91g $t91g
+Write-Doc90 "$(Get-Dir91 $sid91g)/draft.md" $n91g
+Invoke-Stop90 $sid91g $t91g | Out-Null
+Add-Usage91 $t91g 500
+$s6c1 = Get-Cell91 (Invoke-Clear91) "nonce-t91g-00000000" $n91g
+$s6r2 = Get-Cell91 (Invoke-Restore91 $sid91g $t91g "compact") "nonce-t91g-00000000" $n91g
+# s7: 1サイクル目を圧縮で終える → 新しいソフト指示 → 書きかけの下書き
+$sid91h = "91919191-8888-8888-8888-888888888888"; $t91h = "$tRoot/t91h.jsonl"
+Complete-Soft91 $sid91h $t91h "nonce-t91h-00000000"
+Invoke-Restore91 $sid91h $t91h "compact" | Out-Null
+New-UsageTranscript $t91h 250
+Invoke-Stop90 $sid91h $t91h | Out-Null
+Write-Partial91 $sid91h ([string](Read-StateObj90 $t91h).nonce)
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000600"
+$s7r1 = Get-Cell91 (Invoke-Restore91 $sid91h $t91h "compact") "nonce-t91h-00000000" ""
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000000"
+$sid91i = "91919191-9999-9999-9999-999999999999"; $t91i = "$tRoot/t91i.jsonl"
+Complete-Soft91 $sid91i $t91i "nonce-t91i-00000000"
+Invoke-Restore91 $sid91i $t91i "compact" | Out-Null
+New-UsageTranscript $t91i 250
+Invoke-Stop90 $sid91i $t91i | Out-Null
+Write-Partial91 $sid91i ([string](Read-StateObj90 $t91i).nonce)
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000600"
+$s7c1 = Get-Cell91 (Invoke-Clear91) "nonce-t91i-00000000" ""
+$s7r2 = Get-Cell91 (Invoke-Restore91 $sid91i $t91i "compact") "nonce-t91i-00000000" ""
+# pe / ce
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000000"
+$sid91j = "91919191-aaaa-aaaa-aaaa-aaaaaaaaaaaa"; $t91j = "$tRoot/t91j.jsonl"
+Complete-Soft91 $sid91j $t91j "nonce-t91j-00000000"
+Invoke-Refresh91 $sid91j $t91j | Out-Null
+Edit-Doc91 "$(Get-Dir91 $sid91j)/current.md" "PARTIAL-REWRITE"
+$pec1 = Get-Cell91 (Invoke-Clear91) "nonce-t91j-00000000" ""
+$per2 = Get-Cell91 (Invoke-Restore91 $sid91j $t91j "compact") "nonce-t91j-00000000" ""
+$sid91k = "91919191-bbbb-bbbb-bbbb-bbbbbbbbbbbb"; $t91k = "$tRoot/t91k.jsonl"
+Complete-Soft91 $sid91k $t91k "nonce-t91k-00000000"
+Edit-Doc91 "$(Get-Dir91 $sid91k)/current.md" "EDITED-AFTER-DONE"
+$cec1 = Get-Cell91 (Invoke-Clear91) "nonce-t91k-00000000" ""
+$cer2 = Get-Cell91 (Invoke-Restore91 $sid91k $t91k "compact") "nonce-t91k-00000000" ""
+# other（R1）→ legacy（ポインタを別セッションにしてから R2）
+function Edit-State91([string]$Transcript, [scriptblock]$Change) {
+    $p = "$Transcript.handoff-state.json"
+    $s = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json
+    & $Change $s
+    Set-Content -LiteralPath $p -Value ($s | ConvertTo-Json -Depth 5 -Compress) -Encoding UTF8
+}
+$sid91o = "91919191-dddd-dddd-dddd-dddddddddddd"; $t91o = "$tRoot/t91o.jsonl"
+Complete-Soft91 $sid91o $t91o "nonce-t91o-00000000"
+Edit-State91 $t91o { param($s) $s.nonce = "nonce-t91o-99999999" }
+$other91 = Get-Cell91 (Invoke-Restore91 $sid91o $t91o "compact") "nonce-t91o-00000000" ""
+$sid91l = "91919191-cccc-cccc-cccc-cccccccccccc"; $t91l = "$tRoot/t91l.jsonl"
+Complete-Soft91 $sid91l $t91l "nonce-t91l-00000000"
+Edit-State91 $t91l { param($s) [void]$s.PSObject.Properties.Remove("completed_tokens"); [void]$s.PSObject.Properties.Remove("completed_epoch"); [void]$s.PSObject.Properties.Remove("completed_sha256") }
+Complete-Soft91 "91919191-eeee-eeee-eeee-eeeeeeeeeeee" "$tRoot/t91z.jsonl" "nonce-t91z-00000000"
+$legacy91 = Get-Cell91 (Invoke-Restore91 $sid91l $t91l "compact") "nonce-t91l-00000000" ""
+# s8: 初回サイクルの書きかけ（ポインタは直前の legacy で作った別セッションのもの）
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000000"
+function Get-S8Cell91([string]$Out, [string]$OtherNonce, [string]$Sid) {
+    $c = $Out.Replace([string][char]13, "")
+    if ($c.Contains("handoff-complete: $OtherNonce -->")) { $r = "other" }
+    elseif ($c.Contains("current.md: 見つからない")) { $r = "missing" }
+    elseif ($c.Trim().Length -eq 0) { $r = "silent" }
+    else { $r = "else" }
+    $i = $c.IndexOf("## 全文バックアップ導線", [System.StringComparison]::Ordinal)
+    if ($i -ge 0 -and $c.IndexOf($Sid, $i, [System.StringComparison]::Ordinal) -ge 0) { $r += "+backup" }
+    return $r
+}
+$sid91s = "91919191-5858-5858-5858-585858585858"; $t91s = "$tRoot/t91s.jsonl"
+New-UsageTranscript $t91s 450
+Invoke-Stop90 $sid91s $t91s | Out-Null
+Write-Partial91 $sid91s ([string](Read-StateObj90 $t91s).nonce)
+$null = Invoke-Hook "handoff-save.ps1" @{ session_id = $sid91s; transcript_path = $t91s; cwd = "$WorkDir/proj"; hook_event_name = "PreCompact"; trigger = "auto" }
+$s8b91 = Get-S8Cell91 (Invoke-Restore91 $sid91s $t91s "compact") "nonce-t91z-00000000" $sid91s
+$sid91t = "91919191-5959-5959-5959-595959595959"; $t91t = "$tRoot/t91t.jsonl"
+New-UsageTranscript $t91t 450
+Invoke-Stop90 $sid91t $t91t | Out-Null
+Write-Partial91 $sid91t ([string](Read-StateObj90 $t91t).nonce)
+$s8n91 = Get-S8Cell91 (Invoke-Restore91 $sid91t $t91t "compact") "nonce-t91z-00000000" $sid91t
+# bs: 完了状態の completed_sha256 が形式外（手で壊した）→ R2 で照合を飛ばさず拒否（sh/PS 同一）
+$sid91m = "91919191-5a5a-5a5a-5a5a-5a5a5a5a5a5a"; $t91m = "$tRoot/t91m.jsonl"
+Complete-Soft91 $sid91m $t91m "nonce-t91m-00000000"
+Edit-State91 $t91m { param($s) $s.completed_sha256 = "abc" }
+Complete-Soft91 "91919191-eeee-eeee-eeee-eeeeeeeeeeee" "$tRoot/t91z.jsonl" "nonce-t91z-00000000"
+$bs91 = Get-Cell91 (Invoke-Restore91 $sid91m $t91m "compact") "nonce-t91m-00000000" ""
+Remove-Item "Env:HANDOFF_TEST_NOW_EPOCH"
+Write-Output ("C91 s1=$s1r1/$s1c1/$s1r2 s2=$s2r1/$s2c1/$s2r2 s4=$s4c1/$s4r2 s5=$s5st/$s5c1/$s5r2 s6=$s6c1/$s6r2 " +
+    "s7=$s7r1/$s7c1/$s7r2 s8=$s8b91/$s8n91 pe=$pec1/$per2 ce=$cec1/$cer2 legacy=$legacy91 other=$other91 bs=$bs91")
+
+# C92: 鮮度行の整形の境界（共通ヘルパーを直接呼ぶ。v0.2.1）。
+#   lt1/m59/h1: 59秒=1分未満 / 3599秒=59分 / 3600秒=1時間0分
+#   past  : 現在時刻が完成時刻より前（時計のずれ）なら経過を出さない → 材料が無く空
+#   shrink: 復元直前の使用量が完成時より小さければ伸びを出さない → 空
+#   zero  : 復元直前の使用量が0（測れなかった）なら伸びを出さない → 空
+#   huge  : 復元直前の使用量が上限（1,000,000,000）を超えたら伸びを出さない → 空
+#   big   : 18桁のepochでも整数のまま割る（doubleを経由すると丸まってshと割れる）
+#   compact/clear: 文言の全文一致（clearは「圧縮要約」を含まない）
+function Get-Has92([string]$Actual, [string]$Needle) {
+    if ($Actual.Contains($Needle)) { return "yes" }
+    return "no"
+}
+function Get-Empty92([string]$Actual) {
+    if ($Actual.Length -eq 0) { return "empty" }
+    return "nonempty"
+}
+function Get-Exact92([string]$Actual, [string]$Expected) {
+    if ([string]::Equals($Actual, $Expected, [System.StringComparison]::Ordinal)) { return "yes" }
+    return "no"
+}
+$lt192 = Get-Has92 (Format-HoFreshnessLine ([long]1000) ([long]1059) $null $null "compact") "完成から1分未満経過"
+$m5992 = Get-Has92 (Format-HoFreshnessLine ([long]1000) ([long]4599) $null $null "compact") "完成から59分経過"
+$h192 = Get-Has92 (Format-HoFreshnessLine ([long]1000) ([long]4600) $null $null "compact") "完成から1時間0分経過"
+$past92 = Get-Empty92 (Format-HoFreshnessLine ([long]1000) ([long]999) $null $null "compact")
+$shrink92 = Get-Empty92 (Format-HoFreshnessLine $null $null ([long]500) ([long]400) "compact")
+$zero92 = Get-Empty92 (Format-HoFreshnessLine $null $null ([long]1) ([long]0) "compact")
+$huge92 = Get-Empty92 (Format-HoFreshnessLine $null $null ([long]1) ([long]1000000001) "compact")
+$big92 = Get-Has92 (Format-HoFreshnessLine ([long]1) ([long]"999999999999999961") $null $null "compact") "完成から277777777777777時間46分経過"
+$compact92 = Get-Exact92 (Format-HoFreshnessLine $null $null ([long]250) ([long]380) "compact") "※ 資料の鮮度: 完成時の使用量 250 → 復元直前 380（+130）。完成後に行った作業はこの資料に含まれていないため、圧縮要約・git状態・直近のユーザーメッセージと突き合わせて現状を確認すること。"
+$clear92 = Get-Exact92 (Format-HoFreshnessLine ([long]1000) ([long]1300) ([long]250) ([long]300) "clear") "※ 資料の鮮度: 完成から5分経過 / 完成時の使用量 250 → 復元直前 300（+50）。完成後に行った作業はこの資料に含まれていないため、git状態・直近のユーザーメッセージと突き合わせて現状を確認すること。"
+Write-Output "C92 lt1=$lt192 m59=$m5992 h1=$h192 past=$past92 shrink=$shrink92 zero=$zero92 huge=$huge92 big=$big92 compact=$compact92 clear=$clear92"
 }
 
 # KEEP_WORK=1 で作業ディレクトリを残す（失敗ケースの成果物調査用。issue #16）

@@ -362,8 +362,101 @@ HO_STATE_SUFFIX=".handoff-state.json"
 # 移行期間用の受理専用キー（無検証・不使用）。照合はjqのキー完全一致
 # （大小違いキーは未知キー — issue #37の契約と整合）
 HO_POINTER_KNOWN_KEYS='["schema_version","session_id","nonce","sha256","transcript_path","updated_epoch","updated_at","consumed","consumed_at","handoff_path","size"]'
-HO_STATE_KNOWN_KEYS='["schema_version","mode","nonce","attempts","completed","failed"]'
+# completed_tokens / completed_epoch / completed_nonce / completed_sha256 は additive キー（v0.2.1。PS版と同一契約）。
+# いずれも「このサイクルで直近に完成した資料」の情報で、completed=true なら nonce の資料、
+# completed=false（ソフトで作った資料の書き直しを指示中）なら completed_nonce の資料を指す
+HO_STATE_KNOWN_KEYS='["schema_version","mode","nonce","attempts","completed","failed","completed_tokens","completed_epoch","completed_nonce","completed_sha256"]'
 HO_CONFIG_KNOWN_KEYS='["soft_threshold","hard_threshold","min_margin","conservative_fire_pct","autocompact_window"]'
+# completed_epoch の上限（10桁 = 2286年まで。PS版 $HO_EPOCH_MAX と同一）
+HO_EPOCH_MAX=9999999999
+# completed_tokens の上限（checkの設定値上限と同じ。PS版 $HO_TOKENS_MAX と同一）
+HO_TOKENS_MAX=1000000000
+
+# transcript末尾からメインチェーン最後の完全なusage合算を返す（不正行は無視）。
+# $1=transcript $2=末尾から読む行数。check と restore で共有する（PS版 Get-LastUsageFromTranscript と同一契約）。
+# restore から呼ぶと「圧縮直前（clearなら /clear 直前）の使用量」になる: SessionStart
+# フックが走る時点では、圧縮後のassistant行はまだ書かれていない（実測で確認済み）
+ho_last_usage() {
+    tail -n "$2" "$1" 2>/dev/null | jq -rRn '
+        [ inputs | fromjson? // empty
+          | select(type == "object" and .type == "assistant" and (.isSidechain != true))
+          | .message.usage? | select(type == "object")
+          | [ .input_tokens, .cache_read_input_tokens, .cache_creation_input_tokens, .output_tokens ]
+          | select(all(.[]; type == "number" and . == floor and . >= 0))
+          | add | select(. > 0)
+        ] | last // 0' 2>/dev/null || echo 0
+}
+
+# 状態ファイルから「このサイクルで直近に完成した資料」を読む（v0.2.1。PS版 Get-HoCompletionInfo と同一契約）。
+# $1=状態ファイル。出力は「nonce 完成時使用量 完成時刻 SHA-256」の1行（値が取れない項目は - 。SHA-256 はキーがあるのに形式外なら INVALID で、照合を必ず失敗させる）、
+# 該当が無い・閉じたスキーマに反する・読めないときは空。数値は「number・整数値・範囲内」を
+# floor|tostring で整数表記に揃える（1.0 や 1e3 をそのまま算術比較に渡さないため）
+ho_completion_info() {
+    jq -r --argjson known "$HO_STATE_KNOWN_KEYS" --argjson emax "$HO_EPOCH_MAX" --argjson tmax "$HO_TOKENS_MAX" '
+        def okint(min; max): type == "number" and . == floor and . >= min and . <= max;
+        def oknonce: type == "string" and test("\\A[A-Za-z0-9-]{8,64}\\z");
+        if type == "object"
+           and ([keys_unsorted[] | select(. as $k | $known | index($k) | not)] | length == 0)
+           and ((has("schema_version") | not) or (.schema_version == 1))
+        then
+            (if .completed == true then (if (.nonce | oknonce) then .nonce else null end)
+             elif (.completed_nonce | oknonce) then .completed_nonce
+             else null end) as $n
+            | if $n == null then ""
+              else $n
+                + " " + (if (.completed_tokens | okint(1; $tmax)) then (.completed_tokens | floor | tostring) else "-" end)
+                + " " + (if (.completed_epoch | okint(1; $emax)) then (.completed_epoch | floor | tostring) else "-" end)
+                + " " + (if (.completed_sha256 | type == "string" and test("\\A[0-9A-F]{64}\\z")) then .completed_sha256 elif has("completed_sha256") then "INVALID" else "-" end)
+              end
+        else "" end' "$1" 2>/dev/null
+}
+
+# 復元する資料の鮮度行（v0.2.1。PS版 Format-HoFreshnessLine と同一契約・同一文言）。
+# $1=完成時刻epoch $2=現在epoch $3=完成時の使用量 $4=復元直前の使用量 $5=source（未知の値は空）。
+# 材料がどちらも揃わなければ何も出さない。使用量は「復元直前 >= 完成時」かつ「復元直前 >= 1」のときだけ
+ho_freshness_line() {
+    _fparts=""
+    case "$1" in ''|*[!0-9]*) ;; *)
+        case "$2" in ''|*[!0-9]*) ;; *)
+            if [ "$2" -ge "$1" ] 2>/dev/null; then
+                _fmins=$(( ($2 - $1) / 60 ))
+                if [ "$_fmins" -lt 1 ]; then
+                    _felapsed="1分未満"
+                elif [ "$_fmins" -lt 60 ]; then
+                    _felapsed="${_fmins}分"
+                else
+                    _fhrs=$(( _fmins / 60 ))
+                    _frem=$(( _fmins % 60 ))
+                    _felapsed="${_fhrs}時間${_frem}分"
+                fi
+                _fparts="完成から${_felapsed}経過"
+            fi ;;
+        esac ;;
+    esac
+    case "$3" in ''|*[!0-9]*) ;; *)
+        case "$4" in ''|*[!0-9]*) ;; *)
+            # 上限（HO_TOKENS_MAX）以下のときだけ。桁数で先に落として整数幅を越えさせない（PS版と同一）
+            if [ "${#3}" -le 10 ] && [ "${#4}" -le 10 ] &&
+               [ "$3" -le "$HO_TOKENS_MAX" ] 2>/dev/null && [ "$4" -le "$HO_TOKENS_MAX" ] 2>/dev/null &&
+               [ "$4" -ge 1 ] 2>/dev/null && [ "$4" -ge "$3" ] 2>/dev/null; then
+                _fgrown=$(( $4 - $3 ))
+                _ftok="完成時の使用量 ${3} → 復元直前 ${4}（+${_fgrown}）"
+                if [ -n "$_fparts" ]; then
+                    _fparts="${_fparts} / ${_ftok}"
+                else
+                    _fparts="$_ftok"
+                fi
+            fi ;;
+        esac ;;
+    esac
+    [ -n "$_fparts" ] || return 0
+    if [ "$5" = "clear" ]; then
+        _fcheck="git状態・直近のユーザーメッセージ"
+    else
+        _fcheck="圧縮要約・git状態・直近のユーザーメッセージ"
+    fi
+    printf '※ 資料の鮮度: %s。完成後に行った作業はこの資料に含まれていないため、%sと突き合わせて現状を確認すること。' "$_fparts" "$_fcheck"
+}
 
 ho_projects_root() {
     # 解決不能・字句不正は失敗（fail-closed）。優先順はPS版と同一。
