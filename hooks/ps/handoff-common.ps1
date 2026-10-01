@@ -193,33 +193,138 @@ function Get-UsageTotal {
     return $total
 }
 
+function Invoke-HoTranscriptTail {
+    # transcript の末尾から1行ずつ、新しい順に $OnLine へ渡す（最大 $MaxLines 行。tail -n と同じ数え方:
+    # LF で区切り、ファイル末尾の改行の後ろは行に数えない）。$OnLine が $true を返したら打ち切る。
+    # Get-Content -Tail は末尾の行を1文字ずつ逆読みするため遅く、長い行が1本あるだけで数十秒〜数分かかった
+    # （設計メモ docs/design/2026-10-01-transcript-tail-reader.md）。ここでは FileStream で末尾から
+    # ブロック単位で読み、改行の探索はネイティブの [Array]::LastIndexOf に任せる。
+    # 行は UTF-8（BOMなし・不正バイトは置換文字）で復号し、行末の CR とファイル先頭の BOM は除く
+    # （Get-Content -Encoding UTF8 と同じ）。
+    # 戻り値: 読み終えた・打ち切った・上限に達したら $true、開けない・読み取り中に切り詰められた・
+    # 例外のときは $false（途中まで渡した行を呼び出し側が捨てられるように）。
+    # 計算量は「末尾から打ち切り位置までのバイト数」に比例し、メモリは最長の行1本分を要する
+    param([string]$Path, [int]$MaxLines, [scriptblock]$OnLine)
+    if ($MaxLines -le 0) { return $true }
+    $fs = $null
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+    } catch { return $false }
+    try {
+        $utf8 = New-Object System.Text.UTF8Encoding($false, $false)
+        $pieces = New-Object System.Collections.Generic.List[byte[]]
+        $pos = $fs.Length
+        $emitted = 0
+        $atEof = $true
+        # LF を1つでも見たか（見ていれば、ファイル先頭からその LF までが1行。空でも行に数える）
+        $sawLf = $false
+        while ($true) {
+            $chunk = $null
+            $end = 0
+            if ($pos -gt 0) {
+                $n = [int][Math]::Min([long]1048576, $pos)
+                $pos -= $n
+                [void]$fs.Seek($pos, [System.IO.SeekOrigin]::Begin)
+                $chunk = New-Object byte[] $n
+                $got = 0
+                while ($got -lt $n) {
+                    $r = $fs.Read($chunk, $got, $n - $got)
+                    if ($r -le 0) { return $false }
+                    $got += $r
+                }
+                $end = $n
+            }
+            while ($true) {
+                $i = -1
+                if ($null -ne $chunk -and $end -gt 0) { $i = [Array]::LastIndexOf($chunk, [byte]10, $end - 1, $end) }
+                if ($i -ge 0) {
+                    # chunk[i+1 .. end) が、組み立て中の行のいちばん左の断片
+                    $len = $end - $i - 1
+                    $piece = New-Object byte[] $len
+                    [System.Buffer]::BlockCopy($chunk, $i + 1, $piece, 0, $len)
+                    $pieces.Add($piece)
+                    $end = $i
+                    $sawLf = $true
+                } elseif ($null -eq $chunk) {
+                    # ファイル先頭に達した: 残りの断片がファイルの1行目（LF を見ていなければ空ファイル）
+                    if ($pieces.Count -eq 0 -and -not $sawLf) { return $true }
+                } else {
+                    if ($end -gt 0) {
+                        $piece = New-Object byte[] $end
+                        [System.Buffer]::BlockCopy($chunk, 0, $piece, 0, $end)
+                        $pieces.Add($piece)
+                    }
+                    break
+                }
+                $total = 0
+                foreach ($p in $pieces) { $total += $p.Length }
+                $bytes = New-Object byte[] $total
+                $off = 0
+                for ($k = $pieces.Count - 1; $k -ge 0; $k--) {
+                    [System.Buffer]::BlockCopy($pieces[$k], 0, $bytes, $off, $pieces[$k].Length)
+                    $off += $pieces[$k].Length
+                }
+                $pieces.Clear()
+                if ($atEof) {
+                    $atEof = $false
+                    # ファイル末尾の改行の後ろ（空）は行に数えない
+                    if ($total -eq 0 -and $i -ge 0) { continue }
+                }
+                $line = $utf8.GetString($bytes)
+                # 1文字の比較で見る（String.StartsWith/EndsWith(string) はカルチャ比較で、U+FEFF を無視して
+                # どの文字列にも一致してしまう）
+                if ($line.Length -gt 0 -and $line[$line.Length - 1] -eq [char]13) { $line = $line.Substring(0, $line.Length - 1) }
+                if ($null -eq $chunk -and $line.Length -gt 0 -and $line[0] -eq [char]0xFEFF) { $line = $line.Substring(1) }
+                $emitted++
+                # コールバックが余計な値を出力しても、boolean の $true が含まれていれば打ち切る
+                foreach ($o in @(& $OnLine $line)) {
+                    if (($o -is [bool]) -and $o) { return $true }
+                }
+                if ($emitted -ge $MaxLines) { return $true }
+                if ($null -eq $chunk) { return $true }
+            }
+        }
+    } catch {
+        return $false
+    } finally {
+        $fs.Dispose()
+    }
+}
+
 function Get-LastUsageFromTranscript {
     param([string]$TranscriptPath, [int]$TailLines)
     # メインチェーン（isSidechainでない）assistant行のうち、最後の完全なusageの合算を返す。
     # restore から呼ぶと「圧縮直前（clearなら /clear 直前）の使用量」になる: SessionStart
-    # フックが走る時点では、圧縮後のassistant行はまだ書かれていない（実測で確認済み）
-    $tokens = [long]0
-    $lines = Get-Content -LiteralPath $TranscriptPath -Tail $TailLines -Encoding UTF8 -ErrorAction SilentlyContinue
-    foreach ($line in $lines) {
+    # フックが走る時点では、圧縮後のassistant行はまだ書かれていない（実測で確認済み）。
+    # 末尾から新しい順に見て最初に見つかったものを返す（末尾N行のうち最後の一致と同じ値）。
+    # 引用符込みの "usage" を含まない行は解析しない: JSON 文字列の中の引用符は必ずエスケープされるので、
+    # 引用符込みで現れるのはキー（または値そのものが usage の文字列）のときだけ。sh版の grep -aF と同一契約。
+    # キー名の文字をバックスラッシュ+u+16進4桁でエスケープした usage は読まない（Claude Code はそう書かない — 契約外）
+    $usageAcc = @{ tokens = [long]0 }
+    $null = Invoke-HoTranscriptTail -Path $TranscriptPath -MaxLines $TailLines -OnLine {
+        param([string]$line)
+        if ($line.IndexOf('"usage"', [System.StringComparison]::Ordinal) -lt 0) { return $false }
         try {
             # 行全体が配列のJSONは不正行として無視（jqのselect(type=="object")と同一契約。
             # パイプラインの ConvertFrom-Json はpwshで1要素配列が縮退するため使わない — 罠8）
             $e = ConvertFrom-JsonPreserve $line
-            if ($null -eq $e -or ($e -is [System.Array]) -or -not (Test-HoProp $e "type")) { continue }
-            if (-not ($e.type -is [string]) -or -not (Test-OrdinalEqual $e.type "assistant")) { continue }
+            if ($null -eq $e -or ($e -is [System.Array]) -or -not (Test-HoProp $e "type")) { return $false }
+            if (-not ($e.type -is [string]) -or -not (Test-OrdinalEqual $e.type "assistant")) { return $false }
             # 除外はboolean trueのみ（jqの `.isSidechain != true` と同一契約。文字列"false"は
             # truthyのため旧実装は誤除外していた — 罠8の型固定）
-            if ((Test-HoProp $e "isSidechain") -and ($e.isSidechain -is [bool]) -and $e.isSidechain) { continue }
-            if (-not (Test-HoProp $e "message")) { continue }
+            if ((Test-HoProp $e "isSidechain") -and ($e.isSidechain -is [bool]) -and $e.isSidechain) { return $false }
+            if (-not (Test-HoProp $e "message")) { return $false }
             # messageが配列の行は不正として無視（jqは配列への .usage アクセスがエラーで行ごと落ちる）
-            if ($e.message -is [System.Array]) { continue }
+            if ($e.message -is [System.Array]) { return $false }
             $u = $null
             if ($null -ne $e.message -and (Test-HoProp $e.message "usage")) { $u = $e.message.usage }
             $t = Get-UsageTotal $u
-            if ($t -gt 0) { $tokens = $t }
+            if ($t -gt 0) { $usageAcc.tokens = $t; return $true }
         } catch { }
+        return $false
     }
-    return $tokens
+    return $usageAcc.tokens
 }
 
 function ConvertTo-HoStateLong {

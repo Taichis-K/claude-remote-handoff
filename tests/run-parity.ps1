@@ -3,9 +3,9 @@
 # 期待値と照合して2系統一致を検証する（ローカル実行）
 # 出力形式: "C<番号> <key>=<value> ..."（1ケース1行）
 # 使い方: -WorkDir <作業ディレクトリ> -Part <all|1|2|3>
-#   Part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C92）。
+#   Part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C94）。
 #   パートは独立した作業ディレクトリで並列に実行し、出力を1〜3の順に連結すると
-#   all と同じ92行になる（run-local-check.ps1 がそれを行い期待値と照合する）
+#   all と同じ94行になる（run-local-check.ps1 がそれを行い期待値と照合する）
 param([string]$WorkDir = "", [string]$Part = "all")
 
 $ErrorActionPreference = "Stop"
@@ -2268,6 +2268,100 @@ $big92 = Get-Has92 (Format-HoFreshnessLine ([long]1) ([long]"999999999999999961"
 $compact92 = Get-Exact92 (Format-HoFreshnessLine $null $null ([long]250) ([long]380) "compact") "※ 資料の鮮度: 完成時の使用量 250 → 復元直前 380（+130）。完成後に行った作業はこの資料に含まれていないため、圧縮要約・git状態・直近のユーザーメッセージと突き合わせて現状を確認すること。"
 $clear92 = Get-Exact92 (Format-HoFreshnessLine ([long]1000) ([long]1300) ([long]250) ([long]300) "clear") "※ 資料の鮮度: 完成から5分経過 / 完成時の使用量 250 → 復元直前 300（+50）。完成後に行った作業はこの資料に含まれていないため、git状態・直近のユーザーメッセージと突き合わせて現状を確認すること。"
 Write-Output "C92 lt1=$lt192 m59=$m5992 h1=$h192 past=$past92 shrink=$shrink92 zero=$zero92 huge=$huge92 big=$big92 compact=$compact92 clear=$clear92"
+
+# C93: transcript 末尾の読み取り（共通ヘルパーを直接呼ぶ。v0.2.2。設計メモ 2026-10-01-transcript-tail-reader.md）。
+# PS版は末尾からブロック単位で逆読みし、sh版は tail -n。どちらも引用符込みの "usage" を含む行だけ解析する。
+#   big  : 1MB のブロックをまたぐ 2.5MB の行が最後にある → その手前の usage（222）
+#   span : usage 行そのものが 2.5MB（ブロックをまたぐ）→ 444
+#   in500/out500: usage 行が末尾からちょうど500行目なら読む（556）、501行目なら読まない（0）
+#   crlf : 行末が CR+LF → 666
+#   nolf : 最後の行に改行が無い → 777
+#   esc  : 最後の行は "usage" をエスケープされた文字列として含むだけ → その手前（999）
+#   part : 最後の行が書きかけ（JSON として不完全）→ その手前（998）
+#   none : ファイルが無い → 0
+#   edge : 最後の行の直前の LF が、末尾から読む最初のブロック（1MB）のちょうど先頭にある → 4242
+#   uesc : キー名の u をバックスラッシュ+u+16進4桁でエスケープした usage の行は読まない（契約外。旧実装は 12 を返した — 設計メモ §4）→ その手前（13）
+function Get-U93([long]$Tokens) {
+    return '{"type":"assistant","isSidechain":false,"message":{"usage":{"input_tokens":' + $Tokens + ',"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}'
+}
+function Write-T93([string]$Name, [string]$Text) {
+    [System.IO.File]::WriteAllText((Join-Path $d93 $Name), $Text, (New-Object System.Text.UTF8Encoding($false)))
+}
+$d93 = Join-Path $WorkDir "t93"
+New-Item -ItemType Directory -Force $d93 | Out-Null
+$lf93 = [string][char]10
+$x93 = New-Object string ([char]'x'), 2621440
+Write-T93 "big.jsonl" ((Get-U93 111) + $lf93 + '{"type":"user","message":{"content":"' + $x93 + '"}}' + $lf93 + (Get-U93 222) + $lf93 +
+    '{"type":"user","message":{"content":"' + $x93 + '"}}' + $lf93)
+Write-T93 "span.jsonl" ((Get-U93 333) + $lf93 + '{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"text","text":"' + $x93 +
+    '"}],"usage":{"input_tokens":444,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}' + $lf93)
+$f93 = '{"type":"user","message":{"content":"f"}}' + $lf93
+Write-T93 "in500.jsonl" ((Get-U93 556) + $lf93 + ($f93 * 499))
+Write-T93 "out500.jsonl" ((Get-U93 555) + $lf93 + ($f93 * 500))
+$crlf93 = [string][char]13 + $lf93
+Write-T93 "crlf.jsonl" ((Get-U93 665) + $crlf93 + (Get-U93 666) + $crlf93)
+Write-T93 "nolf.jsonl" ((Get-U93 776) + $lf93 + (Get-U93 777))
+Write-T93 "esc.jsonl" ((Get-U93 999) + $lf93 + '{"type":"user","message":{"content":"see \"usage\":{\"input_tokens\":5}"}}' + $lf93)
+Write-T93 "part.jsonl" ((Get-U93 998) + $lf93 + '{"type":"assistant","isSidechain":false,"message":{"usage":{"input_tokens":12')
+$big93 = Get-LastUsageFromTranscript -TranscriptPath (Join-Path $d93 "big.jsonl") -TailLines 500
+$span93 = Get-LastUsageFromTranscript -TranscriptPath (Join-Path $d93 "span.jsonl") -TailLines 500
+$in50093 = Get-LastUsageFromTranscript -TranscriptPath (Join-Path $d93 "in500.jsonl") -TailLines 500
+$out50093 = Get-LastUsageFromTranscript -TranscriptPath (Join-Path $d93 "out500.jsonl") -TailLines 500
+$crlf93 = Get-LastUsageFromTranscript -TranscriptPath (Join-Path $d93 "crlf.jsonl") -TailLines 500
+$nolf93 = Get-LastUsageFromTranscript -TranscriptPath (Join-Path $d93 "nolf.jsonl") -TailLines 500
+$esc93 = Get-LastUsageFromTranscript -TranscriptPath (Join-Path $d93 "esc.jsonl") -TailLines 500
+$part93 = Get-LastUsageFromTranscript -TranscriptPath (Join-Path $d93 "part.jsonl") -TailLines 500
+$none93 = Get-LastUsageFromTranscript -TranscriptPath (Join-Path $d93 "missing.jsonl") -TailLines 500
+$p93 = '{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"text","text":"'
+$s93 = '"}],"usage":{"input_tokens":4242,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}'
+Write-T93 "edge.jsonl" ((Get-U93 4141) + $lf93 + $p93 + (New-Object string ([char]'x'), (1048574 - $p93.Length - $s93.Length)) + $s93 + $lf93)
+# キー名の先頭の u をエスケープした行（バックスラッシュはこのファイルに直接書かず [char]92 で作る）
+Write-T93 "uesc.jsonl" ((Get-U93 13) + $lf93 + '{"type":"assistant","isSidechain":false,"message":{"' + [char]92 + 'u0075sage":{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}' + $lf93)
+$edge93 = Get-LastUsageFromTranscript -TranscriptPath (Join-Path $d93 "edge.jsonl") -TailLines 500
+$uesc93 = Get-LastUsageFromTranscript -TranscriptPath (Join-Path $d93 "uesc.jsonl") -TailLines 500
+Write-Output "C93 big=$big93 span=$span93 in500=$in50093 out500=$out50093 crlf=$crlf93 nolf=$nolf93 esc=$esc93 part=$part93 none=$none93 edge=$edge93 uesc=$uesc93"
+
+# C94: 復元時の「直近のユーザーメッセージ」（末尾から新しい順に読み、上限で打ち切る。v0.2.2）。
+# 自セッションの資料を完成させたあと transcript に行を足し、compact で復元した出力を見る。
+#   five : 7件あれば新しい5件（M3〜M7）を古い順に「1.〜5.」で出す → yes
+#   budget: 1件300文字（切り詰めて「...」付き303文字）を4件 → 合計1,200文字を越える手前の3件 → 3
+#   in2000/out2000: 発言が末尾からちょうど2,000行目なら出る（yes）、2,001行目なら出ない（no）
+#   clean: 出力に True / False だけの行が混ざらない（PS版の読み取り関数の戻り値が漏れていない）→ yes
+function Get-Msg94([string]$Text) {
+    return '{"type":"user","isSidechain":false,"message":{"content":"' + $Text + '"}}' + $lf93
+}
+function Add-T94([string]$Path, [string]$Text) {
+    [System.IO.File]::AppendAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
+}
+$fill94 = '{"type":"system","subtype":"parity-fill"}' + $lf93
+$sid94a = "94949494-1111-1111-1111-111111111111"; $t94a = "$tRoot/t94a.jsonl"
+Complete-Soft91 $sid94a $t94a "nonce-t94a-00000000"
+Add-T94 $t94a ((1..7 | ForEach-Object { Get-Msg94 "C94-M$_" }) -join "")
+$o94 = (Invoke-Restore91 $sid94a $t94a "compact").Replace([string][char]13, "")
+$clean94 = "yes"; foreach ($l94 in $o94.Split([char]10)) { if ($l94 -ceq "True" -or $l94 -ceq "False") { $clean94 = "no" } }
+$five94 = "no"
+$i94a = $o94.IndexOf("1. C94-M3", [System.StringComparison]::Ordinal)
+if ($i94a -ge 0 -and $o94.IndexOf("5. C94-M7", $i94a, [System.StringComparison]::Ordinal) -ge 0 -and -not $o94.Contains("C94-M2")) { $five94 = "yes" }
+$sid94b = "94949494-2222-2222-2222-222222222222"; $t94b = "$tRoot/t94b.jsonl"
+Complete-Soft91 $sid94b $t94b "nonce-t94b-00000000"
+$x94 = New-Object string ([char]'x'), 300
+Add-T94 $t94b ((1..4 | ForEach-Object { Get-Msg94 ("C94-B$_" + $x94) }) -join "")
+$o94 = (Invoke-Restore91 $sid94b $t94b "compact").Replace([string][char]13, "")
+$budget94 = 0
+foreach ($k in 1..4) { if ($o94.Contains("C94-B$k")) { $budget94++ } }
+$budget94 = [string]$budget94
+if ($o94.Contains("C94-B1")) { $budget94 += "/withB1" }
+$sid94c = "94949494-3333-3333-3333-333333333333"; $t94c = "$tRoot/t94c.jsonl"
+Complete-Soft91 $sid94c $t94c "nonce-t94c-00000000"
+Add-T94 $t94c ((Get-Msg94 "C94-IN") + ($fill94 * 1999))
+$in200094 = "no"
+if ((Invoke-Restore91 $sid94c $t94c "compact").Contains("C94-IN")) { $in200094 = "yes" }
+$sid94d = "94949494-4444-4444-4444-444444444444"; $t94d = "$tRoot/t94d.jsonl"
+Complete-Soft91 $sid94d $t94d "nonce-t94d-00000000"
+Add-T94 $t94d ((Get-Msg94 "C94-OUT") + ($fill94 * 2000))
+$out200094 = "no"
+if ((Invoke-Restore91 $sid94d $t94d "compact").Contains("C94-OUT")) { $out200094 = "yes" }
+Write-Output "C94 five=$five94 budget=$budget94 in2000=$in200094 out2000=$out200094 clean=$clean94"
 }
 
 # KEEP_WORK=1 で作業ディレクトリを残す（失敗ケースの成果物調査用。issue #16）

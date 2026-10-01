@@ -429,21 +429,23 @@ try {
         }
     }
     if ($null -ne $srcTranscript) {
-        $userTexts = New-Object System.Collections.Generic.List[string]
-        # 末尾2,000行だけ読む（O(n)全走査の回避と読取り競合の軽減）
-        $lines = Get-Content -LiteralPath $srcTranscript -Tail 2000 -Encoding UTF8 -ErrorAction SilentlyContinue
-        foreach ($line in $lines) {
+        $selected = New-Object System.Collections.Generic.List[string]
+        $msgAcc = @{ total = 0 }
+        # 末尾2,000行を新しい順に見て、5件に達するか合計の上限を越えたら打ち切る（旧実装の「全件を
+        # 集めてから新しい順に選ぶ」と同じ結果。末尾の読み方は Invoke-HoTranscriptTail — 設計メモ 2026-10-01）
+        $readOk = Invoke-HoTranscriptTail -Path $srcTranscript -MaxLines 2000 -OnLine {
+            param([string]$line)
             try {
                 # 行全体が配列のJSONは不正行として無視（jqのselect(type=="object")と同一契約）
                 $e = ConvertFrom-JsonPreserve $line
-                if ($null -eq $e -or ($e -is [System.Array])) { continue }
-                if (-not (Test-HoProp $e "type")) { continue }
-                if (-not ($e.type -is [string]) -or -not (Test-OrdinalEqual $e.type "user")) { continue }
+                if ($null -eq $e -or ($e -is [System.Array])) { return $false }
+                if (-not (Test-HoProp $e "type")) { return $false }
+                if (-not ($e.type -is [string]) -or -not (Test-OrdinalEqual $e.type "user")) { return $false }
                 # 除外はboolean trueのみ（jqの `!= true` と同一契約 — 罠8の型固定）
-                if ((Test-HoProp $e "isSidechain") -and ($e.isSidechain -is [bool]) -and $e.isSidechain) { continue }
-                if ((Test-HoProp $e "isMeta") -and ($e.isMeta -is [bool]) -and $e.isMeta) { continue }
-                if (-not (Test-HoProp $e "message")) { continue }
-                if ($e.message -is [System.Array]) { continue }
+                if ((Test-HoProp $e "isSidechain") -and ($e.isSidechain -is [bool]) -and $e.isSidechain) { return $false }
+                if ((Test-HoProp $e "isMeta") -and ($e.isMeta -is [bool]) -and $e.isMeta) { return $false }
+                if (-not (Test-HoProp $e "message")) { return $false }
+                if ($e.message -is [System.Array]) { return $false }
                 $content = Get-HoProp $e.message "content"
                 $text = ""
                 if ($content -is [string]) {
@@ -461,31 +463,27 @@ try {
                     }
                     $text = $parts -join "`n"
                 }
-                if ([string]::IsNullOrWhiteSpace($text)) { continue }
+                if ([string]::IsNullOrWhiteSpace($text)) { return $false }
                 # ローカルコマンド結果・コマンドマークアップ・システム注入を除外
-                if ($text -match '^\s*<') { continue }
+                if ($text -match '^\s*<') { return $false }
                 if ($text.Length -gt $BUDGET_MSG_EACH) { $text = $text.Substring(0, $BUDGET_MSG_EACH) + "..." }
-                $userTexts.Add($text)
+                # 新しいものを優先し、超過分は古いものから削る（表示は時系列順）
+                if ($selected.Count -ge $MSG_MAX_COUNT) { return $true }
+                if (($msgAcc.total + $text.Length) -gt $BUDGET_MSGS_TOTAL) { return $true }
+                $selected.Insert(0, $text)
+                $msgAcc.total = $msgAcc.total + $text.Length
+                if ($selected.Count -ge $MSG_MAX_COUNT) { return $true }
             } catch { }
+            return $false
         }
-        if ($userTexts.Count -gt 0) {
-            # 新しいものを優先し、超過分は古いものから削る（表示は時系列順）
-            $selected = New-Object System.Collections.Generic.List[string]
-            $total = 0
-            for ($i = $userTexts.Count - 1; $i -ge 0; $i--) {
-                if ($selected.Count -ge $MSG_MAX_COUNT) { break }
-                $t = $userTexts[$i]
-                if (($total + $t.Length) -gt $BUDGET_MSGS_TOTAL) { break }
-                $selected.Insert(0, $t)
-                $total = $total + $t.Length
-            }
-            if ($selected.Count -gt 0) {
-                $sections.Add("## 直近のユーザーメッセージ（古い順）")
-                $n = 0
-                foreach ($t in $selected) {
-                    $n++
-                    $sections.Add("$n. $t")
-                }
+        # 読み取り中に切り詰められた・読めなくなったときは、途中まで選んだものを出さない（旧実装の「無し」と同じ）
+        if (-not $readOk) { $selected.Clear() }
+        if ($selected.Count -gt 0) {
+            $sections.Add("## 直近のユーザーメッセージ（古い順）")
+            $n = 0
+            foreach ($t in $selected) {
+                $n++
+                $sections.Add("$n. $t")
             }
         }
     }

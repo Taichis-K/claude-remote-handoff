@@ -375,9 +375,14 @@ HO_TOKENS_MAX=1000000000
 # transcript末尾からメインチェーン最後の完全なusage合算を返す（不正行は無視）。
 # $1=transcript $2=末尾から読む行数。check と restore で共有する（PS版 Get-LastUsageFromTranscript と同一契約）。
 # restore から呼ぶと「圧縮直前（clearなら /clear 直前）の使用量」になる: SessionStart
-# フックが走る時点では、圧縮後のassistant行はまだ書かれていない（実測で確認済み）
+# フックが走る時点では、圧縮後のassistant行はまだ書かれていない（実測で確認済み）。
+# 引用符込みの "usage" を含まない行は jq に渡さない（大きな tool_result の行を解析しないため。
+# JSON 文字列の中の引用符は必ずエスケープされるので、引用符込みで現れるのはキーか値そのものが
+# usage の文字列のときだけ — 設計メモ docs/design/2026-10-01-transcript-tail-reader.md。PS版と同一契約。
+# キー名の文字をバックスラッシュ+u+16進4桁でエスケープした usage は読まない: Claude Code はそう書かない — 契約外）。
+# grep は -a（バイナリ判定で行を出さなくなるのを防ぐ）と LC_ALL=C（ロケールに依らずバイト列で比べる）
 ho_last_usage() {
-    tail -n "$2" "$1" 2>/dev/null | jq -rRn '
+    tail -n "$2" "$1" 2>/dev/null | LC_ALL=C grep -aF '"usage"' | jq -rRn '
         [ inputs | fromjson? // empty
           | select(type == "object" and .type == "assistant" and (.isSidechain != true))
           | .message.usage? | select(type == "object")

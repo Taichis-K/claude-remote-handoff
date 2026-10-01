@@ -3,9 +3,9 @@
 # run-parity.ps1 と同一ケース・同一出力形式。run-local-check.ps1 / .sh が両者の出力を
 # 期待値と照合して2系統一致を検証する（ローカル実行）
 # 使い方: sh run-parity.sh [作業ディレクトリ] [part]
-#   part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C92）。
+#   part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C94）。
 #   パートは独立した作業ディレクトリで並列に実行し、出力を1〜3の順に連結すると
-#   all と同じ92行になる（run-local-check.sh がそれを行い期待値と照合する）
+#   all と同じ94行になる（run-local-check.sh がそれを行い期待値と照合する）
 set -u
 
 tests_dir=$(cd "$(dirname "$0")" && pwd)
@@ -2206,6 +2206,91 @@ big92=$(has92 "$(ho_freshness_line 1 999999999999999961 "" "" compact)" "完成�
 compact92=$(exact92 "$(ho_freshness_line "" "" 250 380 compact)" "※ 資料の鮮度: 完成時の使用量 250 → 復元直前 380（+130）。完成後に行った作業はこの資料に含まれていないため、圧縮要約・git状態・直近のユーザーメッセージと突き合わせて現状を確認すること。")
 clear92=$(exact92 "$(ho_freshness_line 1000 1300 250 300 clear)" "※ 資料の鮮度: 完成から5分経過 / 完成時の使用量 250 → 復元直前 300（+50）。完成後に行った作業はこの資料に含まれていないため、git状態・直近のユーザーメッセージと突き合わせて現状を確認すること。")
 printf 'C92 lt1=%s m59=%s h1=%s past=%s shrink=%s zero=%s huge=%s big=%s compact=%s clear=%s\n' "$lt192" "$m5992" "$h192" "$past92" "$shrink92" "$zero92" "$huge92" "$big92" "$compact92" "$clear92"
+
+# C93: transcript 末尾の読み取り（共通ヘルパーを直接呼ぶ。v0.2.2。設計メモ 2026-10-01-transcript-tail-reader.md）。
+# PS版は末尾からブロック単位で逆読みし、sh版は tail -n。どちらも引用符込みの "usage" を含む行だけ解析する。
+#   big  : 1MB のブロックをまたぐ 2.5MB の行が最後にある → その手前の usage（222）
+#   span : usage 行そのものが 2.5MB（ブロックをまたぐ）→ 444
+#   in500/out500: usage 行が末尾からちょうど500行目なら読む（556）、501行目なら読まない（0）
+#   crlf : 行末が CR+LF → 666
+#   nolf : 最後の行に改行が無い → 777
+#   esc  : 最後の行は "usage" をエスケープされた文字列として含むだけ → その手前（999）
+#   part : 最後の行が書きかけ（JSON として不完全）→ その手前（998）
+#   none : ファイルが無い → 0
+#   edge : 最後の行の直前の LF が、末尾から読む最初のブロック（1MB）のちょうど先頭にある → 4242
+#   uesc : キー名の u をバックスラッシュ+u+16進4桁でエスケープした usage の行は読まない（契約外。旧実装は 12 を返した — 設計メモ §4）→ その手前（13）
+u93() { # $1=tokens
+    printf '{"type":"assistant","isSidechain":false,"message":{"usage":{"input_tokens":%s,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}\n' "$1"
+}
+x93() { # $1=bytes。x を並べる
+    head -c "$1" /dev/zero | tr '\0' 'x'
+}
+d93="$work/t93"
+mkdir -p "$d93"
+{ u93 111; printf '{"type":"user","message":{"content":"'; x93 2621440; printf '"}}\n'; u93 222
+  printf '{"type":"user","message":{"content":"'; x93 2621440; printf '"}}\n'; } > "$d93/big.jsonl"
+{ u93 333; printf '{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"text","text":"'; x93 2621440
+  printf '"}],"usage":{"input_tokens":444,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}\n'; } > "$d93/span.jsonl"
+{ u93 556; i=0; while [ $i -lt 499 ]; do printf '{"type":"user","message":{"content":"f"}}\n'; i=$((i + 1)); done; } > "$d93/in500.jsonl"
+{ u93 555; i=0; while [ $i -lt 500 ]; do printf '{"type":"user","message":{"content":"f"}}\n'; i=$((i + 1)); done; } > "$d93/out500.jsonl"
+{ u93 665; u93 666; } | sed 's/$/\r/' > "$d93/crlf.jsonl"
+{ u93 776; u93 777 | tr -d '\n'; } > "$d93/nolf.jsonl"
+{ u93 999; printf '%s\n' '{"type":"user","message":{"content":"see \"usage\":{\"input_tokens\":5}"}}'; } > "$d93/esc.jsonl"
+{ u93 998; printf '%s' '{"type":"assistant","isSidechain":false,"message":{"usage":{"input_tokens":12'; } > "$d93/part.jsonl"
+big93=$(ho_last_usage "$d93/big.jsonl" 500)
+span93=$(ho_last_usage "$d93/span.jsonl" 500)
+in50093=$(ho_last_usage "$d93/in500.jsonl" 500)
+out50093=$(ho_last_usage "$d93/out500.jsonl" 500)
+crlf93=$(ho_last_usage "$d93/crlf.jsonl" 500)
+nolf93=$(ho_last_usage "$d93/nolf.jsonl" 500)
+esc93=$(ho_last_usage "$d93/esc.jsonl" 500)
+part93=$(ho_last_usage "$d93/part.jsonl" 500)
+none93=$(ho_last_usage "$d93/missing.jsonl" 500)
+p93='{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"text","text":"'
+s93='"}],"usage":{"input_tokens":4242,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}'
+{ u93 4141; printf '%s' "$p93"; x93 $((1048574 - ${#p93} - ${#s93})); printf '%s\n' "$s93"; } > "$d93/edge.jsonl"
+# キー名の先頭の u をエスケープした行（バックスラッシュはこのファイルに直接書かず awk で作る）
+bs93=$(awk 'BEGIN { printf "%c", 92 }')
+{ u93 13; printf '{"type":"assistant","isSidechain":false,"message":{"%su0075sage":{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}\n' "$bs93"; } > "$d93/uesc.jsonl"
+edge93=$(ho_last_usage "$d93/edge.jsonl" 500)
+uesc93=$(ho_last_usage "$d93/uesc.jsonl" 500)
+printf 'C93 big=%s span=%s in500=%s out500=%s crlf=%s nolf=%s esc=%s part=%s none=%s edge=%s uesc=%s\n' "$big93" "$span93" "$in50093" "$out50093" "$crlf93" "$nolf93" "$esc93" "$part93" "$none93" "$edge93" "$uesc93"
+
+# C94: 復元時の「直近のユーザーメッセージ」（末尾から新しい順に読み、上限で打ち切る。v0.2.2）。
+# 自セッションの資料を完成させたあと transcript に行を足し、compact で復元した出力を見る。
+#   five : 7件あれば新しい5件（M3〜M7）を古い順に「1.〜5.」で出す → yes
+#   budget: 1件300文字（切り詰めて「...」付き303文字）を4件 → 合計1,200文字を越える手前の3件 → 3
+#   in2000/out2000: 発言が末尾からちょうど2,000行目なら出る（yes）、2,001行目なら出ない（no）
+#   clean: 出力に True / False だけの行が混ざらない（PS版の読み取り関数の戻り値が漏れていない）→ yes
+msg94() { # $1=text
+    printf '{"type":"user","isSidechain":false,"message":{"content":"%s"}}\n' "$1"
+}
+fill94() { # $1=行数。ユーザーの発言ではない行
+    awk -v n="$1" 'BEGIN { for (i = 0; i < n; i++) print "{\"type\":\"system\",\"subtype\":\"parity-fill\"}" }'
+}
+sid94a="94949494-1111-1111-1111-111111111111"; t94a="$troot/t94a.jsonl"
+done91 "$sid94a" "$t94a" "nonce-t94a-00000000"
+for k in 1 2 3 4 5 6 7; do msg94 "C94-M$k"; done >> "$t94a"
+o94=$(restore91 "$sid94a" "$t94a" compact | tr -d '\r')
+clean94="yes"; if printf '%s\n' "$o94" | grep -qxE 'True|False'; then clean94="no"; fi
+five94="no"
+case "$o94" in *"1. C94-M3"*"5. C94-M7"*) case "$o94" in *"C94-M2"*) ;; *) five94="yes" ;; esac ;; esac
+sid94b="94949494-2222-2222-2222-222222222222"; t94b="$troot/t94b.jsonl"
+done91 "$sid94b" "$t94b" "nonce-t94b-00000000"
+for k in 1 2 3 4; do msg94 "C94-B$k$(x93 300)"; done >> "$t94b"
+o94=$(restore91 "$sid94b" "$t94b" compact | tr -d '\r')
+budget94=0
+for k in 1 2 3 4; do case "$o94" in *"C94-B$k"*) budget94=$((budget94 + 1)) ;; esac; done
+case "$o94" in *"C94-B1"*) budget94="$budget94/withB1" ;; esac
+sid94c="94949494-3333-3333-3333-333333333333"; t94c="$troot/t94c.jsonl"
+done91 "$sid94c" "$t94c" "nonce-t94c-00000000"
+{ msg94 "C94-IN"; fill94 1999; } >> "$t94c"
+in200094="no"; case "$(restore91 "$sid94c" "$t94c" compact)" in *"C94-IN"*) in200094="yes" ;; esac
+sid94d="94949494-4444-4444-4444-444444444444"; t94d="$troot/t94d.jsonl"
+done91 "$sid94d" "$t94d" "nonce-t94d-00000000"
+{ msg94 "C94-OUT"; fill94 2000; } >> "$t94d"
+out200094="no"; case "$(restore91 "$sid94d" "$t94d" compact)" in *"C94-OUT"*) out200094="yes" ;; esac
+printf 'C94 five=%s budget=%s in2000=%s out2000=%s clean=%s\n' "$five94" "$budget94" "$in200094" "$out200094" "$clean94"
 fi
 
 # KEEP_WORK=1 で作業ディレクトリを残す（失敗ケースの成果物調査用。issue #16）
