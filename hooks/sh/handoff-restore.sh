@@ -30,104 +30,70 @@ main() {
     state_file=$(ho_valid_state_path "$tp" delete) || state_file=""
 
     # --- 1. ポインタ読込み（スキーマ・消費済み・有効期限を検証） ---
+    # latest.json は経路によらず常に検証する（compact で自セッションを直接参照するときも、ポインタが自セッションの
+    # ものなら SHA-256 照合に使うため）。判定と診断は ho_pointer_state（従来の直書きを関数にしたもの。PS版と同一契約）
     latest_path="$handoff_root/latest.json"
     pointer_ok="no"
     p_sid=""
+    now_epoch=$(ho_now_epoch) || now_epoch=""
+    case "$now_epoch" in ''|*[!0-9]*) now_epoch="" ;; esac
+    latest_state="bad"
     if [ -f "$latest_path" ]; then
-        # 閉じたスキーマ（issue #38 — 設計文書4.2）: 既知キー以外が1つでもあればファイル無効。
-        # schema_versionは必須の整数1（欠落=旧形式 / 不一致=未知の形式でログ文言を区別 —
-        # 旧producerのポインタは次のhandoffサイクルで再生成される）。判定は数値比較
-        # （.schema_version == 1。PS版のdouble正規化比較と同一契約）。非objectとjq失敗は
-        # 従来どおり診断なしの静かな無効（PS版のnon-PSCustomObject分岐と同一）
-        schema_state=$(jq -r --argjson known "$HO_POINTER_KNOWN_KEYS" '
-            if type != "object" then "notobj"
-            elif ([keys_unsorted[] | select(. as $k | $known | index($k) | not)] | length) > 0 then "unknown"
-            elif (has("schema_version") | not) then "old"
-            elif (.schema_version == 1 | not) then "badver"
-            else "ok" end' "$latest_path" 2>/dev/null)
-        if [ "$schema_state" = "unknown" ]; then
-            ho_error "$handoff_root" "restore" "latest.jsonに未知のキーがあります。ポインタを無効として扱いました"
-        elif [ "$schema_state" = "old" ]; then
-            ho_error "$handoff_root" "restore" "latest.jsonにschema_versionがありません（旧形式のポインタ）。ポインタを無効として扱いました"
-        elif [ "$schema_state" = "badver" ]; then
-            ho_error "$handoff_root" "restore" "latest.jsonのschema_versionが1ではありません（未知の形式）。ポインタを無効として扱いました"
-        fi
-        # 消費判定はdual-read（issue #34 — 設計文書4.2）: consumed == true または
-        # consumed_at非空なら消費済み。consumedは存在するならboolean falseのみ許可
-        # （"true"等の型違いはポインタごと無効 — PS版の -is [bool] と同一契約・罠8）
-        [ "$schema_state" = "ok" ] && pointer_ok=$(jq -r '
-            if type == "object"
-               and (.session_id | type == "string")
-               and (.nonce | type == "string" and test("^[A-Za-z0-9-]{8,64}$"))
-               and ((has("consumed") | not) or (.consumed == false))
-               and ((has("consumed_at") | not) or (.consumed_at == null) or (.consumed_at == ""))
-            then "ok" else "no" end' "$latest_path" 2>/dev/null)
-        if [ "$pointer_ok" = "ok" ]; then
-            p_sid=$(ho_json_str_field "$latest_path" session_id)
-            ho_is_uuid "$p_sid" || pointer_ok="no"
-        fi
-        if [ "$pointer_ok" = "ok" ]; then
-            # 有効期限。鮮度判定の唯一の正はupdated_epoch＝UNIX秒の整数（issue #34 —
-            # 挙動変更）。人間可読日時のパース（date -d/-j+暦日検証）は判定経路から排除し、
-            # updated_atは表示専用。契約: 数値かつ整数値（jq floor同値）・0 < v・
-            # v ≤ now+86400（未来skew上限1日）・now-v ≤ 7日。旧producerのポインタ
-            # （updated_epochなし）はfail-closed → 次サイクルで再生成される。
-            # 比較はjq内（double・53bit精度）で行い、shの算術オーバーフローを避ける —
-            # 2^53超は丸まるが範囲検証の受否は変わらない（正しく拒否される）
-            now_epoch=$(ho_now_epoch) || now_epoch=""
-            case "$now_epoch" in ''|*[!0-9]*) now_epoch="" ;; esac
-            if [ -z "$now_epoch" ]; then
-                # nowを取得できなければ鮮度を判定できない（fail-closed）
-                pointer_ok="no"
-                ho_error "$handoff_root" "restore" "現在時刻(epoch)を取得できないため鮮度判定できません。ポインタを無効として扱いました"
-            else
-                epoch_state=$(jq -r --argjson now "$now_epoch" --argjson maxage "$POINTER_MAX_AGE_DAYS" '
-                    if (has("updated_epoch") | not) then "bad"
-                    else .updated_epoch as $v |
-                        if (($v | type) != "number") or ($v != ($v | floor)) or ($v <= 0)
-                           or ($v > ($now + 86400)) then "bad"
-                        elif ($now - $v) > ($maxage * 86400) then "expired"
-                        else "ok" end
-                    end' "$latest_path" 2>/dev/null)
-                if [ "$epoch_state" = "expired" ]; then
-                    # 契約内の値で期限超過のみ静かに無効（毎回の復元でerror.logを埋めない —
-                    # 旧updated_at時代の期限切れと同じ扱い）
-                    pointer_ok="no"
-                elif [ "$epoch_state" != "ok" ]; then
-                    pointer_ok="no"
-                    ho_error "$handoff_root" "restore" "latest.jsonのupdated_epochが無いか不正です。ポインタを無効として扱いました"
-                fi
-            fi
-        fi
+        latest_state=$(ho_pointer_state "$latest_path" "latest.json" "$HO_POINTER_KNOWN_KEYS" "$now_epoch")
+    fi
+    if [ "$latest_state" = "ok" ]; then
+        pointer_ok="ok"
+        p_sid=$(ho_json_str_field "$latest_path" session_id)
     fi
 
-    # --- 2. handoff解決: compactは自session直接参照を最優先、clearはポインタ ---
+    # --- 2. handoff解決: compactは自session直接参照を最優先、clear（と compact で自セッションに資料が無いとき）は
+    #        系列ポインタと latest.json から決める（v0.2.3。設計メモ docs/design/2026-11-21-multi-session-keys.md 5-4） ---
     resolved_sid=""
     origin=""
     use_pointer="no"
+    pointer_via=""
+    pointer_title=""
     # 自セッションに下書き（draft.md）だけがある場合も自セッションに解決する（v0.2.1。初回サイクルで書いている途中・
     # 検証NG・打ち切り。HEAD は書きかけの current.md があったので自セッションに解決していた。広げないと
     # 自セッションのバックアップ導線が消え、別セッションの資料を代わりに注入してしまう — 設計メモ 2026-09-13 S8）
     own_draft="no"
     [ -n "$own_sid" ] && [ -f "$handoff_root/$own_sid/draft.md" ] && own_draft="yes"
+    sel="no"
     if [ "$source_kind" != "clear" ] && [ -n "$own_sid" ] &&
        { [ -f "$handoff_root/$own_sid/current.md" ] || [ "$own_draft" = "yes" ]; }; then
         resolved_sid="$own_sid"
         origin="セッションディレクトリ直接参照（${own_sid}）"
-    elif [ "$pointer_ok" = "ok" ]; then
+    else
+        is_clear="no"
+        [ "$source_kind" = "clear" ] && is_clear="yes"
+        if ho_resolve_pointer "$handoff_root" "$latest_state" "${HO_SESSION_TITLE:-}" "$tp" "$own_sid" "$is_clear" "$now_epoch"; then
+            sel="yes"
+        fi
+    fi
+    if [ "$sel" = "yes" ]; then
+        # 以降の検証・鮮度・引用・消費は、選んだポインタのファイルについて行う（PS版で $pointer を差し替えるのと同じ）
+        latest_path=$HO_SEL_PATH
+        pointer_ok="ok"
+        p_sid=$(ho_json_str_field "$latest_path" session_id)
+        pointer_via=$HO_SEL_VIA
+        pointer_title=$HO_SEL_TITLE
         resolved_sid="$p_sid"
         use_pointer="yes"
         # updated_atは非信頼の表示値（鮮度検証から外れた — issue #34）。producer形式の
         # 1行に一致する場合のみ表示する（改行入り指示や巨大文字列が有効なepoch+SHAの
         # ままで復元出力へ注入される経路を遮断 — レビュー1回目 H1。PS版と同一契約）。
-        # アンカーは \A/\z（文字列端）: jqのOniguruma正規表現では ^/$ が行端のため、
+        # アンカーは文字列端: jqのOniguruma正規表現では ^/$ が行端のため、
         # 「有効な1行目+改行+任意テキスト」が一致して値全体が出力される（レビュー2回目 H1）
         upd_disp=$(jq -r 'if (.updated_at | type) == "string"
                and (.updated_at | test("\\A[1-9][0-9]{3}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([+-]((0[0-9]|1[0-3]):?[0-5][0-9]|14:?00)|[Zz])\\z"))
             then .updated_at else "?" end' "$latest_path" 2>/dev/null)
         [ -n "$upd_disp" ] || upd_disp="?"
-        origin="latest.json経由（作成セッション: $p_sid / 更新: ${upd_disp}）"
-    elif [ -n "$own_sid" ] && [ -f "$handoff_root/$own_sid/current.md" ]; then
+        case "$pointer_via" in
+            pid) origin="このウィンドウの直前のセッション（作成セッション: $p_sid / 更新: ${upd_disp}）" ;;
+            name) origin="同じ名前のセッション（作成セッション: $p_sid / 更新: ${upd_disp}）" ;;
+            *) origin="latest.json経由（作成セッション: $p_sid / 更新: ${upd_disp}）" ;;
+        esac
+    elif [ -z "$resolved_sid" ] && [ -n "$own_sid" ] && [ -f "$handoff_root/$own_sid/current.md" ]; then
         resolved_sid="$own_sid"
         origin="セッションディレクトリ直接参照（${own_sid}）"
     fi
@@ -230,10 +196,20 @@ main() {
 
     # ポインタ経由で自分以外のセッションの資料を注入する場合は冒頭で明示する
     # （同一プロジェクトで複数セッションを並行させると他セッションの資料が来得る。issue #19）
+    # 系列ポインタ経由（v0.2.3）は、どの経路で引いたかを出す（このウィンドウの直前のセッションか、同じ名前のセッションか）
     if [ "$use_pointer" = "yes" ] && { [ -z "$own_sid" ] || [ "$p_sid" != "$own_sid" ]; }; then
-        out="$out
+        case "$pointer_via" in
+            pid) out="$out
 
-※ この資料は別セッション（${p_sid}）で作成されたものです。同一プロジェクトで複数のセッションを併用している場合は、現在の作業に対応する内容か確認してから使うこと。"
+※ この資料は、このウィンドウの直前のセッション（${p_sid}）で作成されたものです。" ;;
+            # 名前は注入文に出さない（利用者の入力で、Unicode の改行・書式制御文字を含み得る — PS版と同一）
+            name) out="$out
+
+※ この資料は、同じ名前の前のセッション（${p_sid}）で作成されたものです。現在の作業に対応する内容か確認してから使うこと。" ;;
+            *) out="$out
+
+※ この資料は別セッション（${p_sid}）で作成されたものです。同一プロジェクトで複数のセッションを併用している場合は、現在の作業に対応する内容か確認してから使うこと。" ;;
+        esac
     fi
 
     # --- 4.5 資料の鮮度（v0.2.1。ゲートを通過した資料についてのみ。PS版と同一契約） ---
@@ -426,8 +402,9 @@ $bk"
     # --- 9. 出力（最終ガード10,000文字） ---
     printf '%s' "$out" | jq -Rs --argjson m "$TOTAL_MAX" 'if length <= $m then . else .[0:$m] end' | jq -r .
 
-    # --- 10. ポインタの消費マーク（clearでポインタ経由の注入をした場合のみ）。
-    #         dual-write（issue #34 — 設計文書4.2）: consumed=true と非空consumed_atを
+    # --- 10. ポインタの消費マーク（clearでポインタ経由の注入をした場合のみ。compact のポインタ経由は従来どおり
+    #         消費しない）。v0.2.3 から、同じ nonce を持つすべてのポインタ（latest.json・系列）に書く
+    #         （設計メモ 2026-11-21 I8）。dual-write（issue #34 — 設計文書4.2）: consumed=true と非空consumed_atを
     #         同一のatomic更新で書く（旧consumerはconsumed_atのみ読むため両方必要） ---
     if [ "$use_pointer" = "yes" ] && [ "$source_kind" = "clear" ] && [ "$gate" = "yes" ]; then
         # consumed_atは必ず非空にする（日時取得失敗で空を書くと旧consumerが未消費と読み
@@ -435,8 +412,7 @@ $bk"
         # now_epoch（ポインタ経路ではepoch検証で取得済み）のepoch表記へフォールバック
         _c=$(ho_now_display) || _c=""
         [ -n "$_c" ] || _c="epoch:${now_epoch}"
-        jq --arg c "$_c" '. + {consumed: true, consumed_at: $c}' "$latest_path" 2>/dev/null \
-            | ho_write_atomic "$latest_path"
+        ho_consume_pointers "$handoff_root" "$(ho_json_str_field "$latest_path" nonce)" "$_c"
     fi
 
     # --- 11. 状態ファイル削除 ---

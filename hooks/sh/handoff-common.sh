@@ -66,7 +66,8 @@ ho_read_input() {
     HO_TRIGGER=""
     HO_BG_TASKS=0
     HO_STOP_ACTIVE=0
-    _fields=$(printf '%s' "$HO_INPUT" | jq -s -r '
+    HO_SESSION_TITLE=""
+    _fields=$(printf '%s' "$HO_INPUT" | jq -s -r "$HO_TITLE_JQDEF"'
         def strfield: if type == "string" and (contains("\u0000") | not)
                          and (contains("\r") | not) then . else "" end;
         def pathfield: if type == "string" and (test("[\u0000-\u001f\u007f]") | not) then . else "" end;
@@ -75,6 +76,7 @@ ho_read_input() {
             "HO_TRANSCRIPT_PATH=\(.transcript_path | pathfield | @sh) " +
             "HO_SESSION_ID=\(.session_id | strfield | @sh) " +
             "HO_SOURCE=\(.source | strfield | @sh) " +
+            "HO_SESSION_TITLE=\(.session_title | if titleok then . else "" end | @sh) " +
             "HO_TRIGGER=\(.trigger | strfield | @sh) " +
             "HO_BG_TASKS=\(.background_tasks | if type == "array" then length else 0 end) " +
             "HO_STOP_ACTIVE=\(if .stop_hook_active == true then 1
@@ -728,4 +730,380 @@ ho_git_repo() {
     _val=$(cat "$_probe" 2>/dev/null | tr -d '\r\n[:space:]')
     rm -f "$_probe" 2>/dev/null
     [ "$_r" = "ok" ] && [ "$_val" = "true" ]
+}
+
+# ---------------------------------------------------------------------------
+# 系列ポインタ（v0.2.3。設計メモ docs/design/2026-11-21-multi-session-keys.md。PS版と同一契約）
+# 同一ワークスペースで複数セッションを並行させたとき、/clear 後に「自分の」資料を引くため、
+# latest.json に加えて、Claude Code 本体のプロセス（PID と起動時刻）とセッション名を鍵にした
+# 系列ポインタ（.claude-handoff/series-pid-<PID>.json / series-name-<名前のSHA-256>.json）を書く
+
+HO_SERIES_KNOWN_KEYS='["schema_version","session_id","nonce","sha256","transcript_path","updated_epoch","updated_at","consumed","consumed_at","handoff_path","size","series_key","pid","process_start_epoch","session_title"]'
+HO_PROC_START_TOLERANCE=2
+HO_SERIES_MAX_FILES=64
+HO_SERIES_MAX_AGE_DAYS=7
+HO_SERIES_MAX_BYTES=65536
+HO_PID_MAX=2147483647
+
+# セッション名として使えるか（jq の def。PS版 Test-HoSessionTitle と同一契約）: 文字列・1〜256コードポイント・
+# 制御文字（C0 / DEL）と U+FFFD を含まない（jq は対になっていないサロゲートを U+FFFD に置き換える）・
+# 先頭と末尾が空白（U+0020 / U+00A0 / U+3000）でない
+HO_TITLE_JQDEF='def titleok: type == "string" and (explode as $c | ($c | length) >= 1 and ($c | length) <= 256
+    and ([$c[] | select(. < 32 or . == 127 or . == 65533)] | length) == 0
+    and ($c[0] as $f | [32, 160, 12288] | any(. == $f) | not)
+    and ($c[-1] as $l | [32, 160, 12288] | any(. == $l) | not));'
+
+ho_config_dir() {
+    _cr=$(ho_projects_root) || return 1
+    printf '%s' "${_cr%/projects}"
+}
+
+# プロセスの起動時刻（UTC の UNIX 秒）。Linux は /proc、それ以外（macOS）は ps の lstart。取れなければ1
+ho_proc_start_epoch() {
+    if [ -r "/proc/$1/stat" ] && [ -r /proc/stat ]; then
+        _pst=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+        # 2番目の欄（実行ファイル名）は空白や括弧を含み得るので、最後の閉じ括弧より後ろを数える（starttime は20番目）
+        _pst=${_pst##*) }
+        _pt=$(printf '%s' "$_pst" | awk '{print $20}')
+        _pbt=$(awk '$1 == "btime" {print $2}' /proc/stat 2>/dev/null)
+        _phz=$(getconf CLK_TCK 2>/dev/null)
+        case "$_pt" in ''|*[!0-9]*) return 1 ;; esac
+        case "$_pbt" in ''|*[!0-9]*) return 1 ;; esac
+        case "$_phz" in ''|0|*[!0-9]*) return 1 ;; esac
+        printf '%s' "$((_pbt + _pt / _phz))"
+        return 0
+    fi
+    _pls=$(LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null) || return 1
+    # 連続する空白を1つにそろえる（日が1桁のとき「Nov  2」になる）
+    _pls=$(printf '%s' "$_pls" | awk '{$1 = $1; print}')
+    [ -n "$_pls" ] || return 1
+    _pe=$(LC_ALL=C date -j -f '%a %b %d %T %Y' "$_pls" +%s 2>/dev/null) ||
+        _pe=$(LC_ALL=C date -d "$_pls" +%s 2>/dev/null) || return 1
+    case "$_pe" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$_pe"
+}
+
+# フックの親プロセス（Claude Code 本体）の PID と起動時刻を HO_HOST_PID / HO_HOST_START に設定する。取れなければ1。
+# 取得失敗とみなす条件（設計メモ 5-2）: 親 PID が1以下（Git for Windows の sh をネイティブの親から起動した場合など）／
+# <設定ディレクトリ>/sessions/<親PID>.json が無い（ラッパーや入れ子の起動には無い）。起動時刻でのラッパー判定は採らない（PS版参照）。
+# テスト用シーム: HANDOFF_TEST_HOST="<PID>:<起動時刻>" で固定、"fail" で取得失敗（PS版と同一契約）
+ho_host_process() {
+    HO_HOST_PID=""
+    HO_HOST_START=""
+    if [ -n "${HANDOFF_TEST_HOST:-}" ]; then
+        _hh_p=${HANDOFF_TEST_HOST%%:*}
+        _hh_s=${HANDOFF_TEST_HOST#*:}
+        [ "$_hh_p:$_hh_s" = "$HANDOFF_TEST_HOST" ] || return 1
+        case "$_hh_p" in ''|0*|*[!0-9]*) return 1 ;; esac
+        case "$_hh_s" in ''|0*|*[!0-9]*) return 1 ;; esac
+        [ "${#_hh_p}" -le 10 ] && [ "${#_hh_s}" -le 12 ] || return 1
+        [ "$_hh_p" -le "$HO_PID_MAX" ] 2>/dev/null || return 1
+        HO_HOST_PID=$_hh_p
+        HO_HOST_START=$_hh_s
+        return 0
+    fi
+    _hh_cfg=$(ho_config_dir) || return 1
+    [ -d "$_hh_cfg/sessions" ] || return 1
+    _hh_p=${PPID:-}
+    case "$_hh_p" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_hh_p" -gt 1 ] 2>/dev/null && [ "$_hh_p" -le "$HO_PID_MAX" ] 2>/dev/null || return 1
+    [ -f "$_hh_cfg/sessions/$_hh_p.json" ] || return 1
+    _hh_s=$(ho_proc_start_epoch "$_hh_p") || return 1
+    HO_HOST_PID=$_hh_p
+    HO_HOST_START=$_hh_s
+    return 0
+}
+
+# プロセスが生きているか: alive / dead / unknown を出力する（PS版 Get-HoProcessLiveness と同一契約）。
+# PID が無い・別の起動時刻（PID の再利用）なら dead、起動時刻が読めない等は unknown（呼び出し側は alive として扱う）。
+# テスト用シーム: HANDOFF_TEST_LIVE="<PID>:<alive|dead|unknown>,..."（並べた PID 以外は dead）
+ho_proc_liveness() {
+    if [ -n "${HANDOFF_TEST_LIVE:-}" ]; then
+        _lv=$(printf '%s' "$HANDOFF_TEST_LIVE" | tr ',' '\n' | awk -F: -v p="$1" '$1 == p && NF == 2 {print $2; exit}')
+        case "$_lv" in
+            alive|dead|unknown) printf '%s' "$_lv" ;;
+            '') printf 'dead' ;;
+            *) printf 'unknown' ;;
+        esac
+        return 0
+    fi
+    case "$1" in ''|*[!0-9]*) printf 'dead'; return 0 ;; esac
+    if [ "${#1}" -gt 10 ] || [ "$1" -le 0 ] || [ "$1" -gt "$HO_PID_MAX" ]; then printf 'dead'; return 0; fi
+    if [ -d /proc/self ]; then
+        [ -d "/proc/$1" ] || { printf 'dead'; return 0; }
+    fi
+    _lvs=$(ho_proc_start_epoch "$1") || {
+        if [ -d /proc/self ]; then printf 'unknown'
+        elif [ -z "$(LC_ALL=C ps -o pid= -p "$1" 2>/dev/null)" ]; then printf 'dead'
+        else printf 'unknown'
+        fi
+        return 0
+    }
+    _lvd=$((_lvs - $2))
+    [ "$_lvd" -lt 0 ] && _lvd=$((0 - _lvd))
+    if [ "$_lvd" -le "$HO_PROC_START_TOLERANCE" ]; then printf 'alive'; else printf 'dead'; fi
+}
+
+# セッション名の SHA-256（UTF-8 のバイト列。英大文字の16進。PS版 Get-HoTitleHash と同一契約）
+ho_title_hash() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$1" | sha256sum 2>/dev/null | awk '{print toupper($1)}'
+    elif command -v shasum >/dev/null 2>&1; then
+        printf '%s' "$1" | shasum -a 256 2>/dev/null | awk '{print toupper($1)}'
+    else
+        return 1
+    fi
+}
+
+# transcript の末尾 500 行から、自セッション（$2）の最後の custom-title 行の名前を出力する（無い・使えない名前は空）
+ho_title_from_transcript() {
+    tail -n 500 "$1" 2>/dev/null | LC_ALL=C grep -aF '"custom-title"' | jq -rRn --arg sid "$2" "$HO_TITLE_JQDEF"'
+        [ inputs | fromjson? // empty
+          | select(type == "object" and .type == "custom-title" and (.sessionId | type) == "string"
+                   and .sessionId == $sid and (.customTitle | type) == "string" and .customTitle != "") ]
+        | last | if . == null then "" elif (.customTitle | titleok) then .customTitle else "" end' 2>/dev/null
+}
+
+# 系列ポインタのファイル（直下の通常ファイル。名前の形が合うもので、更新から7日以内のもの）を1行ずつ出力する。
+# 7日を過ぎたものは中身も必ず期限切れなので、数にも入れない（PS版 Get-HoSeriesPaths と同一 — 実装レビュー2回目 H1）
+ho_series_paths() {
+    find "$1" -maxdepth 1 -type f -name 'series-*.json' -mtime -"$HO_SERIES_MAX_AGE_DAYS" 2>/dev/null | while read -r _sf; do
+        [ -f "$_sf" ] && [ ! -L "$_sf" ] || continue
+        _sn=${_sf##*/}
+        if printf '%s' "$_sn" | LC_ALL=C grep -Eq '^(series-pid-[1-9][0-9]{0,9}|series-name-[0-9A-F]{64})[.]json$'; then
+            printf '%s\n' "$_sf"
+        fi
+    done | LC_ALL=C sort
+}
+
+# check が latest.json を書いた直後に呼ぶ（$1=root $2=latest.json の内容 $3=transcript $4=session_id）。
+# 本体プロセスが取れなければ何も書かない。書き込みに失敗したらそのファイルを消して error.log に残す（I9）
+ho_write_series_pointers() {
+    # 7日を過ぎた系列ファイルを消す（PreCompact が走らない使い方でも溜めない — PS版と同一）
+    find "$1" -maxdepth 1 -type f -name 'series-*.json' -mtime +"$((HO_SERIES_MAX_AGE_DAYS - 1))" -exec rm -f {} \; 2>/dev/null
+    ho_host_process || return 0
+    _wt=$(ho_title_from_transcript "$3" "$4")
+    _wl="pid:$HO_HOST_PID series-pid-$HO_HOST_PID.json"
+    if [ -n "$_wt" ]; then
+        _wh=$(ho_title_hash "$_wt")
+        [ "${#_wh}" -eq 64 ] && _wl="$_wl
+name:$_wh series-name-$_wh.json"
+    fi
+    printf '%s\n' "$_wl" | while read -r _wk _wf; do
+        [ -n "$_wk" ] || continue
+        if [ "${_wk%%:*}" = "name" ]; then
+            _wjson=$(printf '%s' "$2" | jq --arg k "$_wk" --argjson p "$HO_HOST_PID" --argjson s "$HO_HOST_START" --arg t "$_wt" \
+                '. + {series_key: $k, pid: $p, process_start_epoch: $s, session_title: $t}' 2>/dev/null)
+        else
+            _wjson=$(printf '%s' "$2" | jq --arg k "$_wk" --argjson p "$HO_HOST_PID" --argjson s "$HO_HOST_START" \
+                '. + {series_key: $k, pid: $p, process_start_epoch: $s}' 2>/dev/null)
+        fi
+        if [ -z "$_wjson" ] || ! printf '%s\n' "$_wjson" | ho_write_atomic "$1/$_wf"; then
+            rm -f "$1/$_wf" 2>/dev/null
+            ho_error "$1" "handoff-check" "系列ポインタ（${_wk}）を書けなかったため消しました（session=${4}）"
+        fi
+    done
+}
+
+# ポインタの検証（PS版 Get-HoPointerState と同一契約。判定と診断の文言は従来の latest.json の検証と同じ）。
+# $1=ファイル $2=診断に出す名前 $3=既知キー（JSON 配列） $4=現在の epoch（空なら取得失敗）。ok / consumed / expired / bad を出力する
+ho_pointer_state() {
+    _ps=$(jq -r --argjson known "$3" '
+        if type != "object" then "notobj"
+        elif ([keys_unsorted[] | select(. as $k | $known | index($k) | not)] | length) > 0 then "unknown"
+        elif (has("schema_version") | not) then "old"
+        elif (.schema_version == 1 | not) then "badver"
+        elif ((.session_id | type) != "string") then "bad"
+        elif ((.nonce | type == "string" and test("^[A-Za-z0-9-]{8,64}$")) | not) then "bad"
+        elif (has("consumed") and ((.consumed | type) != "boolean")) then "bad"
+        elif (has("consumed_at") and .consumed_at != null and ((.consumed_at | type) != "string")) then "bad"
+        elif (.consumed == true) or ((.consumed_at | type) == "string" and .consumed_at != "") then "consumed"
+        else "ok" end' "$1" 2>/dev/null)
+    case "$_ps" in
+        unknown) ho_error "$HO_HANDOFF_ROOT" "restore" "${2}に未知のキーがあります。ポインタを無効として扱いました"; printf 'bad'; return 0 ;;
+        old) ho_error "$HO_HANDOFF_ROOT" "restore" "${2}にschema_versionがありません（旧形式のポインタ）。ポインタを無効として扱いました"; printf 'bad'; return 0 ;;
+        badver) ho_error "$HO_HANDOFF_ROOT" "restore" "${2}のschema_versionが1ではありません（未知の形式）。ポインタを無効として扱いました"; printf 'bad'; return 0 ;;
+        consumed) printf 'consumed'; return 0 ;;
+        ok) ;;
+        *) printf 'bad'; return 0 ;;
+    esac
+    _psid=$(ho_json_str_field "$1" session_id)
+    ho_is_uuid "$_psid" || { printf 'bad'; return 0; }
+    if [ -z "$4" ]; then
+        ho_error "$HO_HANDOFF_ROOT" "restore" "現在時刻(epoch)を取得できないため鮮度判定できません。ポインタを無効として扱いました"
+        printf 'bad'
+        return 0
+    fi
+    _pe=$(jq -r --argjson now "$4" '
+        if (has("updated_epoch") | not) then "bad"
+        else .updated_epoch as $v |
+            if (($v | type) != "number") or ($v != ($v | floor)) or ($v <= 0) or ($v > ($now + 86400)) then "bad"
+            elif ($now - $v) > (7 * 86400) then "expired"
+            else "ok" end
+        end' "$1" 2>/dev/null)
+    case "$_pe" in
+        ok|expired) printf '%s' "$_pe" ;;
+        *) ho_error "$HO_HANDOFF_ROOT" "restore" "${2}のupdated_epochが無いか不正です。ポインタを無効として扱いました"; printf 'bad' ;;
+    esac
+}
+
+# 系列ポインタだけの検証（PS版 Test-HoSeriesFields と同一契約）: series_key がファイル名と一致し、
+# pid / process_start_epoch が正の整数（10桁以下）、session_title があれば使える名前
+ho_series_fields_ok() {
+    _sfn=${1##*/}
+    case "$_sfn" in
+        series-pid-*.json) _sfk="pid:${_sfn#series-pid-}"; _sfk=${_sfk%.json} ;;
+        series-name-*.json) _sfk="name:${_sfn#series-name-}"; _sfk=${_sfk%.json} ;;
+        *) return 1 ;;
+    esac
+    _sfr=$(jq -r --arg k "$_sfk" "$HO_TITLE_JQDEF"'
+        def posint($m): type == "number" and . == floor and . > 0 and . <= $m;
+        if type == "object" and (.series_key | type) == "string" and .series_key == $k
+           and (.pid | posint(2147483647)) and (.process_start_epoch | posint(9999999999))
+           and ((($k | startswith("pid:")) | not) or (("pid:" + (.pid | tostring)) == $k))
+           and ((has("session_title") | not) or .session_title == null or (.session_title | titleok))
+        then "ok" else "no" end' "$1" 2>/dev/null)
+    [ "$_sfr" = "ok" ]
+}
+
+# ポインタが指す資料（検証済み UUID から組み立てた current.md）が完了検証と SHA-256 照合に通るか
+ho_pointer_target_ok() {
+    _tsid=$(ho_json_str_field "$1" session_id)
+    ho_is_uuid "$_tsid" || return 1
+    _tmd="$2/$_tsid/current.md"
+    [ -f "$_tmd" ] && ho_under_root "$2" "$_tmd" || return 1
+    _tn=$(ho_json_str_field "$1" nonce)
+    [ -n "$_tn" ] && ho_test_complete "$_tmd" "$_tn" || return 1
+    _tsha=$(ho_json_str_field "$1" sha256)
+    [ -n "$_tsha" ] || return 1
+    _tact=$(ho_sha256 "$_tmd")
+    [ -n "$_tact" ] && [ "$_tact" = "$_tsha" ]
+}
+
+# /clear（と compact で自セッションに資料が無いとき）に使うポインタを決める（設計メモ 5-4。PS版 Resolve-HoPointer と同一契約）。
+# $1=root $2=latest.json の検証結果（ok 等） $3=入力の session_title（使えない値は空） $4=transcript $5=自 session_id
+# $6=clear なら yes $7=現在の epoch。決まれば HO_SEL_PATH / HO_SEL_VIA / HO_SEL_TITLE を設定して0、決まらなければ1
+ho_resolve_pointer() {
+    HO_SEL_PATH=""
+    HO_SEL_VIA=""
+    HO_SEL_TITLE=""
+    _rr=$1
+    NOW_FOR_POINTER=$7
+    _rlatest="$_rr/latest.json"
+    _rls=$2
+    _rseries=$(ho_series_paths "$_rr")
+    # 系列ファイルの数と大きさに上限を置く。超えたら途中で打ち切らず、ポインタからの注入をやめる（PS版と同一 — 実装レビュー1回目 M8）
+    _rcnt=$(printf '%s\n' "$_rseries" | grep -c .)
+    if [ "$_rcnt" -gt "$HO_SERIES_MAX_FILES" ]; then
+        ho_error "$HO_HANDOFF_ROOT" "restore" "系列ポインタが多すぎます（${_rcnt}件）。ポインタからの注入を行いません"
+        return 1
+    fi
+    _rbig=$(printf '%s\n' "$_rseries" | while read -r _rf; do
+        [ -n "$_rf" ] || continue
+        _rsz=$(wc -c < "$_rf" 2>/dev/null | tr -d ' ')
+        [ "${_rsz:-0}" -gt "$HO_SERIES_MAX_BYTES" ] && { printf '%s' "${_rf##*/}"; break; }
+    done)
+    if [ -n "$_rbig" ]; then
+        ho_error "$HO_HANDOFF_ROOT" "restore" "系列ポインタが大きすぎます（${_rbig}）。ポインタからの注入を行いません"
+        return 1
+    fi
+    # 消費の判定: 同じ nonce を持つポインタのどれか1つでも消費済みなら消費済み（2回目レビュー N4）
+    _rconsumed=$( { [ -f "$_rlatest" ] && printf '%s\n' "$_rlatest"; printf '%s\n' "$_rseries"; } | while read -r _rf; do
+        [ -n "$_rf" ] || continue
+        jq -r 'if type == "object" and (.nonce | type) == "string"
+                  and ((.consumed == true) or ((.consumed_at | type) == "string" and .consumed_at != ""))
+               then .nonce else empty end' "$_rf" 2>/dev/null
+    done)
+    _rlnonce=""
+    if [ "$_rls" = "ok" ]; then
+        _rlnonce=$(ho_json_str_field "$_rlatest" nonce)
+        printf '%s\n' "$_rconsumed" | grep -qxF "$_rlnonce" && _rls="consumed"
+    fi
+    _rhost="no"
+    [ -n "$_rseries" ] && ho_host_process && _rhost="yes"
+    _rtitle=""
+    if [ -n "$3" ]; then
+        _rtitle=$3
+    elif [ "$6" != "yes" ] && [ -n "$5" ] && [ -n "$4" ]; then
+        _rtitle=$(ho_title_from_transcript "$4" "$5")
+    fi
+
+    # 1. PID の系列
+    if [ "$_rhost" = "yes" ] && [ -f "$_rr/series-pid-$HO_HOST_PID.json" ]; then
+        _rp="$_rr/series-pid-$HO_HOST_PID.json"
+        if ho_series_usable "$_rp" && ho_series_is_self "$_rp"; then
+            HO_SEL_PATH=$_rp
+            HO_SEL_VIA="pid"
+            return 0
+        fi
+    fi
+    # 2. 名前の系列（書いたプロセスが自分か、生きていない — 2回目レビュー N1）
+    if [ -n "$_rtitle" ]; then
+        _rh=$(ho_title_hash "$_rtitle")
+        _rp="$_rr/series-name-$_rh.json"
+        if [ "${#_rh}" -eq 64 ] && [ -f "$_rp" ] && ho_series_usable "$_rp"; then
+            _rmine="no"
+            ho_series_is_self "$_rp" && _rmine="yes"
+            if [ "$_rmine" = "yes" ] ||
+               [ "$(ho_proc_liveness "$(jq -r '.pid | floor | tostring' "$_rp")" "$(jq -r '.process_start_epoch | floor | tostring' "$_rp")")" = "dead" ]; then
+                HO_SEL_PATH=$_rp
+                HO_SEL_VIA="name"
+                HO_SEL_TITLE=$_rtitle
+                return 0
+            fi
+        fi
+    fi
+    # 3. latest.json（その資料の系列の書き手が、自分以外で生きている〔判定できないを含む〕なら使わない）
+    # 書き手の確認は、資料が検証に落ちる場合も先に行う（PS版と同一 — 実装レビュー1回目 High 2）
+    [ "$_rls" = "ok" ] || return 1
+    {
+        _rblock=$(printf '%s\n' "$_rseries" | while read -r _rf; do
+            [ -n "$_rf" ] || continue
+            [ "$(ho_json_str_field "$_rf" nonce)" = "$_rlnonce" ] || continue
+            ho_series_fields_ok "$_rf" || continue
+            ho_series_is_self "$_rf" && continue
+            _rlv=$(ho_proc_liveness "$(jq -r '.pid | floor | tostring' "$_rf")" "$(jq -r '.process_start_epoch | floor | tostring' "$_rf")")
+            [ "$_rlv" = "dead" ] || { printf 'block'; break; }
+        done)
+        [ -z "$_rblock" ] || return 1
+    }
+    HO_SEL_PATH=$_rlatest
+    HO_SEL_VIA="latest"
+    return 0
+}
+
+# 系列ポインタが使えるか（ho_resolve_pointer の中から呼ぶ。_rr / _rconsumed と NOW_FOR_POINTER を参照する）
+ho_series_usable() {
+    _ufn=${1##*/}
+    [ "$(ho_pointer_state "$1" "$_ufn" "$HO_SERIES_KNOWN_KEYS" "$NOW_FOR_POINTER")" = "ok" ] || return 1
+    if ! ho_series_fields_ok "$1"; then
+        ho_error "$HO_HANDOFF_ROOT" "restore" "${_ufn}の系列情報が不正です。ポインタを無効として扱いました"
+        return 1
+    fi
+    _un=$(ho_json_str_field "$1" nonce)
+    printf '%s\n' "$_rconsumed" | grep -qxF "$_un" && return 1
+    # latest.json より古い系列を飛ばす規則は採らない（PS版 Resolve-HoPointer のコメント参照）
+    ho_pointer_target_ok "$1" "$_rr"
+}
+
+# 系列ポインタの書き手が自分（HO_HOST_PID と起動時刻が±2秒）か
+ho_series_is_self() {
+    [ -n "${HO_HOST_PID:-}" ] || return 1
+    _sp=$(jq -r '.pid | floor | tostring' "$1" 2>/dev/null)
+    _ss=$(jq -r '.process_start_epoch | floor | tostring' "$1" 2>/dev/null)
+    [ "$_sp" = "$HO_HOST_PID" ] || return 1
+    case "$_ss" in ''|*[!0-9]*) return 1 ;; esac
+    _sd=$((_ss - HO_HOST_START))
+    [ "$_sd" -lt 0 ] && _sd=$((0 - _sd))
+    [ "$_sd" -le "$HO_PROC_START_TOLERANCE" ]
+}
+
+# 同じ nonce を持つすべてのポインタ（latest.json・系列）に消費を書く（I8）。各ファイルは書く直前に読み直し、
+# nonce が一致するときだけ書く（2回目レビュー N4）。$1=root $2=nonce $3=consumed_at
+ho_consume_pointers() {
+    { printf '%s\n' "$1/latest.json"; ho_series_paths "$1"; } | while read -r _cf; do
+        [ -f "$_cf" ] || continue
+        [ "$(ho_json_str_field "$_cf" nonce)" = "$2" ] || continue
+        jq --arg c "$3" '. + {consumed: true, consumed_at: $c}' "$_cf" 2>/dev/null | ho_write_atomic "$_cf"
+    done
 }

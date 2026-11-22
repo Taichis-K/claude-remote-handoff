@@ -13,6 +13,7 @@ $GIT_TIMEOUT_MS = 10000
 $GIT_MAX_BYTES = 2000000           # gitコマンド毎の出力上限（約2MB）
 $KEEP_GENERATIONS = 3               # セッション毎のバックアップ世代数
 $RETENTION_DAYS = 30                # セッションディレクトリ・孤児状態ファイルの保持日数
+$SERIES_RETENTION_DAYS = 7   # 系列ポインタ（series-*.json）の日数上限
 $MAX_TRANSCRIPT_BYTES = 200MB       # transcriptコピーの上限（超過時はコピーせず記録のみ）
 $MAX_TOTAL_BYTES = 500MB            # 全セッション横断の合計容量上限
 
@@ -127,14 +128,23 @@ try {
         }
     }
     # 4b. 全セッション横断の日数上限（更新が$RETENTION_DAYSを超えたセッションディレクトリを削除）
+    # 対象はセッション（UUID の名前）と、session_id が不正なときの退避先 unknown のディレクトリだけ
+    # （v0.2.3。それ以外の直下の物には触れない — 実装レビュー1回目 M6）
     $cutoff = (Get-Date).AddDays(-$RETENTION_DAYS)
-    Get-ChildItem -LiteralPath $handoffRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem -LiteralPath $handoffRoot -Directory -ErrorAction SilentlyContinue | Where-Object { (Test-Uuid $_.Name) -or (Test-OrdinalEqual $_.Name "unknown") } | ForEach-Object {
         $newest = Get-ChildItem -LiteralPath $_.FullName -Recurse -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
         if ($null -ne $newest -and $newest.LastWriteTime -lt $cutoff) {
             Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    # 4b2. 系列ポインタ（直下の series-*.json。v0.2.3）は7日で消す（読むときも7日を過ぎたものは使わない。
+    # セッション名と transcript のパスを含むので、セッションの日数上限まで残さない — 実装レビュー1回目 M5）
+    $seriesCutoff = (Get-Date).AddDays(-$SERIES_RETENTION_DAYS)
+    Get-ChildItem -LiteralPath $handoffRoot -Filter "series-*.json" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $seriesCutoff -and (Test-RegularFile $_.FullName) } | ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+        }
     # 4c. 孤児状態ファイルの掃除（自ツールのファイル名パターンに完全一致するもののみ）。
     # 対象ディレクトリはtranscript_pathが包含ゲートを通る場合のみ採用し（issue #33 —
     # 従来は任意ディレクトリを掃除対象にできた）、reparse point（symlink等）は削除しない
@@ -152,7 +162,7 @@ try {
     if ($null -ne $files) { $total = ($files | Measure-Object -Sum Length).Sum }
     if ($total -gt $MAX_TOTAL_BYTES) {
         $sessionDirs = Get-ChildItem -LiteralPath $handoffRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object { -not (Test-OrdinalEqual $_.Name $sessionId) } | Sort-Object LastWriteTime
+            Where-Object { ((Test-Uuid $_.Name) -or (Test-OrdinalEqual $_.Name "unknown")) -and -not (Test-OrdinalEqual $_.Name $sessionId) } | Sort-Object LastWriteTime
         foreach ($s in $sessionDirs) {
             if ($total -le $MAX_TOTAL_BYTES) { break }
             $sz = [long]0

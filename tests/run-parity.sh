@@ -3,9 +3,9 @@
 # run-parity.ps1 と同一ケース・同一出力形式。run-local-check.ps1 / .sh が両者の出力を
 # 期待値と照合して2系統一致を検証する（ローカル実行）
 # 使い方: sh run-parity.sh [作業ディレクトリ] [part]
-#   part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C94）。
+#   part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C96）。
 #   パートは独立した作業ディレクトリで並列に実行し、出力を1〜3の順に連結すると
-#   all と同じ94行になる（run-local-check.sh がそれを行い期待値と照合する）
+#   all と同じ96行になる（run-local-check.sh がそれを行い期待値と照合する）
 set -u
 
 tests_dir=$(cd "$(dirname "$0")" && pwd)
@@ -2291,6 +2291,154 @@ done91 "$sid94d" "$t94d" "nonce-t94d-00000000"
 { msg94 "C94-OUT"; fill94 2000; } >> "$t94d"
 out200094="no"; case "$(restore91 "$sid94d" "$t94d" compact)" in *"C94-OUT"*) out200094="yes" ;; esac
 printf 'C94 five=%s budget=%s in2000=%s out2000=%s clean=%s\n' "$five94" "$budget94" "$in200094" "$out200094" "$clean94"
+
+# C95: 系列ポインタ（v0.2.3。同一ワークスペースの複数セッション — 設計メモ 2026-11-21）。
+# 本体プロセスは HANDOFF_TEST_HOST（"<PID>:<起動時刻>" / "fail"）、生存は HANDOFF_TEST_LIVE で差し替える。
+#   cross: A（1001・alpha）→ B（1002・beta）の順に完成。両方生きている。A の /clear → A の資料（PID）、
+#          B の /clear → B の資料（PID）、A の2回目の /clear → 無い（消費済み）
+#   live:  C（1003）が完成。資料の無い D（1004）の /clear は、C が生きている／判定できない間は無い、終わっていれば latest.json
+#   name:  E（1005・gamma）が完成。別プロセス（1006）で同じ名前 gamma の /clear は、E が生きていれば無い、終わっていれば名前で
+#   fail:  G（1007）が完成。本体プロセスが取れない /clear は、G が生きていれば無い、終わっていれば latest.json
+#   stale: F（1008）が f1 を完成させた後、本体プロセスが取れないまま f2 を完成（PID の系列は f1 のまま古い）。
+#          F の /clear → 古い PID の系列は飛ばして latest.json の f2
+#   bad:   H（1009）が完成した後、PID の系列に未知のキーを足す。H の /clear → 系列は無効、latest.json（書き手は自分）で注入
+#   ret:   save の retention: 直下の UUID でないディレクトリは残し、古い系列ポインタは消す
+host95() { HANDOFF_TEST_HOST=$1; export HANDOFF_TEST_HOST; }
+live95() { HANDOFF_TEST_LIVE=$1; export HANDOFF_TEST_LIVE; }
+now95() { HANDOFF_TEST_NOW_EPOCH=$1; export HANDOFF_TEST_NOW_EPOCH; }
+done95() { # $1=sid $2=transcript $3=nonce $4=名前（空なら custom-title 行なし）
+    usage_transcript "$2" 250
+    [ -n "$4" ] && printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s"}\n' "$4" "$1" >> "$2"
+    soft_state90 "$2" "$3"
+    doc90 "$(dir91 "$1")/draft.md" "$3"
+    invoke_hook handoff-check.sh "$(stop_input "$1" "$2")" > /dev/null
+}
+clear95() { # $1=新しいsid $2=名前（空なら session_title なし）
+    invoke_hook handoff-restore.sh "$(jq -n --arg sid "$1" --arg tp "$troot/new95.jsonl" --arg cwd "$work/proj" --arg t "$2" \
+        '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "SessionStart", source: "clear"}
+         + (if $t == "" then {} else {session_title: $t} end)')"
+}
+cell95() { # $1=output $2..=「ラベル=nonce」。注入された資料のラベルと経路（pid / name / latest）
+    _o95=$(printf '%s' "$1" | tr -d '\r')
+    shift
+    _l95="none"
+    for _kv in "$@"; do
+        case "$_o95" in *"handoff-complete: ${_kv#*=} -->"*) _l95=${_kv%%=*} ;; esac
+    done
+    [ "$_l95" = "none" ] && { printf 'none'; return; }
+    case "$_o95" in
+        *"このウィンドウの直前のセッション"*) printf '%s/pid' "$_l95" ;;
+        *"同じ名前のセッション"*) printf '%s/name' "$_l95" ;;
+        *"latest.json経由"*) printf '%s/latest' "$_l95" ;;
+        *) printf '%s/other' "$_l95" ;;
+    esac
+}
+root95="$work/proj/.claude-handoff"
+rm -f "$root95/latest.json" "$root95"/series-*.json
+now95 1700000000
+host95 1001:1690000000; done95 "95959595-aaaa-0000-0000-000000000001" "$troot/t95a.jsonl" "nonce-t95a-00000000" alpha
+now95 1700000010
+host95 1002:1690000000; done95 "95959595-bbbb-0000-0000-000000000002" "$troot/t95b.jsonl" "nonce-t95b-00000000" beta
+now95 1700000100
+live95 "1001:alive,1002:alive"
+host95 1001:1690000000; xa95=$(cell95 "$(clear95 95959595-aaaa-1111-0000-000000000001 alpha)" a=nonce-t95a-00000000 b=nonce-t95b-00000000)
+host95 1002:1690000000; xb95=$(cell95 "$(clear95 95959595-bbbb-1111-0000-000000000002 beta)" a=nonce-t95a-00000000 b=nonce-t95b-00000000)
+host95 1001:1690000000; xa295=$(cell95 "$(clear95 95959595-aaaa-2222-0000-000000000001 alpha)" a=nonce-t95a-00000000 b=nonce-t95b-00000000)
+
+now95 1700000200
+host95 1003:1690000000; done95 "95959595-cccc-0000-0000-000000000003" "$troot/t95c.jsonl" "nonce-t95c-00000000" ""
+host95 1004:1690000000
+live95 "1003:alive"; l1_95=$(cell95 "$(clear95 95959595-dddd-1111-0000-000000000004 "")" c=nonce-t95c-00000000)
+live95 "1003:unknown"; l2_95=$(cell95 "$(clear95 95959595-dddd-2222-0000-000000000004 "")" c=nonce-t95c-00000000)
+live95 "1003:dead"; l3_95=$(cell95 "$(clear95 95959595-dddd-3333-0000-000000000004 "")" c=nonce-t95c-00000000)
+
+now95 1700000300
+host95 1005:1690000000; done95 "95959595-eeee-0000-0000-000000000005" "$troot/t95e.jsonl" "nonce-t95e-00000000" gamma
+host95 1006:1690000000
+live95 "1005:alive"; n1_95=$(cell95 "$(clear95 95959595-eeee-1111-0000-000000000006 gamma)" e=nonce-t95e-00000000)
+live95 "1005:dead"; n2_95=$(cell95 "$(clear95 95959595-eeee-2222-0000-000000000006 gamma)" e=nonce-t95e-00000000)
+
+now95 1700000400
+host95 1007:1690000000; done95 "95959595-1111-0000-0000-000000000007" "$troot/t95g.jsonl" "nonce-t95g-00000000" ""
+host95 fail
+live95 "1007:alive"; f1_95=$(cell95 "$(clear95 95959595-1111-1111-0000-000000000007 "")" g=nonce-t95g-00000000)
+live95 "1007:dead"; f2_95=$(cell95 "$(clear95 95959595-1111-2222-0000-000000000007 "")" g=nonce-t95g-00000000)
+
+now95 1700000500
+host95 1008:1690000000; done95 "95959595-2222-0000-0000-000000000008" "$troot/t95f.jsonl" "nonce-t95f-00000001" ""
+now95 1700000510
+host95 fail; done95 "95959595-2222-0000-0000-000000000008" "$troot/t95f.jsonl" "nonce-t95f-00000002" ""
+now95 1700000520
+live95 "1008:alive"
+host95 1008:1690000000; st95=$(cell95 "$(clear95 95959595-2222-1111-0000-000000000008 "")" f1=nonce-t95f-00000001 f2=nonce-t95f-00000002)
+
+now95 1700000600
+host95 1009:1690000000; done95 "95959595-3333-0000-0000-000000000009" "$troot/t95h.jsonl" "nonce-t95h-00000000" ""
+jq '. + {extra: 1}' "$root95/series-pid-1009.json" > "$root95/series-pid-1009.json.tmp" && mv -f "$root95/series-pid-1009.json.tmp" "$root95/series-pid-1009.json"
+live95 "1009:alive"
+bd95=$(cell95 "$(clear95 95959595-3333-1111-0000-000000000009 "")" h=nonce-t95h-00000000)
+
+mkdir -p "$root95/keep95"
+printf 'x' > "$root95/keep95/x.txt"
+printf '{}' > "$root95/series-pid-1999.json"
+touch -t 202001010000 "$root95/keep95/x.txt" "$root95/keep95" "$root95/series-pid-1999.json"
+invoke_hook handoff-save.sh "$(jq -n --arg sid "95959595-4444-0000-0000-00000000000a" --arg tp "$troot/t95a.jsonl" --arg cwd "$work/proj" \
+    '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "PreCompact", trigger: "auto"}')" > /dev/null
+ret95="kept"; [ -d "$root95/keep95" ] || ret95="deleted"
+[ -f "$root95/series-pid-1999.json" ] && ret95="$ret95/left" || ret95="$ret95/gone"
+unset HANDOFF_TEST_HOST HANDOFF_TEST_LIVE HANDOFF_TEST_NOW_EPOCH
+printf 'C95 cross=%s,%s,%s live=%s,%s,%s name=%s,%s fail=%s,%s stale=%s bad=%s ret=%s\n' \
+    "$xa95" "$xb95" "$xa295" "$l1_95" "$l2_95" "$l3_95" "$n1_95" "$n2_95" "$f1_95" "$f2_95" "$st95" "$bd95" "$ret95"
+
+# C96: 系列ポインタの境界（実装レビュー1回目の指摘）。
+#   dtgt:   W（2001）の資料を完成後に書き換え（SHA 不一致）。W が生きている間の別プロセス（2002）の /clear は何も出さない
+#           （警告・引用・バックアップ導線も出さない）、W が終わっていれば従来どおり検証失敗の警告（refused）
+#   pidmax: PID が上限（2147483647）を超える系列は不正として無視し、latest.json を使う（PS と sh で判定を分けない）
+#   many:   系列ファイルが上限（64）を超えたらポインタから注入しない（error.log に記録）。7日を過ぎたファイルは数えない
+#   name:   名前で引いたとき、注入文に名前を出さない
+rm -f "$root95/latest.json" "$root95"/series-*.json
+now95 1700001000
+host95 2001:1690000000; done95 "96969696-1111-0000-0000-000000000001" "$troot/t96w.jsonl" "nonce-t96w-00000000" ""
+printf '%s\n' 'tampered' >> "$(dir91 96969696-1111-0000-0000-000000000001)/current.md"
+host95 2002:1690000000
+live95 "2001:alive"; d1_96=$(out_kind "$(clear95 96969696-1111-1111-0000-000000000002 "")")
+live95 "2001:dead"; d2_96=$(out_kind "$(clear95 96969696-1111-2222-0000-000000000002 "")")
+
+rm -f "$root95/latest.json" "$root95"/series-*.json
+now95 1700001100
+host95 2003:1690000000; done95 "96969696-2222-0000-0000-000000000003" "$troot/t96p.jsonl" "nonce-t96p-00000000" ""
+jq '. + {pid: 2147483648, series_key: "pid:2147483648"}' "$root95/series-pid-2003.json" > "$root95/series-pid-2147483648.json"
+rm -f "$root95/series-pid-2003.json"
+live95 "2147483648:alive"
+host95 2004:1690000000; pm96=$(out_kind "$(clear95 96969696-2222-1111-0000-000000000004 "")")
+
+rm -f "$root95/latest.json" "$root95"/series-*.json
+now95 1700001200
+host95 2005:1690000000; done95 "96969696-3333-0000-0000-000000000005" "$troot/t96m.jsonl" "nonce-t96m-00000000" ""
+k96=0
+while [ "$k96" -lt 64 ]; do
+    printf '{}' > "$root95/series-name-$(printf '%064d' "$k96").json"
+    k96=$((k96 + 1))
+done
+live95 "2005:dead"
+host95 2006:1690000000
+before96=$(grep -c '系列ポインタが多すぎます' "$root95/error.log" 2>/dev/null)
+mn96=$(out_kind "$(clear95 96969696-3333-1111-0000-000000000006 "")")
+after96=$(grep -c '系列ポインタが多すぎます' "$root95/error.log" 2>/dev/null)
+mn96="$mn96/$(( ${after96:-0} - ${before96:-0} ))"
+# 7日を過ぎた系列ファイルは数に入れない（PreCompact が走らなくても溜まって止まらない — 実装レビュー2回目 H1）
+touch -t 202001010000 "$root95"/series-name-0*.json
+mn96="$mn96,$(out_kind "$(clear95 96969696-3333-2222-0000-000000000006 "")")"
+
+rm -f "$root95/latest.json" "$root95"/series-*.json
+now95 1700001300
+host95 2007:1690000000; done95 "96969696-4444-0000-0000-000000000007" "$troot/t96n.jsonl" "nonce-t96n-00000000" "delta-name96"
+live95 "2007:dead"
+host95 2008:1690000000; o96=$(clear95 96969696-4444-1111-0000-000000000008 "delta-name96" | tr -d '\r')
+nm96="show"
+case "$o96" in *"delta-name96"*) ;; *"同じ名前の前のセッション"*) nm96="noshow" ;; *) nm96="other" ;; esac
+unset HANDOFF_TEST_HOST HANDOFF_TEST_LIVE HANDOFF_TEST_NOW_EPOCH
+printf 'C96 dtgt=%s,%s pidmax=%s many=%s name=%s\n' "$d1_96" "$d2_96" "$pm96" "$mn96" "$nm96"
 fi
 
 # KEEP_WORK=1 で作業ディレクトリを残す（失敗ケースの成果物調査用。issue #16）

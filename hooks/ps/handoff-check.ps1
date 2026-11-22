@@ -391,6 +391,9 @@ try {
                 size            = (Get-Item -LiteralPath $handoffMd).Length
             }
             Write-FileAtomic -Path (Join-Path $handoffRoot "latest.json") -Content ($pointer | ConvertTo-Json)
+            # 系列ポインタ（v0.2.3。本体プロセスの PID とセッション名を鍵にした同じ内容のポインタ。
+            # /clear 後に「このウィンドウの直前の資料」を引くため — 設計メモ 2026-11-21）。失敗しても latest.json は書けている
+            try { Write-HoSeriesPointers -HandoffRoot $handoffRoot -Pointer $pointer -TranscriptPath $transcript -SessionId $sessionId } catch { }
             Write-FileAtomic -Path $statePath -Content ((New-CompletedState -State $state -TranscriptPath $transcript -Epoch $ue -Sha $sha) | ConvertTo-Json)
             exit 0
         }

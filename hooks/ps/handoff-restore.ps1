@@ -5,7 +5,8 @@
 #
 # handoff解決（codex敵対的レビュー1回目の反映）:
 #  - compact: 自session_idの直接参照を最優先（並行セッションのポインタ誤注入を回避）
-#  - clear: ポインタ latest.json（session_idが変わるため）。ただし
+#  - clear: ポインタ（session_idが変わるため）。v0.2.3 から、本体プロセスの PID とセッション名を鍵にした
+#    系列ポインタを先に見て、latest.json は最後（設計メモ docs/design/2026-11-21-multi-session-keys.md）。ただし
 #    * ポインタ内のパスは信用せず、検証済みUUIDのsession_idからroot配下にパスを再構築する
 #    * 完了検証（nonceマーカー+構造）+ SHA-256照合を必須ゲートとし、
 #      失敗時はcurrent.mdの内容を一切注入しない（警告と導線のみ）
@@ -55,110 +56,46 @@ try {
     }
 
     # --- 1. ポインタ読込み（スキーマ・鮮度・消費済みを検証） ---
-    $pointer = $null
+    # latest.json は経路によらず常に検証する（compact で自セッションを直接参照するときも、ポインタが自セッションの
+    # ものなら SHA-256 照合に使うため）。検証の判定と診断は Get-HoPointerState（従来の直書きを関数にしたもの）
+    $nowEpoch = Get-HoNowEpoch
     $latestPath = Join-Path $handoffRoot "latest.json"
-    if (Test-Path -LiteralPath $latestPath) {
-        try { $pointer = ConvertFrom-JsonPreserve (Get-Content -LiteralPath $latestPath -Raw -Encoding UTF8) } catch { $pointer = $null }
-        # ルートがobject以外（配列・スカラー）は無効（jqのtype=="object"検証と同一契約 — 罠8。
-        # 非objectは診断なしの静かな無効: sh版のnotobj分岐と同一。またPSObject.Propertiesが
-        # 型固有プロパティ（string.Length等）を列挙して未知キー誤検出するため先に落とす）
-        if (-not ($pointer -is [System.Management.Automation.PSCustomObject])) { $pointer = $null }
+    $latestObj = Read-HoPointerObject $latestPath
+    $latestState = "bad"
+    if ($null -ne $latestObj) {
+        $latestState = Get-HoPointerState $latestObj "latest.json" $HO_POINTER_KNOWN_KEYS $handoffRoot $nowEpoch
     }
-    if ($null -ne $pointer) {
-        # session_id（UUID）とnonceの形式検証。パスはポインタから採らない
-        $ok = $true
-        # 閉じたスキーマ（issue #38 — 設計文書4.2）: 既知キー以外が1つでもあればファイル無効。
-        # schema_versionは必須の整数1（欠落=旧形式 / 不一致=未知の形式でログ文言を区別 —
-        # 旧producerのポインタは次のhandoffサイクルで再生成される）。判定はjqの
-        # `.schema_version == 1`（数値比較）と同一契約: 数値型のみ受理しdoubleへ正規化して比較
-        if (-not (Test-HoOnlyKnownKeys $pointer $HO_POINTER_KNOWN_KEYS)) {
-            $ok = $false
-            Write-HandoffError $handoffRoot "restore" "latest.jsonに未知のキーがあります。ポインタを無効として扱いました"
-        }
-        if ($ok) {
-            if (-not (Test-HoProp $pointer "schema_version")) {
-                $ok = $false
-                Write-HandoffError $handoffRoot "restore" "latest.jsonにschema_versionがありません（旧形式のポインタ）。ポインタを無効として扱いました"
-            } else {
-                $sv = $pointer.schema_version
-                $svOk = (($sv -is [int]) -or ($sv -is [long]) -or ($sv -is [double]) -or ($sv -is [decimal])) -and
-                    (([double]$sv) -eq 1)
-                if (-not $svOk) {
-                    $ok = $false
-                    Write-HandoffError $handoffRoot "restore" "latest.jsonのschema_versionが1ではありません（未知の形式）。ポインタを無効として扱いました"
-                }
-            }
-        }
-        if ($ok -and ((-not (Test-HoProp $pointer "session_id")) -or -not (Test-Uuid $pointer.session_id))) { $ok = $false }
-        if ($ok -and (-not (Test-HoProp $pointer "nonce") -or
-            -not ($pointer.nonce -is [string]) -or $pointer.nonce -cnotmatch '^[A-Za-z0-9-]{8,64}$')) { $ok = $false }
-        # 消費済みポインタは使わない（古いhandoffの無期限再生を防ぐ）。dual-read（issue #34 —
-        # 設計文書4.2）: consumed == true または consumed_at が非空文字列 なら消費済み。
-        # consumedは存在するならbooleanのみ許可（型固定 — 罠8。"true"等の文字列縮退で
-        # sh版jqと受否が分裂しないよう、非booleanはポインタごと無効にする）
-        if ($ok -and (Test-HoProp $pointer "consumed")) {
-            if (-not ($pointer.consumed -is [bool]) -or $pointer.consumed) { $ok = $false }
-        }
-        # consumed_atで許可するのは欠落・null・空文字列のみで型も固定する（配列[""]等はPSの
-        # 文字列縮退で未消費扱いになり、ポインタごと拒否するsh版jqと分裂する — 罠8）
-        if ($ok -and (Test-HoProp $pointer "consumed_at") -and $null -ne $pointer.consumed_at) {
-            if (-not ($pointer.consumed_at -is [string]) -or $pointer.consumed_at.Length -gt 0) { $ok = $false }
-        }
-        # 有効期限。鮮度判定の唯一の正はupdated_epoch＝UNIX秒の整数（issue #34 — 挙動変更）。
-        # 人間可読日時のパース（TryParseExact/date）は判定経路から排除し、updated_atは表示専用。
-        # 契約: 数値型かつ整数値・0 < v・v ≤ now+86400（未来skew上限1日）・now-v ≤ 7日。
-        # 旧producerのポインタ（updated_epochなし）はfail-closed → 次サイクルで再生成される。
-        # 整数値判定はjqの `. == floor` と同一契約: 型はJSONパーサ依存（int/long/double/decimal）
-        # のため整数値の数値のみ受理し、文字列・配列等は拒否。比較はPSの数値昇格に任せる
-        # （範囲検証が2^53超のdoubleを先に落とすので[long]キャストによるオーバーフローはない）
-        if ($ok) {
-            $nowEpoch = Get-HoNowEpoch
-            if ($null -eq $nowEpoch) {
-                # nowを取得できなければ鮮度を判定できない（fail-closed。sh版と同一契約）
-                $ok = $false
-                Write-HandoffError $handoffRoot "restore" "現在時刻(epoch)を取得できないため鮮度判定できません。ポインタを無効として扱いました"
-            } else {
-                $epochState = "bad"
-                if ((Test-HoProp $pointer "updated_epoch")) {
-                    $v = $pointer.updated_epoch
-                    if (($v -is [int]) -or ($v -is [long]) -or ($v -is [double]) -or ($v -is [decimal])) {
-                        # jq互換: パーサ表現によらずdoubleへ正規化してから整数値判定・範囲比較する
-                        # （PS 5.1のdecimalはsub-ULP小数を保持し、doubleへ丸めるpwsh/jqと受否が
-                        # 分裂する — レビュー1回目 M2。契約は「double化された値が整数」）
-                        $d = [double]$v
-                        if (($d -eq [math]::Truncate($d)) -and ($d -gt 0) -and
-                            ($d -le ($nowEpoch + $POINTER_FUTURE_SKEW_SEC))) {
-                            # 契約内の値: 期限超過のみ静かに無効（毎回の復元でerror.logを
-                            # 埋めない — 旧updated_at時代の期限切れと同じ扱い）
-                            if (($nowEpoch - $d) -le ($POINTER_MAX_AGE_DAYS * 86400)) { $epochState = "ok" }
-                            else { $epochState = "expired" }
-                        }
-                    }
-                }
-                if ($epochState -ne "ok") {
-                    $ok = $false
-                    if ($epochState -eq "bad") {
-                        Write-HandoffError $handoffRoot "restore" "latest.jsonのupdated_epochが無いか不正です。ポインタを無効として扱いました"
-                    }
-                }
-            }
-        }
-        if (-not $ok) { $pointer = $null }
-    }
+    $pointer = $null
+    if ($latestState -eq "ok") { $pointer = $latestObj }
 
-    # --- 2. handoff解決: compactは自session直接参照を最優先、clearはポインタ ---
+    # --- 2. handoff解決: compactは自session直接参照を最優先、clear（と compact で自セッションに資料が無いとき）は
+    #        系列ポインタと latest.json から決める（v0.2.3。設計メモ docs/design/2026-11-21-multi-session-keys.md 5-4） ---
     $resolvedSessionId = $null   # current.md/バックアップ導線を読むセッション
     $handoffOrigin = ""
     $usePointer = $false
+    $pointerVia = ""
+    $pointerTitle = $null
     # 自セッションに下書き（draft.md）だけがある場合も自セッションに解決する（v0.2.1。初回サイクルで書いている途中・
     # 検証NG・打ち切り。HEAD は書きかけの current.md があったので自セッションに解決していた。広げないと
     # 自セッションのバックアップ導線が消え、別セッションの資料を代わりに注入してしまう — 設計メモ 2026-09-13 S8。sh版と同一）
     $ownDraft = ($null -ne $ownSessionId) -and (Test-Path -LiteralPath (Join-Path $handoffRoot "$ownSessionId/draft.md") -PathType Leaf)
+    $sel = $null
     if (-not (Test-OrdinalEqual $source "clear") -and $null -ne $ownSessionId -and
         ((Test-Path -LiteralPath (Join-Path $handoffRoot "$ownSessionId/current.md")) -or $ownDraft)) {
         $resolvedSessionId = $ownSessionId
         $handoffOrigin = "セッションディレクトリ直接参照（$ownSessionId）"
-    } elseif ($null -ne $pointer) {
+    } else {
+        $inTitle = $null
+        if (Test-HoProp $inp "session_title") { $inTitle = $inp.session_title }
+        $inTranscript = ""
+        if ((Test-HoProp $inp "transcript_path") -and ($inp.transcript_path -is [string])) { $inTranscript = $inp.transcript_path }
+        $sel = Resolve-HoPointer -HandoffRoot $handoffRoot -LatestObj $latestObj -LatestState $latestState -InputTitle $inTitle `
+            -TranscriptPath $inTranscript -OwnSessionId $ownSessionId -IsClear (Test-OrdinalEqual $source "clear") -NowEpoch $nowEpoch
+    }
+    if ($null -ne $sel) {
+        $pointer = $sel.pointer
+        $pointerVia = $sel.via
+        $pointerTitle = $sel.title
         $resolvedSessionId = $pointer.session_id
         $usePointer = $true
         # updated_atは非信頼の表示値（鮮度検証から外れた — issue #34）。producer形式の
@@ -168,11 +105,17 @@ try {
         # ため、^/$ では改行入り値が一致・混入する（レビュー2回目 H1）
         $updDisp = "?"
         if ((Test-HoProp $pointer "updated_at") -and ($pointer.updated_at -is [string]) -and
-            $pointer.updated_at -cmatch '\A[1-9][0-9]{3}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([+-]((0[0-9]|1[0-3]):?[0-5][0-9]|14:?00)|[Zz])\z') {
+            $pointer.updated_at -cmatch $HO_UPDATED_AT_PATTERN) {
             $updDisp = $pointer.updated_at
         }
-        $handoffOrigin = "latest.json経由（作成セッション: $($pointer.session_id) / 更新: $updDisp）"
-    } elseif ($null -ne $ownSessionId -and
+        if ($pointerVia -eq "pid") {
+            $handoffOrigin = "このウィンドウの直前のセッション（作成セッション: $($pointer.session_id) / 更新: $updDisp）"
+        } elseif ($pointerVia -eq "name") {
+            $handoffOrigin = "同じ名前のセッション（作成セッション: $($pointer.session_id) / 更新: $updDisp）"
+        } else {
+            $handoffOrigin = "latest.json経由（作成セッション: $($pointer.session_id) / 更新: $updDisp）"
+        }
+    } elseif ($null -eq $resolvedSessionId -and $null -ne $ownSessionId -and
         (Test-Path -LiteralPath (Join-Path $handoffRoot "$ownSessionId/current.md"))) {
         # clearでポインタ不在でも、稀にsession_idが維持される環境に備えたフォールバック
         $resolvedSessionId = $ownSessionId
@@ -289,8 +232,16 @@ try {
 
     # ポインタ経由で自分以外のセッションの資料を注入する場合は冒頭で明示する
     # （同一プロジェクトで複数セッションを並行させると他セッションの資料が来得る。issue #19）
+    # 系列ポインタ経由（v0.2.3）は、どの経路で引いたかを出す（このウィンドウの直前のセッションか、同じ名前のセッションか）
     if ($usePointer -and ($null -eq $ownSessionId -or -not (Test-OrdinalEqual ([string]$pointer.session_id) ([string]$ownSessionId)))) {
-        $sections.Add("※ この資料は別セッション（$($pointer.session_id)）で作成されたものです。同一プロジェクトで複数のセッションを併用している場合は、現在の作業に対応する内容か確認してから使うこと。")
+        if ($pointerVia -eq "pid") {
+            $sections.Add("※ この資料は、このウィンドウの直前のセッション（$($pointer.session_id)）で作成されたものです。")
+        } elseif ($pointerVia -eq "name") {
+            # 名前は注入文に出さない（利用者の入力で、Unicode の改行・書式制御文字を含み得る — 実装レビュー1回目 M7）
+            $sections.Add("※ この資料は、同じ名前の前のセッション（$($pointer.session_id)）で作成されたものです。現在の作業に対応する内容か確認してから使うこと。")
+        } else {
+            $sections.Add("※ この資料は別セッション（$($pointer.session_id)）で作成されたものです。同一プロジェクトで複数のセッションを併用している場合は、現在の作業に対応する内容か確認してから使うこと。")
+        }
     }
 
     # --- 4.5 資料の鮮度（v0.2.1。ゲートを通過した資料についてのみ） ---
@@ -522,9 +473,11 @@ try {
     if ($final.Length -gt $TOTAL_MAX) { $final = $final.Substring(0, $TOTAL_MAX) }
     Write-Output $final
 
-    # --- 10. ポインタの消費マーク（clearでポインタ経由の注入をした場合のみ）。
-    #         dual-write（issue #34 — 設計文書4.2）: consumed=true と非空consumed_atを
-    #         同一のatomic更新で書く（旧consumerはconsumed_atのみ読むため両方必要） ---
+    # --- 10. ポインタの消費マーク（clearでポインタ経由の注入をした場合のみ。compact のポインタ経由は従来どおり
+    #         消費しない）。v0.2.3 から、同じ nonce を持つすべてのポインタ（latest.json・系列）に書く
+    #         （設計メモ 2026-11-21 I8。どれか1つでも消費済みなら消費済みと読むので、/clear で渡した資料が
+    #         別の鍵や旧版の経路から再注入されない）。dual-write（issue #34 — 設計文書4.2）: consumed=true と
+    #         非空consumed_atを同一のatomic更新で書く（旧consumerはconsumed_atのみ読むため両方必要） ---
     if ($usePointer -and (Test-OrdinalEqual $source "clear") -and $gatePassed) {
         try {
             # consumed_atは必ず非空にする（日時取得失敗で空を書くと旧consumerが未消費と
@@ -532,9 +485,7 @@ try {
             # now（ポインタ経路ではepoch検証で取得済み）のepoch表記へフォールバック
             $cAt = Get-HoNowDisplay
             if (($null -eq $cAt) -or ($cAt.Length -eq 0)) { $cAt = "epoch:$nowEpoch" }
-            $pointer | Add-Member -NotePropertyName "consumed" -NotePropertyValue $true -Force
-            $pointer | Add-Member -NotePropertyName "consumed_at" -NotePropertyValue $cAt -Force
-            Write-FileAtomic -Path $latestPath -Content ($pointer | ConvertTo-Json)
+            Set-HoPointersConsumed -HandoffRoot $handoffRoot -Nonce ([string]$pointer.nonce) -ConsumedAt $cAt
         } catch { }
     }
 

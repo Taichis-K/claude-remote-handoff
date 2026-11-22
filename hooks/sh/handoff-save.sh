@@ -8,6 +8,7 @@ GIT_TIMEOUT_SEC=10
 GIT_MAX_BYTES=2000000
 KEEP_GENERATIONS=3
 RETENTION_DAYS=30
+SERIES_RETENTION_DAYS=7     # 系列ポインタ（series-*.json）の日数上限
 MAX_TRANSCRIPT_BYTES=209715200   # 200MB
 MAX_TOTAL_BYTES=524288000        # 500MB
 
@@ -91,12 +92,18 @@ main() {
         [ -n "$g" ] && rm -rf "$backup_root/$g" 2>/dev/null
     done
 
-    # 4b. 日数上限（最終更新が古いセッションディレクトリを削除）
+    # 4b. 日数上限（最終更新が古いセッションディレクトリを削除）。対象はセッション（UUID の名前）の
+    # ディレクトリだけ（v0.2.3。それ以外の直下の物には触れない — PS版と同一）
     for d in "$handoff_root"/*/; do
         [ -d "$d" ] || continue
+        _dn=${d%/}; _dn=${_dn##*/}
+        ho_is_uuid "$_dn" || [ "$_dn" = "unknown" ] || continue
         newest=$(find "$d" -type f -mtime -"$RETENTION_DAYS" 2>/dev/null | head -n 1)
         [ -z "$newest" ] && rm -rf "$d" 2>/dev/null
     done
+
+    # 4b2. 系列ポインタ（直下の series-*.json。v0.2.3）は7日で消す（PS版と同一。-mtime +6 は「7日以上前」）
+    find "$handoff_root" -maxdepth 1 -name "series-*.json" -type f -mtime +"$((SERIES_RETENTION_DAYS - 1))" -exec rm -f {} \; 2>/dev/null
 
     # 4c. 孤児状態ファイルの掃除（自ツールのパターンに完全一致するもののみ）。
     # 対象ディレクトリはtranscript_pathが包含ゲートを通る場合のみ採用する（issue #33 —
@@ -112,6 +119,7 @@ main() {
     if [ -n "$total" ] && [ "$total" -gt "$MAX_TOTAL_BYTES" ] 2>/dev/null; then
         ls -1tr "$handoff_root" 2>/dev/null | while read -r d; do
             [ -d "$handoff_root/$d" ] || continue
+            ho_is_uuid "$d" || [ "$d" = "unknown" ] || continue
             [ "$d" = "$session_id" ] && continue
             total2=$(du -sk "$handoff_root" 2>/dev/null | awk '{print $1 * 1024}')
             [ "$total2" -le "$MAX_TOTAL_BYTES" ] 2>/dev/null && break

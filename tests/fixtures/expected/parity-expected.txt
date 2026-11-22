@@ -92,3 +92,5 @@ C91 s1=yes/deleted/yes/old+full s2=old+full/old+full/old+full s4=old+full/old+fu
 C92 lt1=yes m59=yes h1=yes past=empty shrink=empty zero=empty huge=empty big=yes compact=yes clear=yes
 C93 big=222 span=444 in500=556 out500=0 crlf=666 nolf=777 esc=999 part=998 none=0 edge=4242 uesc=13
 C94 five=yes budget=3 in2000=yes out2000=no clean=yes
+C95 cross=a/pid,b/pid,none live=none,none,c/latest name=none,e/name fail=none,g/latest stale=f2/latest bad=h/latest ret=kept/gone
+C96 dtgt=none,refused pidmax=injected many=none/1,injected name=noshow

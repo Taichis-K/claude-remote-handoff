@@ -329,12 +329,20 @@ main() {
             size=$(wc -c < "$handoff_md" | tr -d '[:space:]')
             # updated_at/handoff_path/sizeは表示・移行用の併記（additive — 設計文書5章）
             ua=$(ho_now_display) || ua=""
-            jq -n --arg sid "$session_id" --arg hp "$handoff_md" --arg n "$s_nonce" \
+            ptr_json=$(jq -n --arg sid "$session_id" --arg hp "$handoff_md" --arg n "$s_nonce" \
                   --arg tp "$transcript" --argjson ue "$ue" --arg ua "$ua" \
                   --arg sha "$sha" --argjson sz "$size" \
                 '{schema_version: 1, session_id: $sid, handoff_path: $hp, nonce: $n, transcript_path: $tp,
-                  updated_epoch: $ue, updated_at: $ua, consumed: false, sha256: $sha, size: $sz}' \
-                | ho_write_atomic "$handoff_root/latest.json"
+                  updated_epoch: $ue, updated_at: $ua, consumed: false, sha256: $sha, size: $sz}')
+            # 系列ポインタ（v0.2.3。本体プロセスの PID とセッション名を鍵にした同じ内容のポインタ。
+            # /clear 後に「このウィンドウの直前の資料」を引くため — 設計メモ 2026-11-21）は、latest.json を書けたときだけ、
+            # 同じ内容から書く（書けなかったのに残っている古い latest.json を自分の系列として書かない — 実装レビュー1回目 High 1。
+            # PS版は書き込みの失敗が例外になり、系列へ進まない）
+            if [ -n "$ptr_json" ] && printf '%s\n' "$ptr_json" | ho_write_atomic "$handoff_root/latest.json"; then
+                ho_write_series_pointers "$handoff_root" "$ptr_json" "$transcript" "$session_id"
+            else
+                ho_error "$handoff_root" "handoff-check" "ポインタ(latest.json)を書けませんでした（session=${session_id}）"
+            fi
             write_completed_state "$state_path" "$s_mode" "$s_nonce" "$s_attempts" "$ue" "$sha"
             exit 0
         fi

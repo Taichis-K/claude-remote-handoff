@@ -3,9 +3,9 @@
 # 期待値と照合して2系統一致を検証する（ローカル実行）
 # 出力形式: "C<番号> <key>=<value> ..."（1ケース1行）
 # 使い方: -WorkDir <作業ディレクトリ> -Part <all|1|2|3>
-#   Part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C94）。
+#   Part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C96）。
 #   パートは独立した作業ディレクトリで並列に実行し、出力を1〜3の順に連結すると
-#   all と同じ94行になる（run-local-check.ps1 がそれを行い期待値と照合する）
+#   all と同じ96行になる（run-local-check.ps1 がそれを行い期待値と照合する）
 param([string]$WorkDir = "", [string]$Part = "all")
 
 $ErrorActionPreference = "Stop"
@@ -2362,6 +2362,150 @@ Add-T94 $t94d ((Get-Msg94 "C94-OUT") + ($fill94 * 2000))
 $out200094 = "no"
 if ((Invoke-Restore91 $sid94d $t94d "compact").Contains("C94-OUT")) { $out200094 = "yes" }
 Write-Output "C94 five=$five94 budget=$budget94 in2000=$in200094 out2000=$out200094 clean=$clean94"
+
+# C95: 系列ポインタ（v0.2.3。同一ワークスペースの複数セッション — 設計メモ 2026-11-21）。ケースの説明は sh 版の C95 参照
+function Complete-Soft95([string]$Sid, [string]$Transcript, [string]$Nonce, [string]$Title) {
+    New-UsageTranscript $Transcript 250
+    if ($Title.Length -gt 0) {
+        Add-Content -LiteralPath $Transcript -Value ('{"type":"custom-title","customTitle":"' + $Title + '","sessionId":"' + $Sid + '"}') -Encoding UTF8
+    }
+    New-SoftState90 $Transcript $Nonce
+    Write-Doc90 "$(Get-Dir91 $Sid)/draft.md" $Nonce
+    Invoke-Stop90 $Sid $Transcript | Out-Null
+}
+function Invoke-Clear95([string]$Sid, [string]$Title) {
+    $in = @{ session_id = $Sid; transcript_path = "$tRoot/new95.jsonl"; cwd = "$WorkDir/proj"; hook_event_name = "SessionStart"; source = "clear" }
+    if ($Title.Length -gt 0) { $in["session_title"] = $Title }
+    return Invoke-Hook "handoff-restore.ps1" $in
+}
+function Get-Cell95([string]$Out, [string[]]$Pairs) {
+    $o = $Out.Replace("`r", "")
+    $label = "none"
+    foreach ($kv in $Pairs) {
+        $k = $kv.Substring(0, $kv.IndexOf("="))
+        $v = $kv.Substring($kv.IndexOf("=") + 1)
+        if ($o.Contains("handoff-complete: $v -->")) { $label = $k }
+    }
+    if ($label -eq "none") { return "none" }
+    if ($o.Contains("このウィンドウの直前のセッション")) { return "$label/pid" }
+    if ($o.Contains("同じ名前のセッション")) { return "$label/name" }
+    if ($o.Contains("latest.json経由")) { return "$label/latest" }
+    return "$label/other"
+}
+$root95 = "$WorkDir/proj/.claude-handoff"
+Remove-Item -LiteralPath "$root95/latest.json" -Force -ErrorAction SilentlyContinue
+Get-ChildItem -LiteralPath $root95 -Filter "series-*.json" -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+$ab95 = @("a=nonce-t95a-00000000", "b=nonce-t95b-00000000")
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000000"
+$env:HANDOFF_TEST_HOST = "1001:1690000000"; Complete-Soft95 "95959595-aaaa-0000-0000-000000000001" "$tRoot/t95a.jsonl" "nonce-t95a-00000000" "alpha"
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000010"
+$env:HANDOFF_TEST_HOST = "1002:1690000000"; Complete-Soft95 "95959595-bbbb-0000-0000-000000000002" "$tRoot/t95b.jsonl" "nonce-t95b-00000000" "beta"
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000100"
+$env:HANDOFF_TEST_LIVE = "1001:alive,1002:alive"
+$env:HANDOFF_TEST_HOST = "1001:1690000000"; $xa95 = Get-Cell95 (Invoke-Clear95 "95959595-aaaa-1111-0000-000000000001" "alpha") $ab95
+$env:HANDOFF_TEST_HOST = "1002:1690000000"; $xb95 = Get-Cell95 (Invoke-Clear95 "95959595-bbbb-1111-0000-000000000002" "beta") $ab95
+$env:HANDOFF_TEST_HOST = "1001:1690000000"; $xa295 = Get-Cell95 (Invoke-Clear95 "95959595-aaaa-2222-0000-000000000001" "alpha") $ab95
+
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000200"
+$env:HANDOFF_TEST_HOST = "1003:1690000000"; Complete-Soft95 "95959595-cccc-0000-0000-000000000003" "$tRoot/t95c.jsonl" "nonce-t95c-00000000" ""
+$env:HANDOFF_TEST_HOST = "1004:1690000000"
+$env:HANDOFF_TEST_LIVE = "1003:alive"; $l1_95 = Get-Cell95 (Invoke-Clear95 "95959595-dddd-1111-0000-000000000004" "") @("c=nonce-t95c-00000000")
+$env:HANDOFF_TEST_LIVE = "1003:unknown"; $l2_95 = Get-Cell95 (Invoke-Clear95 "95959595-dddd-2222-0000-000000000004" "") @("c=nonce-t95c-00000000")
+$env:HANDOFF_TEST_LIVE = "1003:dead"; $l3_95 = Get-Cell95 (Invoke-Clear95 "95959595-dddd-3333-0000-000000000004" "") @("c=nonce-t95c-00000000")
+
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000300"
+$env:HANDOFF_TEST_HOST = "1005:1690000000"; Complete-Soft95 "95959595-eeee-0000-0000-000000000005" "$tRoot/t95e.jsonl" "nonce-t95e-00000000" "gamma"
+$env:HANDOFF_TEST_HOST = "1006:1690000000"
+$env:HANDOFF_TEST_LIVE = "1005:alive"; $n1_95 = Get-Cell95 (Invoke-Clear95 "95959595-eeee-1111-0000-000000000006" "gamma") @("e=nonce-t95e-00000000")
+$env:HANDOFF_TEST_LIVE = "1005:dead"; $n2_95 = Get-Cell95 (Invoke-Clear95 "95959595-eeee-2222-0000-000000000006" "gamma") @("e=nonce-t95e-00000000")
+
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000400"
+$env:HANDOFF_TEST_HOST = "1007:1690000000"; Complete-Soft95 "95959595-1111-0000-0000-000000000007" "$tRoot/t95g.jsonl" "nonce-t95g-00000000" ""
+$env:HANDOFF_TEST_HOST = "fail"
+$env:HANDOFF_TEST_LIVE = "1007:alive"; $f1_95 = Get-Cell95 (Invoke-Clear95 "95959595-1111-1111-0000-000000000007" "") @("g=nonce-t95g-00000000")
+$env:HANDOFF_TEST_LIVE = "1007:dead"; $f2_95 = Get-Cell95 (Invoke-Clear95 "95959595-1111-2222-0000-000000000007" "") @("g=nonce-t95g-00000000")
+
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000500"
+$env:HANDOFF_TEST_HOST = "1008:1690000000"; Complete-Soft95 "95959595-2222-0000-0000-000000000008" "$tRoot/t95f.jsonl" "nonce-t95f-00000001" ""
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000510"
+$env:HANDOFF_TEST_HOST = "fail"; Complete-Soft95 "95959595-2222-0000-0000-000000000008" "$tRoot/t95f.jsonl" "nonce-t95f-00000002" ""
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000520"
+$env:HANDOFF_TEST_LIVE = "1008:alive"
+$env:HANDOFF_TEST_HOST = "1008:1690000000"; $st95 = Get-Cell95 (Invoke-Clear95 "95959595-2222-1111-0000-000000000008" "") @("f1=nonce-t95f-00000001", "f2=nonce-t95f-00000002")
+
+$env:HANDOFF_TEST_NOW_EPOCH = "1700000600"
+$env:HANDOFF_TEST_HOST = "1009:1690000000"; Complete-Soft95 "95959595-3333-0000-0000-000000000009" "$tRoot/t95h.jsonl" "nonce-t95h-00000000" ""
+$sp95 = "$root95/series-pid-1009.json"
+$so95 = Get-Content -LiteralPath $sp95 -Raw -Encoding UTF8 | ConvertFrom-Json
+$so95 | Add-Member -NotePropertyName "extra" -NotePropertyValue 1 -Force
+Set-Content -LiteralPath $sp95 -Value ($so95 | ConvertTo-Json) -Encoding UTF8
+$env:HANDOFF_TEST_LIVE = "1009:alive"
+$bd95 = Get-Cell95 (Invoke-Clear95 "95959595-3333-1111-0000-000000000009" "") @("h=nonce-t95h-00000000")
+
+New-Item -ItemType Directory -Force "$root95/keep95" | Out-Null
+Set-Content -LiteralPath "$root95/keep95/x.txt" -Value "x" -Encoding UTF8
+Set-Content -LiteralPath "$root95/series-pid-1999.json" -Value "{}" -Encoding UTF8
+$old95 = Get-Date -Year 2020 -Month 1 -Day 1 -Hour 0 -Minute 0 -Second 0
+foreach ($p95 in @("$root95/keep95/x.txt", "$root95/keep95", "$root95/series-pid-1999.json")) { (Get-Item -LiteralPath $p95).LastWriteTime = $old95 }
+Invoke-Hook "handoff-save.ps1" @{ session_id = "95959595-4444-0000-0000-00000000000a"; transcript_path = "$tRoot/t95a.jsonl"; cwd = "$WorkDir/proj"; hook_event_name = "PreCompact"; trigger = "auto" } | Out-Null
+$ret95 = "kept"; if (-not (Test-Path -LiteralPath "$root95/keep95")) { $ret95 = "deleted" }
+if (Test-Path -LiteralPath "$root95/series-pid-1999.json") { $ret95 = "$ret95/left" } else { $ret95 = "$ret95/gone" }
+Remove-Item "Env:HANDOFF_TEST_HOST", "Env:HANDOFF_TEST_LIVE", "Env:HANDOFF_TEST_NOW_EPOCH" -ErrorAction SilentlyContinue
+Write-Output "C95 cross=$xa95,$xb95,$xa295 live=$l1_95,$l2_95,$l3_95 name=$n1_95,$n2_95 fail=$f1_95,$f2_95 stale=$st95 bad=$bd95 ret=$ret95"
+
+# C96: 系列ポインタの境界（実装レビュー1回目の指摘）。ケースの説明は sh 版の C96 参照
+function Clear-Pointers96 {
+    Remove-Item -LiteralPath "$root95/latest.json" -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath $root95 -Filter "series-*.json" -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+}
+function Get-ErrCount96([string]$Needle) {
+    $lp = "$root95/error.log"
+    if (-not (Test-Path -LiteralPath $lp)) { return 0 }
+    return @(Get-Content -LiteralPath $lp -Encoding UTF8 | Where-Object { $_.Contains($Needle) }).Count
+}
+Clear-Pointers96
+$env:HANDOFF_TEST_NOW_EPOCH = "1700001000"
+$env:HANDOFF_TEST_HOST = "2001:1690000000"; Complete-Soft95 "96969696-1111-0000-0000-000000000001" "$tRoot/t96w.jsonl" "nonce-t96w-00000000" ""
+Add-Content -LiteralPath "$(Get-Dir91 '96969696-1111-0000-0000-000000000001')/current.md" -Value "tampered" -Encoding UTF8
+$env:HANDOFF_TEST_HOST = "2002:1690000000"
+$env:HANDOFF_TEST_LIVE = "2001:alive"; $d1_96 = Get-OutKind (Invoke-Clear95 "96969696-1111-1111-0000-000000000002" "")
+$env:HANDOFF_TEST_LIVE = "2001:dead"; $d2_96 = Get-OutKind (Invoke-Clear95 "96969696-1111-2222-0000-000000000002" "")
+
+Clear-Pointers96
+$env:HANDOFF_TEST_NOW_EPOCH = "1700001100"
+$env:HANDOFF_TEST_HOST = "2003:1690000000"; Complete-Soft95 "96969696-2222-0000-0000-000000000003" "$tRoot/t96p.jsonl" "nonce-t96p-00000000" ""
+$po96 = Get-Content -LiteralPath "$root95/series-pid-2003.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+$po96.pid = [long]2147483648
+$po96.series_key = "pid:2147483648"
+Set-Content -LiteralPath "$root95/series-pid-2147483648.json" -Value ($po96 | ConvertTo-Json) -Encoding UTF8
+Remove-Item -LiteralPath "$root95/series-pid-2003.json" -Force
+$env:HANDOFF_TEST_LIVE = "2147483648:alive"
+$env:HANDOFF_TEST_HOST = "2004:1690000000"; $pm96 = Get-OutKind (Invoke-Clear95 "96969696-2222-1111-0000-000000000004" "")
+
+Clear-Pointers96
+$env:HANDOFF_TEST_NOW_EPOCH = "1700001200"
+$env:HANDOFF_TEST_HOST = "2005:1690000000"; Complete-Soft95 "96969696-3333-0000-0000-000000000005" "$tRoot/t96m.jsonl" "nonce-t96m-00000000" ""
+for ($k96 = 0; $k96 -lt 64; $k96++) {
+    [System.IO.File]::WriteAllText("$root95/series-name-$($k96.ToString('D64')).json", "{}")
+}
+$env:HANDOFF_TEST_LIVE = "2005:dead"
+$env:HANDOFF_TEST_HOST = "2006:1690000000"
+$before96 = Get-ErrCount96 "系列ポインタが多すぎます"
+$mn96 = Get-OutKind (Invoke-Clear95 "96969696-3333-1111-0000-000000000006" "")
+$mn96 = "$mn96/$((Get-ErrCount96 '系列ポインタが多すぎます') - $before96)"
+$old96 = Get-Date -Year 2020 -Month 1 -Day 1 -Hour 0 -Minute 0 -Second 0
+Get-ChildItem -LiteralPath $root95 -Filter "series-name-0*.json" -File | ForEach-Object { $_.LastWriteTime = $old96 }
+$mn96 = "$mn96,$(Get-OutKind (Invoke-Clear95 '96969696-3333-2222-0000-000000000006' ''))"
+
+Clear-Pointers96
+$env:HANDOFF_TEST_NOW_EPOCH = "1700001300"
+$env:HANDOFF_TEST_HOST = "2007:1690000000"; Complete-Soft95 "96969696-4444-0000-0000-000000000007" "$tRoot/t96n.jsonl" "nonce-t96n-00000000" "delta-name96"
+$env:HANDOFF_TEST_LIVE = "2007:dead"
+$env:HANDOFF_TEST_HOST = "2008:1690000000"; $o96 = (Invoke-Clear95 "96969696-4444-1111-0000-000000000008" "delta-name96").Replace("`r", "")
+$nm96 = "other"
+if ($o96.Contains("delta-name96")) { $nm96 = "show" } elseif ($o96.Contains("同じ名前の前のセッション")) { $nm96 = "noshow" }
+Remove-Item "Env:HANDOFF_TEST_HOST", "Env:HANDOFF_TEST_LIVE", "Env:HANDOFF_TEST_NOW_EPOCH" -ErrorAction SilentlyContinue
+Write-Output "C96 dtgt=$d1_96,$d2_96 pidmax=$pm96 many=$mn96 name=$nm96"
 }
 
 # KEEP_WORK=1 で作業ディレクトリを残す（失敗ケースの成果物調査用。issue #16）

@@ -936,10 +936,438 @@ function Limit-TextHeadTail {
     return "$h`n...(中略: $info)...`n$t"
 }
 
+# ---------------------------------------------------------------------------
+# 系列ポインタ（v0.2.3。設計メモ docs/design/2026-11-21-multi-session-keys.md）
+# 同一ワークスペースで複数セッションを並行させたとき、/clear 後に「自分の」資料を引くため、
+# latest.json に加えて、Claude Code 本体のプロセス（PID と起動時刻）とセッション名を鍵にした
+# 系列ポインタ（.claude-handoff/series-pid-<PID>.json / series-name-<名前のSHA-256>.json）を書く。
+# 置き場所は .claude-handoff 直下のファイル（retention はセッションのディレクトリだけを消すので巻き込まれない）
 
+# 系列ポインタの既知キー（latest.json の既知キーに4つ足す。latest.json 側は広げない）
+$HO_SERIES_KNOWN_KEYS = @($HO_POINTER_KNOWN_KEYS + @("series_key", "pid", "process_start_epoch", "session_title"))
+$HO_PROC_START_TOLERANCE = 2      # 起動時刻の照合で同一とみなす差（秒）。取り方で値が揺れるため
+$HO_TITLE_MAX = 256               # セッション名の上限（コードポイント数）
+$HO_SERIES_MAX_FILES = 64         # 系列ポインタのファイル数の上限（7日以内のもの。超えたらポインタからの注入をやめる）
+$HO_SERIES_MAX_AGE_DAYS = 7       # 系列ポインタを読む・数える期間（更新時刻。PreCompact の retention と同じ）
+$HO_SERIES_MAX_BYTES = 65536      # 系列ポインタ1ファイルの大きさの上限
+$HO_PID_MAX = 2147483647          # PID の上限（PS の [int] と揃える。sh版と同一契約 — 実装レビュー1回目 M3）
 
+function Get-HoConfigDir {
+    # Claude Code の設定ディレクトリ（projects_root の親）。解決できなければ $null
+    $r = Get-ClaudeProjectsRoot
+    if ($null -eq $r) { return $null }
+    return $r.Substring(0, $r.Length - "/projects".Length)
+}
 
+function ConvertTo-HoEpochFromDate {
+    param([datetime]$Dt)
+    # 起動時刻を UTC の UNIX 秒（切り捨て）にそろえる
+    return [long][math]::Floor(([System.DateTimeOffset]::new($Dt.ToUniversalTime())).ToUnixTimeMilliseconds() / 1000)
+}
 
+function Get-HoHostProcess {
+    # フックの親プロセス（Claude Code 本体）の PID と起動時刻（UNIX 秒）。取れなければ $null。
+    # 取得失敗とみなす条件（設計メモ 5-2）: 親 PID が1以下／<設定ディレクトリ>/sessions/<親PID>.json が無い
+    # （呼び出しのたびに挟まるラッパーや入れ子の起動には無い。内部形式なので否定の判定にだけ使う）。
+    # 「親の起動がフックの起動から5秒以内ならラッパー」という条件は採らない: 本体の起動直後にもフックは走る
+    # （macOS の実測で SessionStart(startup) は本体の起動と同じ秒。起動直後の /clear を誤判定する）
+    # テスト用シーム: HANDOFF_TEST_HOST="<PID>:<起動時刻>" で固定、"fail" で取得失敗（sh版と同一契約）
+    $ov = [string]$env:HANDOFF_TEST_HOST
+    if ($ov.Length -gt 0) {
+        if ($ov.IndexOf([char]10) -ge 0) { return $null }
+        if ($ov -cmatch '^([1-9][0-9]{0,9}):([1-9][0-9]{0,11})$' -and [long]$Matches[1] -le $HO_PID_MAX) {
+            return @{ pid = [long]$Matches[1]; start = [long]$Matches[2] }
+        }
+        return $null
+    }
+    try {
+        $cfg = Get-HoConfigDir
+        if ($null -eq $cfg) { return $null }
+        # 設定ディレクトリに sessions が無ければ、親 PID を問い合わせる前に失敗とする（CIM は数百ミリ秒かかる）
+        if (-not (Test-Path -LiteralPath "$cfg/sessions" -PathType Container)) { return $null }
+        $hostPid = $null
+        if ($PSVersionTable.PSEdition -eq "Core") {
+            $par = (Get-Process -Id $PID).Parent
+            if ($null -ne $par) { $hostPid = [long]$par.Id }
+        } else {
+            $ci = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$PID" -OperationTimeoutSec 3 -ErrorAction Stop
+            if ($null -ne $ci) { $hostPid = [long]$ci.ParentProcessId }
+        }
+        if ($null -eq $hostPid -or $hostPid -le 1 -or $hostPid -gt $HO_PID_MAX) { return $null }
+        if (-not (Test-Path -LiteralPath "$cfg/sessions/$hostPid.json" -PathType Leaf)) { return $null }
+        $proc = [System.Diagnostics.Process]::GetProcessById([int]$hostPid)
+        $start = ConvertTo-HoEpochFromDate $proc.StartTime
+        return @{ pid = $hostPid; start = $start }
+    } catch {
+        return $null
+    }
+}
 
+function Get-HoProcessLiveness {
+    param([long]$ProcId, [long]$Start)
+    # 「alive」「dead」「unknown」。PID が無い・別の起動時刻（PID の再利用）なら dead。
+    # 起動時刻が読めない等は unknown（呼び出し側は alive として扱う — I1 を守る側に倒す）。
+    # テスト用シーム: HANDOFF_TEST_LIVE="<PID>:<alive|dead|unknown>,..."（並べた PID 以外は dead。sh版と同一契約）
+    $ov = [string]$env:HANDOFF_TEST_LIVE
+    if ($ov.Length -gt 0) {
+        foreach ($ent in $ov.Split(",")) {
+            $kv = $ent.Split(":")
+            if ($kv.Count -eq 2 -and [string]::Equals($kv[0], [string]$ProcId, [System.StringComparison]::Ordinal)) {
+                if ($kv[1] -ceq "alive" -or $kv[1] -ceq "dead" -or $kv[1] -ceq "unknown") { return $kv[1] }
+                return "unknown"
+            }
+        }
+        return "dead"
+    }
+    if ($ProcId -le 0 -or $ProcId -gt $HO_PID_MAX) { return "dead" }
+    $proc = $null
+    try { $proc = [System.Diagnostics.Process]::GetProcessById([int]$ProcId) }
+    catch [System.ArgumentException] { return "dead" }
+    catch { return "unknown" }
+    try {
+        $s = ConvertTo-HoEpochFromDate $proc.StartTime
+        if ([math]::Abs($s - $Start) -le $HO_PROC_START_TOLERANCE) { return "alive" }
+        return "dead"
+    } catch {
+        return "unknown"
+    }
+}
 
+function Test-HoSessionTitle {
+    param($T)
+    # セッション名として使えるか（sh版の jq と同一契約）: 文字列・1〜256コードポイント・
+    # 制御文字（C0 / DEL）・U+FFFD・対になっていないサロゲートを含まない・先頭と末尾が空白（U+0020 / U+00A0 / U+3000）でない
+    if (-not ($T -is [string])) { return $false }
+    if ($T.Length -eq 0) { return $false }
+    $cps = New-Object System.Collections.Generic.List[int]
+    $i = 0
+    while ($i -lt $T.Length) {
+        $c = [int]$T[$i]
+        if ($c -ge 0xD800 -and $c -le 0xDBFF) {
+            if ($i + 1 -ge $T.Length) { return $false }
+            $d = [int]$T[$i + 1]
+            if ($d -lt 0xDC00 -or $d -gt 0xDFFF) { return $false }
+            $cps.Add(0x10000 + (($c - 0xD800) * 0x400) + ($d - 0xDC00))
+            $i += 2
+            continue
+        }
+        if ($c -ge 0xDC00 -and $c -le 0xDFFF) { return $false }
+        $cps.Add($c)
+        $i++
+    }
+    if ($cps.Count -gt $HO_TITLE_MAX) { return $false }
+    foreach ($cp in $cps) {
+        if ($cp -lt 32 -or $cp -eq 127 -or $cp -eq 0xFFFD) { return $false }
+    }
+    foreach ($e in @($cps[0], $cps[$cps.Count - 1])) {
+        if ($e -eq 32 -or $e -eq 0xA0 -or $e -eq 0x3000) { return $false }
+    }
+    return $true
+}
 
+function Get-HoTitleHash {
+    param([string]$T)
+    # セッション名の SHA-256（UTF-8・BOM なし。英大文字の16進。sh版と同一契約）
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $b = (New-Object System.Text.UTF8Encoding $false).GetBytes($T)
+    return [System.BitConverter]::ToString($sha.ComputeHash($b)).Replace("-", "")
+}
+
+function Get-HoTitleFromTranscript {
+    param([string]$TranscriptPath, [string]$SessionId, [int]$TailLines = 500)
+    # transcript の末尾から、自セッションの最後の custom-title 行の名前を返す（無い・使えない名前は $null）。
+    # 行は {"type":"custom-title","customTitle":"…","sessionId":"…"}。fork や resume で写された他セッションの行は使わない
+    $acc = @{ title = $null }
+    $null = Invoke-HoTranscriptTail -Path $TranscriptPath -MaxLines $TailLines -OnLine {
+        param([string]$line)
+        if ($line.IndexOf('"custom-title"', [System.StringComparison]::Ordinal) -lt 0) { return $false }
+        try { $o = ConvertFrom-JsonPreserve $line } catch { return $false }
+        if (-not ($o -is [System.Management.Automation.PSCustomObject])) { return $false }
+        if (-not (Test-OrdinalEqual ([string](Get-HoProp $o "type")) "custom-title")) { return $false }
+        $sid = Get-HoProp $o "sessionId"
+        if (-not ($sid -is [string]) -or -not (Test-OrdinalEqual $sid $SessionId)) { return $false }
+        $ct = Get-HoProp $o "customTitle"
+        if (-not ($ct -is [string]) -or $ct.Length -eq 0) { return $false }
+        # 自セッションの最後の行で決める（使えない名前なら、それより前の行は見ない）
+        if (Test-HoSessionTitle $ct) { $acc.title = $ct }
+        return $true
+    }
+    return $acc.title
+}
+
+function Get-HoSeriesPaths {
+    param([string]$HandoffRoot)
+    # 系列ポインタのファイル（直下の通常ファイル。名前の形が合うもので、更新から7日以内のものだけ）。
+    # 7日を過ぎたものは中身も必ず期限切れ（updated_epoch は書いた時刻）なので、数にも入れない
+    # （消すのは PreCompact と資料の完成時だけなので、/clear 中心の使い方では溜まる — 実装レビュー2回目 H1。sh版と同一）
+    $out = @()
+    $fresh = (Get-Date).AddDays(-$HO_SERIES_MAX_AGE_DAYS)
+    foreach ($f in @(Get-ChildItem -LiteralPath $HandoffRoot -Filter "series-*.json" -File -ErrorAction SilentlyContinue)) {
+        if ($f.LastWriteTime -lt $fresh) { continue }
+        if ($f.Name -cmatch '^series-pid-[1-9][0-9]{0,9}[.]json$' -or $f.Name -cmatch '^series-name-[0-9A-F]{64}[.]json$') {
+            if (Test-RegularFile $f.FullName) { $out += ($HandoffRoot + "/" + $f.Name) }
+        }
+    }
+    [Array]::Sort($out, [System.StringComparer]::Ordinal)
+    # 呼び出し側は @() で受ける（ここで ,$out と返すと @() の中で配列が入れ子になる）
+    return $out
+}
+
+function Write-HoSeriesPointers {
+    param([string]$HandoffRoot, [hashtable]$Pointer, [string]$TranscriptPath, [string]$SessionId)
+    # check が latest.json を書いた直後に呼ぶ。本体プロセスが取れなければ何も書かない
+    # （名前の系列も書き手のプロセスで生存を確かめるため — 設計メモ 5-3・2回目レビュー N1）。
+    # 書き込みに失敗したらそのファイルを消して error.log に残す（古い資料を指したまま残さない — I9）
+    # 7日を過ぎた系列ファイルを消す（PreCompact が走らない使い方でも溜めない — 実装レビュー2回目 H1）
+    $old = (Get-Date).AddDays(-$HO_SERIES_MAX_AGE_DAYS)
+    Get-ChildItem -LiteralPath $HandoffRoot -Filter "series-*.json" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $old -and (Test-RegularFile $_.FullName) } | ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+    $hp = Get-HoHostProcess
+    if ($null -eq $hp) { return }
+    $title = $null
+    try { $title = Get-HoTitleFromTranscript -TranscriptPath $TranscriptPath -SessionId $SessionId } catch { $title = $null }
+    $targets = @(@{ path = "$HandoffRoot/series-pid-$($hp.pid).json"; key = "pid:$($hp.pid)"; title = $null })
+    if ($null -ne $title) {
+        $h = Get-HoTitleHash $title
+        $targets += @{ path = "$HandoffRoot/series-name-$h.json"; key = "name:$h"; title = $title }
+    }
+    foreach ($t in $targets) {
+        try {
+            $sp = @{}
+            foreach ($k in $Pointer.Keys) { $sp[$k] = $Pointer[$k] }
+            $sp["series_key"] = $t.key
+            $sp["pid"] = $hp.pid
+            $sp["process_start_epoch"] = $hp.start
+            if ($null -ne $t.title) { $sp["session_title"] = $t.title }
+            Write-FileAtomic -Path $t.path -Content ($sp | ConvertTo-Json)
+        } catch {
+            Remove-Item -LiteralPath $t.path -Force -ErrorAction SilentlyContinue
+            Write-HandoffError $HandoffRoot "handoff-check" "系列ポインタ（$($t.key)）を書けなかったため消しました（session=$SessionId）"
+        }
+    }
+}
+
+# updated_at の表示に使う形（restore の latest.json 経由の表示と同じ。値は非信頼）
+$HO_UPDATED_AT_PATTERN = '\A[1-9][0-9]{3}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([+-]((0[0-9]|1[0-3]):?[0-5][0-9]|14:?00)|[Zz])\z'
+
+function Read-HoPointerObject {
+    param([string]$Path)
+    # ポインタファイル（latest.json / 系列）を読む。JSON のルートが object でなければ $null
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $o = $null
+    try { $o = ConvertFrom-JsonPreserve (Get-Content -LiteralPath $Path -Raw -Encoding UTF8) } catch { return $null }
+    if (-not ($o -is [System.Management.Automation.PSCustomObject])) { return $null }
+    return $o
+}
+
+function Test-HoPointerConsumedMark {
+    param($P)
+    # 消費済みの印（dual-read: consumed == true または consumed_at が非空文字列）
+    if ((Test-HoProp $P "consumed") -and ($P.consumed -is [bool]) -and $P.consumed) { return $true }
+    if ((Test-HoProp $P "consumed_at") -and ($P.consumed_at -is [string]) -and $P.consumed_at.Length -gt 0) { return $true }
+    return $false
+}
+
+function Get-HoPointerState {
+    param($P, [string]$Label, [string[]]$Known, [string]$HandoffRoot, $NowEpoch)
+    # ポインタの検証（従来 restore に直書きしていた latest.json の検証を関数にしたもの。判定と診断の文言は従来どおり）。
+    # 戻り値: "ok" / "consumed" / "expired" / "bad"。$Label は診断に出す名前（latest.json か系列のファイル名）
+    if (-not (Test-HoOnlyKnownKeys $P $Known)) {
+        Write-HandoffError $HandoffRoot "restore" "${Label}に未知のキーがあります。ポインタを無効として扱いました"
+        return "bad"
+    }
+    if (-not (Test-HoProp $P "schema_version")) {
+        Write-HandoffError $HandoffRoot "restore" "${Label}にschema_versionがありません（旧形式のポインタ）。ポインタを無効として扱いました"
+        return "bad"
+    }
+    $sv = $P.schema_version
+    $svOk = (($sv -is [int]) -or ($sv -is [long]) -or ($sv -is [double]) -or ($sv -is [decimal])) -and (([double]$sv) -eq 1)
+    if (-not $svOk) {
+        Write-HandoffError $HandoffRoot "restore" "${Label}のschema_versionが1ではありません（未知の形式）。ポインタを無効として扱いました"
+        return "bad"
+    }
+    if ((-not (Test-HoProp $P "session_id")) -or -not (Test-Uuid $P.session_id)) { return "bad" }
+    if (-not (Test-HoProp $P "nonce") -or -not ($P.nonce -is [string]) -or $P.nonce -cnotmatch '^[A-Za-z0-9-]{8,64}$') { return "bad" }
+    # consumed は存在するなら boolean のみ（型固定 — 罠8）。consumed_at で許可するのは欠落・null・文字列のみ
+    if (Test-HoProp $P "consumed") {
+        if (-not ($P.consumed -is [bool])) { return "bad" }
+    }
+    if ((Test-HoProp $P "consumed_at") -and $null -ne $P.consumed_at -and -not ($P.consumed_at -is [string])) { return "bad" }
+    if (Test-HoPointerConsumedMark $P) { return "consumed" }
+    if ($null -eq $NowEpoch) {
+        Write-HandoffError $HandoffRoot "restore" "現在時刻(epoch)を取得できないため鮮度判定できません。ポインタを無効として扱いました"
+        return "bad"
+    }
+    $epochState = "bad"
+    if ((Test-HoProp $P "updated_epoch")) {
+        $v = $P.updated_epoch
+        if (($v -is [int]) -or ($v -is [long]) -or ($v -is [double]) -or ($v -is [decimal])) {
+            $d = [double]$v
+            if (($d -eq [math]::Truncate($d)) -and ($d -gt 0) -and ($d -le ($NowEpoch + 86400))) {
+                if (($NowEpoch - $d) -le (7 * 86400)) { $epochState = "ok" } else { $epochState = "expired" }
+            }
+        }
+    }
+    if ($epochState -eq "bad") {
+        Write-HandoffError $HandoffRoot "restore" "${Label}のupdated_epochが無いか不正です。ポインタを無効として扱いました"
+    }
+    return $epochState
+}
+
+function Test-HoSeriesFields {
+    param($P, [string]$FileName)
+    # 系列ポインタだけの検証: series_key がファイル名と一致し、pid / process_start_epoch が正の整数
+    if (-not (Test-HoProp $P "series_key") -or -not ($P.series_key -is [string])) { return $false }
+    $expect = $null
+    if ($FileName -cmatch '^series-pid-([1-9][0-9]{0,9})[.]json$') { $expect = "pid:" + $Matches[1] }
+    elseif ($FileName -cmatch '^series-name-([0-9A-F]{64})[.]json$') { $expect = "name:" + $Matches[1] }
+    if ($null -eq $expect -or -not (Test-OrdinalEqual $P.series_key $expect)) { return $false }
+    foreach ($k in @("pid", "process_start_epoch")) {
+        if (-not (Test-HoProp $P $k)) { return $false }
+        $v = $P.$k
+        if (-not (($v -is [int]) -or ($v -is [long]) -or ($v -is [double]) -or ($v -is [decimal]))) { return $false }
+        $d = [double]$v
+        $max = 9999999999
+        if ($k -eq "pid") { $max = $HO_PID_MAX }
+        if (-not (($d -eq [math]::Truncate($d)) -and ($d -gt 0) -and ($d -le $max))) { return $false }
+    }
+    if ($expect.StartsWith("pid:") -and -not (Test-OrdinalEqual ([string][long]$P.pid) $expect.Substring(4))) { return $false }
+    if ((Test-HoProp $P "session_title") -and $null -ne $P.session_title -and -not (Test-HoSessionTitle $P.session_title)) { return $false }
+    return $true
+}
+
+function Test-HoPointerTarget {
+    param($P, [string]$HandoffRoot)
+    # ポインタが指す資料（検証済み UUID から組み立てた current.md）が、完了検証と SHA-256 照合に通るか
+    $cand = Join-Path $HandoffRoot "$($P.session_id)/current.md"
+    if (-not (Test-PathUnderRoot -Root $HandoffRoot -Candidate $cand) -or -not (Test-Path -LiteralPath $cand -PathType Leaf)) { return $false }
+    if (-not (Test-HandoffComplete -HandoffPath $cand -Nonce $P.nonce)) { return $false }
+    if (-not (Test-HoProp $P "sha256") -or -not ($P.sha256 -is [string]) -or $P.sha256.Length -eq 0) { return $false }
+    $h = Get-FileSha256 -Path $cand
+    return ($null -ne $h -and (Test-OrdinalEqual $h $P.sha256))
+}
+
+function Resolve-HoPointer {
+    param([string]$HandoffRoot, $LatestObj, [string]$LatestState, $InputTitle, [string]$TranscriptPath, $OwnSessionId, [bool]$IsClear, $NowEpoch)
+    # /clear（と compact で自セッションに資料が無いとき）に使うポインタを決める（設計メモ 5-4）。
+    # 1. 自分の本体プロセスの PID の系列 → 2. 名前の系列（書き手が自分か、生きていない）→ 3. latest.json（書き手が自分以外で生きていない）。
+    # 各段は「使える」か「次の段へ」で、「無い」と言い切るのは 3 だけ。
+    # 戻り値: @{ pointer; path; via（"pid" / "name" / "latest"）; title } か $null
+    $latestPath = "$HandoffRoot/latest.json"
+    $all = New-Object System.Collections.Generic.List[object]
+    # latest.json は呼び出し側で検証済み（診断を二重に出さないため、結果を受け取る）
+    $latestObj = $LatestObj
+    $latestState = $LatestState
+    if ($null -ne $latestObj) { $all.Add(@{ path = $latestPath; obj = $latestObj; series = $false }) }
+    # 系列ファイルの数と大きさに上限を置く。超えたら途中で打ち切らず、ポインタからの注入をやめる
+    # （一部だけ読むと消費や書き手の判定が崩れる — 実装レビュー1回目 M8）
+    $seriesList = @(Get-HoSeriesPaths $HandoffRoot)
+    if ($seriesList.Count -gt $HO_SERIES_MAX_FILES) {
+        Write-HandoffError $HandoffRoot "restore" "系列ポインタが多すぎます（$($seriesList.Count)件）。ポインタからの注入を行いません"
+        return $null
+    }
+    foreach ($sp in $seriesList) {
+        if ((Get-Item -LiteralPath $sp).Length -gt $HO_SERIES_MAX_BYTES) {
+            Write-HandoffError $HandoffRoot "restore" "系列ポインタが大きすぎます（$([System.IO.Path]::GetFileName($sp))）。ポインタからの注入を行いません"
+            return $null
+        }
+    }
+    foreach ($sp in $seriesList) {
+        $so = Read-HoPointerObject $sp
+        if ($null -ne $so) { $all.Add(@{ path = $sp; obj = $so; series = $true }) }
+    }
+    # 消費の判定: 同じ nonce を持つポインタのどれか1つでも消費済みなら消費済み（2回目レビュー N4）
+    $consumedNonces = @{}
+    foreach ($e in $all) {
+        $n = Get-HoProp $e.obj "nonce"
+        if (($n -is [string]) -and (Test-HoPointerConsumedMark $e.obj)) { $consumedNonces[$n] = $true }
+    }
+    $latestUsable = ($latestState -eq "ok") -and -not $consumedNonces.ContainsKey([string]$latestObj.nonce)
+    $hp = $null
+    if (@($all | Where-Object { $_.series }).Count -gt 0) { $hp = Get-HoHostProcess }
+    $title = $null
+    if (Test-HoSessionTitle $InputTitle) { $title = $InputTitle }
+    elseif (-not $IsClear -and $null -ne $OwnSessionId -and $TranscriptPath.Length -gt 0) {
+        try { $title = Get-HoTitleFromTranscript -TranscriptPath $TranscriptPath -SessionId $OwnSessionId } catch { $title = $null }
+    }
+
+    $isSelf = {
+        param($o)
+        return ($null -ne $hp) -and ([long]$o.pid -eq $hp.pid) -and ([math]::Abs([long]$o.process_start_epoch - $hp.start) -le $HO_PROC_START_TOLERANCE)
+    }
+    $seriesUsable = {
+        param([string]$path)
+        $o = Read-HoPointerObject $path
+        if ($null -eq $o) { return $null }
+        $fname = [System.IO.Path]::GetFileName($path)
+        if ((Get-HoPointerState $o $fname $HO_SERIES_KNOWN_KEYS $HandoffRoot $NowEpoch) -ne "ok") { return $null }
+        if (-not (Test-HoSeriesFields $o $fname)) {
+            Write-HandoffError $HandoffRoot "restore" "${fname}の系列情報が不正です。ポインタを無効として扱いました"
+            return $null
+        }
+        if ($consumedNonces.ContainsKey([string]$o.nonce)) { return $null }
+        # 「latest.json より古い系列は飛ばす」（2回目レビュー N2 の案）は採らない: 別ウィンドウが後から完成させると
+        # 自分の系列は必ず latest.json より古くなり、本来の用途が成り立たない。同じセッションで PID の取得に失敗して
+        # 次の資料を完成させた場合は、current.md が置き換わっているので下の SHA-256 照合で古い系列は落ちる
+        if (-not (Test-HoPointerTarget $o $HandoffRoot)) { return $null }
+        return $o
+    }
+
+    # 1. PID の系列
+    if ($null -ne $hp) {
+        $p1 = "$HandoffRoot/series-pid-$($hp.pid).json"
+        if (Test-Path -LiteralPath $p1 -PathType Leaf) {
+            $o1 = & $seriesUsable $p1
+            if ($null -ne $o1 -and (& $isSelf $o1)) {
+                return @{ pointer = $o1; path = $p1; via = "pid"; title = $null }
+            }
+        }
+    }
+    # 2. 名前の系列（書いたプロセスが自分か、生きていない — 同じ名前のウィンドウが2つあっても混ぜない。2回目レビュー N1）
+    if ($null -ne $title) {
+        $p2 = "$HandoffRoot/series-name-$(Get-HoTitleHash $title).json"
+        if (Test-Path -LiteralPath $p2 -PathType Leaf) {
+            $o2 = & $seriesUsable $p2
+            if ($null -ne $o2) {
+                $mine = & $isSelf $o2
+                if ($mine -or (Get-HoProcessLiveness ([long]$o2.pid) ([long]$o2.process_start_epoch)) -eq "dead") {
+                    return @{ pointer = $o2; path = $p2; via = "name"; title = $title }
+                }
+            }
+        }
+    }
+    # 3. latest.json（その資料の系列の書き手が、自分以外で生きている〔判定できないを含む〕なら使わない）
+    # 書き手の確認は、資料が検証に落ちる場合も先に行う（落ちる資料でも警告・引用・バックアップ導線は出るので、
+    # 生きた別プロセスのものなら何も出さない — 実装レビュー1回目 High 2）
+    if (-not $latestUsable) { return $null }
+    foreach ($e in $all) {
+        if (-not $e.series) { continue }
+        $o = $e.obj
+        if (-not (Test-OrdinalEqual ([string](Get-HoProp $o "nonce")) ([string]$latestObj.nonce))) { continue }
+        if (-not (Test-HoSeriesFields $o ([System.IO.Path]::GetFileName($e.path)))) { continue }
+        if (& $isSelf $o) { continue }
+        if ((Get-HoProcessLiveness ([long]$o.pid) ([long]$o.process_start_epoch)) -ne "dead") { return $null }
+    }
+    # 検証に落ちる資料も従来どおり「ポインタ経由」で解決し、警告と導線を出す（ゲートは後段で同じ判定をする）
+    return @{ pointer = $latestObj; path = $latestPath; via = "latest"; title = $null }
+}
+
+function Set-HoPointersConsumed {
+    param([string]$HandoffRoot, [string]$Nonce, [string]$ConsumedAt)
+    # 同じ nonce を持つすべてのポインタ（latest.json・系列）に消費を書く（I8）。各ファイルは書く直前に読み直し、
+    # nonce が一致するときだけ書く（別プロセスが書いたばかりの新しいポインタを消費済みにしない — 2回目レビュー N4）。
+    # dual-write: consumed=true と非空 consumed_at を同一の atomic 更新で書く
+    $paths = @("$HandoffRoot/latest.json") + @(Get-HoSeriesPaths $HandoffRoot)
+    foreach ($p in $paths) {
+        try {
+            $o = Read-HoPointerObject $p
+            if ($null -eq $o) { continue }
+            if (-not (Test-OrdinalEqual ([string](Get-HoProp $o "nonce")) $Nonce)) { continue }
+            $o | Add-Member -NotePropertyName "consumed" -NotePropertyValue $true -Force
+            $o | Add-Member -NotePropertyName "consumed_at" -NotePropertyValue $ConsumedAt -Force
+            Write-FileAtomic -Path $p -Content ($o | ConvertTo-Json)
+        } catch { }
+    }
+}
