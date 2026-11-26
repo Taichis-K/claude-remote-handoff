@@ -95,6 +95,29 @@ emit_hard() {
     } | emit_context
 }
 
+# 手動の指示（v0.2.5。設計メモ docs/design/2026-11-26-manual-trigger.md。PS版 Write-ManualInstruction と同一契約）:
+# $1=statePath $2=handoffMd $3=mode（soft / hard。状態ファイルに記録する値） [$4=持ち越しJSON]
+# 新しい nonce・attempts 1 で状態を書き、手動用の文言で指示を出す。持ち越しがあれば書き直しの一文を足す
+emit_manual() {
+    mkdir -p "$(dirname "$2")" 2>/dev/null
+    _n=$(ho_uuid)
+    _carry="${4:-}"
+    [ -n "$_carry" ] || _carry='{}'
+    jq -n --arg n "$_n" --arg m "$3" --argjson c "$_carry" '{schema_version: 1, mode: $m, nonce: $n, attempts: 1, completed: false, failed: false} + $c' | ho_write_atomic "$1"
+    {
+        printf '利用者の求め（/handoff-now）で、引き継ぎ資料を作成します。今の作業を区切りの良いところで止めて、圧縮や /clear の後も継続できるよう引き継ぎ資料を作成してください。\n'
+        if [ "$_carry" != '{}' ]; then
+            printf '（この会話には前に作った引き継ぎ資料 %s がありますが、その後の作業が反映されていません。それを読み、いまの状態に合わせて書き直したものを下記の書き先へ書いてください）\n' "$2"
+        fi
+        instruction_common "$2" "$_n"
+    } | emit_context
+}
+
+# 手動の要求か（stop_hook_active が真の Stop では反応しない）
+now_request() {
+    [ "${HO_NOW_REQ:-0}" = "1" ] && [ "${HO_STOP_ACTIVE:-0}" != "1" ]
+}
+
 main() {
     ho_require_jq handoff-check || exit 0
     ho_read_input || exit 0
@@ -254,6 +277,17 @@ main() {
         s_attempts=$(jq -r '.attempts' "$state_path")
         s_completed=$(jq -r '.completed // false' "$state_path")
         s_failed=$(jq -r '.failed // false' "$state_path")
+        if [ "$s_completed" = "true" ] && now_request; then
+            # 完成済みからの手動の書き直し。hard の完成は hard のまま、soft の完成はハード閾値以上なら hard（PS版と同一）
+            m_mode="soft"
+            if [ "$s_mode" = "hard" ]; then m_mode="hard"
+            else
+                m_tok=$(get_last_usage "$transcript")
+                [ "$m_tok" -ge "$hard" ] 2>/dev/null && m_mode="hard"
+            fi
+            emit_manual "$state_path" "$handoff_md" "$m_mode" "$(completion_carry "$state_path")"
+            exit 0
+        fi
         if [ "$s_completed" = "true" ]; then
             # 完了済み。ソフト閾値で作った資料は、ハード閾値を越えたら1度だけ書き直させる
             # （v0.2.1。理由と判定の詳細はPS版の同じ分岐のコメント参照）。
@@ -346,6 +380,17 @@ main() {
             write_completed_state "$state_path" "$s_mode" "$s_nonce" "$s_attempts" "$ue" "$sha"
             exit 0
         fi
+        # 未完了で手動の要求: 指示を新しい nonce で出し直す（完了の判定はこの上で済んでいる — PS版と同一）
+        if now_request; then
+            m_mode="soft"
+            if [ "$s_mode" = "hard" ]; then m_mode="hard"
+            else
+                m_tok=$(get_last_usage "$transcript")
+                [ "$m_tok" -ge "$hard" ] 2>/dev/null && m_mode="hard"
+            fi
+            emit_manual "$state_path" "$handoff_md" "$m_mode" "$(completion_carry "$state_path")"
+            exit 0
+        fi
         if [ "$s_mode" = "hard" ]; then
             if [ "$s_attempts" -ge "$MAX_ATTEMPTS" ]; then
                 if [ "$s_failed" != "true" ]; then
@@ -369,13 +414,26 @@ main() {
         # ソフト未完了は追わない。ただしハード閾値到達でエスカレーション
         tokens_now=$(get_last_usage "$transcript")
         if [ "$tokens_now" -ge "$hard" ] 2>/dev/null; then
-            emit_hard "$state_path" "$handoff_md" 1
+            # 持ち越しがあれば引き継ぎ、書き直しの文言にする（v0.2.5。設計レビュー H1 — PS版と同一）
+            esc=$(completion_carry "$state_path")
+            if [ "$esc" != '{}' ]; then
+                emit_hard "$state_path" "$handoff_md" 1 "" refresh "$esc"
+            else
+                emit_hard "$state_path" "$handoff_md" 1
+            fi
         fi
         exit 0
     fi
 
     # --- 未発行: usage実測 → 閾値判定 ---
     tokens=$(get_last_usage "$transcript")
+    if now_request; then
+        # 手動の要求: 閾値に関係なく指示を出す。ハード閾値以上なら hard、それ以外は soft で記録（PS版と同一）
+        m_mode="soft"
+        [ "$tokens" -ge "$hard" ] 2>/dev/null && m_mode="hard"
+        emit_manual "$state_path" "$handoff_md" "$m_mode"
+        exit 0
+    fi
     [ "$tokens" -ge "$soft" ] 2>/dev/null || exit 0
 
     if [ "$tokens" -ge "$hard" ] 2>/dev/null; then

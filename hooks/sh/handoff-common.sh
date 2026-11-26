@@ -67,7 +67,8 @@ ho_read_input() {
     HO_BG_TASKS=0
     HO_STOP_ACTIVE=0
     HO_SESSION_TITLE=""
-    _fields=$(printf '%s' "$HO_INPUT" | jq -s -r "$HO_TITLE_JQDEF"'
+    HO_NOW_REQ=0
+    _fields=$(printf '%s' "$HO_INPUT" | jq -s -r "$HO_TITLE_JQDEF$HO_NOWREQ_JQDEF"'
         def strfield: if type == "string" and (contains("\u0000") | not)
                          and (contains("\r") | not) then . else "" end;
         def pathfield: if type == "string" and (test("[\u0000-\u001f\u007f]") | not) then . else "" end;
@@ -76,6 +77,7 @@ ho_read_input() {
             "HO_TRANSCRIPT_PATH=\(.transcript_path | pathfield | @sh) " +
             "HO_SESSION_ID=\(.session_id | strfield | @sh) " +
             "HO_SOURCE=\(.source | strfield | @sh) " +
+            "HO_NOW_REQ=\(if (.last_assistant_message | nowreq) then 1 else 0 end) " +
             "HO_SESSION_TITLE=\(.session_title | if titleok then . else "" end | @sh) " +
             "HO_TRIGGER=\(.trigger | strfield | @sh) " +
             "HO_BG_TASKS=\(.background_tasks | if type == "array" then length else 0 end) " +
@@ -752,6 +754,13 @@ HO_TITLE_JQDEF='def titleok: type == "string" and (explode as $c | ($c | length)
     and ([$c[] | select(. < 32 or . == 127 or . == 65533)] | length) == 0
     and ($c[0] as $f | [32, 160, 12288] | any(. == $f) | not)
     and ($c[-1] as $l | [32, 160, 12288] | any(. == $l) | not));'
+
+# 手動の要求行（/handoff-now が Claude に返答させる1行。v0.2.5。PS版 Test-HoNowRequest と同一契約）:
+# last_assistant_message の**最後の行**が要求行か（その行の前後の半角空白・タブ・CR と、後ろに続く空行は無視。
+# NBSP・全角空白は無視しない）。前の行に何があってもよい（指示しても前置きを付けるモデルがある — 実機で確認）。
+# 本文はシェル変数へ運ばず、jq の中で真偽値にする。判定は正規表現1回（前後に大量の空白があっても遅くならない —
+# 実装レビュー Low 1）。文字列全体の端に一致するアンカーを使い、行端の ^/$ は使わない
+HO_NOWREQ_JQDEF='def nowreq: type == "string" and test("(\\A|\\n)[ \\t\\r]*<!-- handoff-now-request -->[ \\t\\r\\n]*\\z");'
 
 ho_config_dir() {
     _cr=$(ho_projects_root) || return 1

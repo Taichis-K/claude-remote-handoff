@@ -3,9 +3,9 @@
 # 期待値と照合して2系統一致を検証する（ローカル実行）
 # 出力形式: "C<番号> <key>=<value> ..."（1ケース1行）
 # 使い方: -WorkDir <作業ディレクトリ> -Part <all|1|2|3>
-#   Part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C96）。
+#   Part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C97）。
 #   パートは独立した作業ディレクトリで並列に実行し、出力を1〜3の順に連結すると
-#   all と同じ96行になる（run-local-check.ps1 がそれを行い期待値と照合する）
+#   all と同じ97行になる（run-local-check.ps1 がそれを行い期待値と照合する）
 param([string]$WorkDir = "", [string]$Part = "all")
 
 $ErrorActionPreference = "Stop"
@@ -2506,6 +2506,83 @@ $nm96 = "other"
 if ($o96.Contains("delta-name96")) { $nm96 = "show" } elseif ($o96.Contains("同じ名前の前のセッション")) { $nm96 = "noshow" }
 Remove-Item "Env:HANDOFF_TEST_HOST", "Env:HANDOFF_TEST_LIVE", "Env:HANDOFF_TEST_NOW_EPOCH" -ErrorAction SilentlyContinue
 Write-Output "C96 dtgt=$d1_96,$d2_96 pidmax=$pm96 many=$mn96 name=$nm96"
+
+# C97: 手動の要求（/handoff-now。v0.2.5）。ケースの説明は sh 版の C97 参照
+$req97 = "<!-- handoff-now-request -->"
+function Get-Kind97([string]$Out) {
+    $k = $Out.Replace("`r", "")
+    if ($k.Trim().Length -eq 0) { return "none" }
+    if ($k.Contains("/handoff-now）で、引き継ぎ資料を作成")) { if ($k.Contains("書き直したもの")) { return "refresh" } else { return "manual" } }
+    if ($k.Contains("ハード閾値を超えました")) { if ($k.Contains("書き直したもの")) { return "hard-refresh" } else { return "hard" } }
+    return "other"
+}
+function Get-St97([string]$Transcript) {
+    $p = "$Transcript.handoff-state.json"
+    if (-not (Test-Path -LiteralPath $p)) { return "nostate" }
+    $s = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json
+    $carry = "nocarry"; if ($s.PSObject.Properties.Name -contains "completed_nonce") { $carry = "carry" }
+    $fl = "open"; if ($s.failed -eq $true) { $fl = "failed" } elseif ($s.completed -eq $true) { $fl = "done" }
+    return "$($s.mode)/$($s.attempts)/$carry/$fl"
+}
+function Invoke-Run97([string]$Sid, [string]$Transcript, [string]$Msg, [bool]$Active) {
+    $in = @{ session_id = $Sid; transcript_path = $Transcript; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $Active }
+    if ($Msg -ne "-") { $in["last_assistant_message"] = $Msg }
+    $o = Invoke-Hook "handoff-check.ps1" $in
+    return "$(Get-Kind97 $o):$(Get-St97 $Transcript)"
+}
+$sid97 = "97979797-0000-0000-0000-000000000001"
+$t97 = "$tRoot/t97.jsonl"
+New-UsageTranscript $t97 100; Remove-Item -LiteralPath "$t97.handoff-state.json" -Force -ErrorAction SilentlyContinue
+$low97 = Invoke-Run97 $sid97 $t97 $req97 $false
+New-UsageTranscript $t97 450; Remove-Item -LiteralPath "$t97.handoff-state.json" -Force -ErrorAction SilentlyContinue
+$high97 = Invoke-Run97 $sid97 $t97 $req97 $false
+New-UsageTranscript $t97 100; Remove-Item -LiteralPath "$t97.handoff-state.json" -Force -ErrorAction SilentlyContinue
+$ws97 = Invoke-Run97 $sid97 $t97 ("  `n`t" + $req97 + " `r`n") $false
+Remove-Item -LiteralPath "$t97.handoff-state.json" -Force -ErrorAction SilentlyContinue
+$nbsp97 = Invoke-Run97 $sid97 $t97 ([string][char]0xA0 + $req97) $false
+$part97 = Invoke-Run97 $sid97 $t97 ("了解しました " + $req97) $false
+$after97 = Invoke-Run97 $sid97 $t97 ($req97 + "`n上の1行を返しました。") $false
+Remove-Item -LiteralPath "$t97.handoff-state.json" -Force -ErrorAction SilentlyContinue
+$last97 = Invoke-Run97 $sid97 $t97 ("こんにちは。`n`n" + $req97 + "`n") $false
+Remove-Item -LiteralPath "$t97.handoff-state.json" -Force -ErrorAction SilentlyContinue
+$active97 = Invoke-Run97 $sid97 $t97 $req97 $true
+$nofield97 = Invoke-Run97 $sid97 $t97 "-" $false
+$o97 = Invoke-Hook "handoff-check.ps1" @{ session_id = $sid97; transcript_path = $t97; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = $false; last_assistant_message = 5 }
+$nonstr97 = "$(Get-Kind97 $o97):$(Get-St97 $t97)"
+$o97 = Invoke-Hook "handoff-check.ps1" @{ session_id = $sid97; transcript_path = $t97; cwd = "$WorkDir/proj"; hook_event_name = "Stop"; stop_hook_active = "true"; last_assistant_message = $req97 }
+$activestr97 = "$(Get-Kind97 $o97):$(Get-St97 $t97)"
+
+$sid97b = "97979797-0000-0000-0000-000000000002"; $t97b = "$tRoot/t97b.jsonl"
+Complete-Soft91 $sid97b $t97b "nonce-t97b-00000000"
+$donesoft97 = Invoke-Run97 $sid97b $t97b $req97 $false
+Add-Usage91 $t97b 450
+$esc97 = Invoke-Run97 $sid97b $t97b "了解" $false
+
+$sid97c = "97979797-0000-0000-0000-000000000003"; $t97c = "$tRoot/t97c.jsonl"
+New-UsageTranscript $t97c 450
+New-HardState $t97c "nonce-t97c-00000000"
+Write-Doc90 "$(Get-Dir91 $sid97c)/draft.md" "nonce-t97c-00000000"
+Invoke-Stop90 $sid97c $t97c | Out-Null
+$donehard97 = Invoke-Run97 $sid97c $t97c $req97 $false
+
+$sid97d = "97979797-0000-0000-0000-000000000004"; $t97d = "$tRoot/t97d.jsonl"
+New-UsageTranscript $t97d 250
+New-SoftState90 $t97d "nonce-t97d-00000000"
+$pend97 = Invoke-Run97 $sid97d $t97d $req97 $false
+$n97d = (Get-Content -LiteralPath "$t97d.handoff-state.json" -Raw -Encoding UTF8 | ConvertFrom-Json).nonce
+if ($n97d -ceq "nonce-t97d-00000000") { $pend97 = "$pend97/samenonce" } else { $pend97 = "$pend97/newnonce" }
+
+$sid97e = "97979797-0000-0000-0000-000000000005"; $t97e = "$tRoot/t97e.jsonl"
+New-UsageTranscript $t97e 450
+Set-Content -LiteralPath "$t97e.handoff-state.json" -Value '{"schema_version":1,"mode":"hard","nonce":"nonce-t97e-00000000","attempts":3,"completed":false,"failed":true}' -Encoding UTF8
+$failed97 = Invoke-Run97 $sid97e $t97e $req97 $false
+
+$sid97f = "97979797-0000-0000-0000-000000000006"; $t97f = "$tRoot/t97f.jsonl"
+New-UsageTranscript $t97f 250
+New-SoftState90 $t97f "nonce-t97f-00000000"
+Write-Doc90 "$(Get-Dir91 $sid97f)/draft.md" "nonce-t97f-00000000"
+$race97 = Invoke-Run97 $sid97f $t97f $req97 $false
+Write-Output "C97 low=$low97 high=$high97 ws=$ws97 nbsp=$nbsp97 part=$part97 after=$after97 last=$last97 active=$active97 nofield=$nofield97 nonstr=$nonstr97 activestr=$activestr97 donesoft=$donesoft97 esc=$esc97 donehard=$donehard97 pend=$pend97 failed=$failed97 race=$race97"
 }
 
 # KEEP_WORK=1 で作業ディレクトリを残す（失敗ケースの成果物調査用。issue #16）

@@ -130,6 +130,15 @@ function New-InstructionText {
         "恒久的な決定事項は反映先を選ぶこと: チーム共有すべき決定はCLAUDE.mdへ、このマシン・個人に固有の決定はCLAUDE.local.mdへ（無ければ作成し、.gitignoreへCLAUDE.local.mdを追加）。共有ファイルを編集してよいか判断できない場合は編集せず、本資料のKey Decisionsに記載するに留めること。",
         "完成したらユーザーへ次を案内して停止すること:「引き継ぎ資料が完成しました。Remote Control中や会話ログを残したい場合はこのまま続行してください（放置すればauto compactが働き、資料は圧縮後のコンテキストへ自動注入されます）。トークン消費を節約したい場合は /clear を実行してください（消費ゼロで資料が自動注入されます。ただし会話ログは新しい空のセッションに切り替わり、次に一言送るまで作業は自動再開されません）」"
     ) -join "`n"
+    if (Test-OrdinalEqual $Mode "manual") {
+        # 利用者の求め（/handoff-now）で出す指示（v0.2.5。設計メモ docs/design/2026-11-26-manual-trigger.md）。
+        # 状態ファイルには soft か hard として記録する（mode の値は増やさない）が、文言はこれを使う
+        $refreshNote = ""
+        if ($Refresh) {
+            $refreshNote = "（この会話には前に作った引き継ぎ資料 ${HandoffMd} がありますが、その後の作業が反映されていません。それを読み、いまの状態に合わせて書き直したものを下記の書き先へ書いてください）`n"
+        }
+        return "利用者の求め（/handoff-now）で、引き継ぎ資料を作成します。今の作業を区切りの良いところで止めて、圧縮や /clear の後も継続できるよう引き継ぎ資料を作成してください。`n$refreshNote$common"
+    }
     if (Test-OrdinalEqual $Mode "hard") {
         $retryNote = ""
         if ($Attempt -gt 1) {
@@ -159,6 +168,37 @@ function Write-HardInstruction {
     if ($null -ne $Carry) { foreach ($k in $Carry.Keys) { $newState[$k] = $Carry[$k] } }
     Write-FileAtomic -Path $StatePath -Content ($newState | ConvertTo-Json)
     $text = New-InstructionText -Mode "hard" -HandoffMd $HandoffMd -Nonce $nonce -Attempt $Attempt -MaxAttempts $MaxAttempts -FailReasons $FailReasons -Refresh:$Refresh
+    Write-Output (@{ hookSpecificOutput = @{ hookEventName = "Stop"; additionalContext = $text } } | ConvertTo-Json -Depth 4)
+}
+
+# 手動の要求行（/handoff-now が Claude に返答させる1行。v0.2.5）
+$HO_NOW_REQUEST = "<!-- handoff-now-request -->"
+$HO_NOW_REQUEST_PATTERN = '(?:\A|\n)[ \t\r]*<!-- handoff-now-request -->[ \t\r\n]*\z'
+
+function Test-HoNowRequest {
+    param($Inp)
+    # そのターンの最後の応答（last_assistant_message）の**最後の行**が要求行か。その行の前後の半角空白・タブ・CR と、
+    # 後ろに続く空行は無視する（NBSP・全角空白は無視しない。sh版と同一契約）。前の行に何があってもよい
+    # （指示しても前置きを付けるモデルがある — 実機で確認）。指示への応答の Stop（stop_hook_active が真）では反応しない
+    $shv = $null
+    if ((Test-HoProp $Inp "stop_hook_active")) { $shv = $Inp.stop_hook_active }
+    if (($shv -is [bool] -and $shv) -or (($shv -is [string]) -and (Test-OrdinalEqual $shv "true"))) { return $false }
+    if (-not (Test-HoProp $Inp "last_assistant_message")) { return $false }
+    $m = $Inp.last_assistant_message
+    if (-not ($m -is [string])) { return $false }
+    return ($m -cmatch $HO_NOW_REQUEST_PATTERN)
+}
+
+function Write-ManualInstruction {
+    param([string]$StatePath, [string]$HandoffMd, [string]$Mode, $Carry = $null)
+    # 手動の指示を新しい nonce で出し、状態ファイルを $Mode（soft / hard）・attempts 1 で書く。
+    # $Carry（直近に完成した資料の情報）があれば持ち越し、書き直しの文言にする
+    New-Item -ItemType Directory -Force -Path (Split-Path $HandoffMd -Parent) | Out-Null
+    $nonce = [guid]::NewGuid().ToString()
+    $newState = @{ schema_version = 1; mode = $Mode; nonce = $nonce; attempts = 1; completed = $false; failed = $false }
+    if ($null -ne $Carry) { foreach ($k in $Carry.Keys) { $newState[$k] = $Carry[$k] } }
+    Write-FileAtomic -Path $StatePath -Content ($newState | ConvertTo-Json)
+    $text = New-InstructionText -Mode "manual" -HandoffMd $HandoffMd -Nonce $nonce -Attempt 1 -MaxAttempts $MAX_ATTEMPTS -Refresh:($null -ne $Carry)
     Write-Output (@{ hookSpecificOutput = @{ hookEventName = "Stop"; additionalContext = $text } } | ConvertTo-Json -Depth 4)
 }
 
@@ -297,8 +337,20 @@ try {
 
     $handoffMd = Join-Path $handoffRoot "$sessionId/current.md"
 
+    # 手動の要求（v0.2.5。設計メモ 2026-11-26 §4）。閾値の判定より前に見るが、未完成の指示がある場合は
+    # 完了の判定を先に行う（この Stop で完成したら要求は無視する — 設計レビュー M2）
+    $nowRequest = Test-HoNowRequest $inp
+
     # --- 発行済みhandoff指示がある場合: 完了検証 ---
     if ($null -ne $state) {
+        if ((Test-HoProp $state "completed") -and $state.completed -and $nowRequest) {
+            # 完成済みからの手動の書き直し。hard の完成は hard のまま、soft の完成はハード閾値以上なら hard にする（M1）
+            $mMode = "soft"
+            if (Test-OrdinalEqual ([string]$state.mode) "hard") { $mMode = "hard" }
+            elseif ((Get-LastUsageFromTranscript -TranscriptPath $transcript -TailLines $TAIL_LINES) -ge $hardThreshold) { $mMode = "hard" }
+            Write-ManualInstruction -StatePath $statePath -HandoffMd $handoffMd -Mode $mMode -Carry (Get-CompletionCarry $state)
+            exit 0
+        }
         if ((Test-HoProp $state "completed") -and $state.completed) {
             # 完了済み。原則はこのサイクルで何もしない（状態ファイルはcompact/clear/resumeの
             # restoreが消す）が、**ソフト閾値で作った資料は、ハード閾値を越えたら1度だけ
@@ -397,6 +449,15 @@ try {
             Write-FileAtomic -Path $statePath -Content ((New-CompletedState -State $state -TranscriptPath $transcript -Epoch $ue -Sha $sha) | ConvertTo-Json)
             exit 0
         }
+        # 未完了で手動の要求: 指示を新しい nonce で出し直す。hard の指示中・打ち切り後は hard（試行回数は数え直す）、
+        # soft の指示中はハード閾値以上なら hard（M1）。直近に完成した資料の情報は持ち越す
+        if ($nowRequest) {
+            $mMode = "soft"
+            if (Test-OrdinalEqual ([string]$state.mode) "hard") { $mMode = "hard" }
+            elseif ((Get-LastUsageFromTranscript -TranscriptPath $transcript -TailLines $TAIL_LINES) -ge $hardThreshold) { $mMode = "hard" }
+            Write-ManualInstruction -StatePath $statePath -HandoffMd $handoffMd -Mode $mMode -Carry (Get-CompletionCarry $state)
+            exit 0
+        }
         # 未完了の場合
         if (Test-OrdinalEqual ([string]$state.mode) "hard") {
             $attempts = [int]$state.attempts
@@ -425,13 +486,25 @@ try {
         # ソフト未完了は追わない（提案のみ）。ただしハード閾値到達ならエスカレーション
         $tokensNow = Get-LastUsageFromTranscript -TranscriptPath $transcript -TailLines $TAIL_LINES
         if ($tokensNow -ge $hardThreshold) {
-            Write-HardInstruction -StatePath $statePath -HandoffMd $handoffMd -Attempt 1 -MaxAttempts $MAX_ATTEMPTS
+            # 直近に完成した資料の情報があれば持ち越し、書き直しの文言にする（v0.2.5。手動の書き直しでできる
+            # 「持ち越しのある soft の指示中」を格上げで失わないため — 設計レビュー H1。従来の経路では持ち越しは無い）
+            $esc = Get-CompletionCarry $state
+            Write-HardInstruction -StatePath $statePath -HandoffMd $handoffMd -Attempt 1 -MaxAttempts $MAX_ATTEMPTS -Refresh:($null -ne $esc) -Carry $esc
         }
         exit 0
     }
 
     # --- 未発行: usage実測 → 閾値判定 ---
     $tokens = Get-LastUsageFromTranscript -TranscriptPath $transcript -TailLines $TAIL_LINES
+    if ($nowRequest) {
+        # 手動の要求: 閾値に関係なく指示を出す。ハード閾値以上なら hard、それ以外は soft で記録する（M1。
+        # soft で作った資料は、あとでハード閾値に達したら v0.2.1 の規則で1度書き直される）。
+        # 実行中のバックグラウンドタスクがあっても見送らない（利用者が求めたため — L2）
+        $mMode = "soft"
+        if ($tokens -ge $hardThreshold) { $mMode = "hard" }
+        Write-ManualInstruction -StatePath $statePath -HandoffMd $handoffMd -Mode $mMode
+        exit 0
+    }
     if ($tokens -lt $softThreshold) { exit 0 }
 
     if ($tokens -ge $hardThreshold) {

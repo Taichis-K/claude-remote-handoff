@@ -3,9 +3,9 @@
 # run-parity.ps1 と同一ケース・同一出力形式。run-local-check.ps1 / .sh が両者の出力を
 # 期待値と照合して2系統一致を検証する（ローカル実行）
 # 使い方: sh run-parity.sh [作業ディレクトリ] [part]
-#   part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C96）。
+#   part は all（既定・全ケース）/ 1（C1〜C50）/ 2（C51〜C75）/ 3（C76〜C97）。
 #   パートは独立した作業ディレクトリで並列に実行し、出力を1〜3の順に連結すると
-#   all と同じ96行になる（run-local-check.sh がそれを行い期待値と照合する）
+#   all と同じ97行になる（run-local-check.sh がそれを行い期待値と照合する）
 set -u
 
 tests_dir=$(cd "$(dirname "$0")" && pwd)
@@ -2439,6 +2439,98 @@ nm96="show"
 case "$o96" in *"delta-name96"*) ;; *"同じ名前の前のセッション"*) nm96="noshow" ;; *) nm96="other" ;; esac
 unset HANDOFF_TEST_HOST HANDOFF_TEST_LIVE HANDOFF_TEST_NOW_EPOCH
 printf 'C96 dtgt=%s,%s pidmax=%s many=%s name=%s\n' "$d1_96" "$d2_96" "$pm96" "$mn96" "$nm96"
+
+# C97: 手動の要求（/handoff-now。v0.2.5 — 設計メモ 2026-11-26）。閾値は soft=200 / hard=400。
+#   low/high: 状態なしで要求（使用量100 / 450）→ 手動の指示（soft / hard で記録）
+#   ws/nbsp/part/active/nofield: 前後の半角空白・改行は無視（反応）、NBSP は無視しない・途中に含む・stop_hook_active・欄なし（反応しない）
+#   donesoft/donehard: 完成済み（soft / hard）で要求 → 書き直しの手動指示（mode はそのまま、完成情報を持ち越す）
+#   pend: soft の指示中で要求 → 新しい nonce で手動の指示
+#   failed: hard の打ち切り後に要求 → hard・試行回数1・failed でない
+#   race: 検証に通る下書きがある soft の指示中に要求 → 完了が先（指示は出ない）
+#   esc: 持ち越しのある soft の指示中（donesoft の後）に、要求なしで使用量がハード閾値に達した → 書き直しのハード指示（持ち越しを保つ）
+REQ97='<!-- handoff-now-request -->'
+stopnow97() { # $1=sid $2=transcript $3=last_assistant_message（"-" なら欄なし） $4=stop_hook_active（true/false）
+    jq -n --arg sid "$1" --arg tp "$2" --arg cwd "$work/proj" --arg m "$3" --argjson a "$4" \
+        '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "Stop", stop_hook_active: $a}
+         + (if $m == "-" then {} else {last_assistant_message: $m} end)'
+}
+kind97() { # $1=output → manual / refresh / hard-refresh / hard / none / other
+    _k=$(printf '%s' "$1" | tr -d '\r')
+    if [ -z "$(printf '%s' "$_k" | tr -d '[:space:]')" ]; then printf 'none'; return; fi
+    case "$_k" in
+        *"/handoff-now）で、引き継ぎ資料を作成"*)
+            case "$_k" in *"書き直したもの"*) printf 'refresh' ;; *) printf 'manual' ;; esac ;;
+        *"ハード閾値を超えました"*)
+            case "$_k" in *"書き直したもの"*) printf 'hard-refresh' ;; *) printf 'hard' ;; esac ;;
+        *) printf 'other' ;;
+    esac
+}
+st97() { # $1=transcript → mode/attempts/carry有無/failed
+    jq -r '.mode + "/" + (.attempts | tostring) + "/" + (if has("completed_nonce") then "carry" else "nocarry" end)
+           + "/" + (if .failed == true then "failed" elif .completed == true then "done" else "open" end)' "$1.handoff-state.json" 2>/dev/null || printf 'nostate'
+}
+run97() { # $1=sid $2=transcript $3=msg $4=active → 「種類:状態」
+    _o=$(invoke_hook handoff-check.sh "$(stopnow97 "$1" "$2" "$3" "$4")")
+    printf '%s:%s' "$(kind97 "$_o")" "$(st97 "$2")"
+}
+sid97="97979797-0000-0000-0000-000000000001"
+t97="$troot/t97.jsonl"
+usage_transcript "$t97" 100; rm -f "$t97.handoff-state.json"
+low97=$(run97 "$sid97" "$t97" "$REQ97" false)
+usage_transcript "$t97" 450; rm -f "$t97.handoff-state.json"
+high97=$(run97 "$sid97" "$t97" "$REQ97" false)
+usage_transcript "$t97" 100; rm -f "$t97.handoff-state.json"
+ws97=$(run97 "$sid97" "$t97" "$(printf '  \n\t%s \r\n' "$REQ97")" false)
+rm -f "$t97.handoff-state.json"
+nbsp97=$(run97 "$sid97" "$t97" "$(printf '\302\240%s' "$REQ97")" false)
+part97=$(run97 "$sid97" "$t97" "了解しました $REQ97" false)
+# 要求行の後ろに文の行が続く（最後の行ではない）→ 反応しない
+after97=$(run97 "$sid97" "$t97" "$REQ97
+上の1行を返しました。" false)
+# 前置きのあと、最後の行が要求行（指示しても前置きを付けるモデルがある — 実機で確認）→ 反応する
+rm -f "$t97.handoff-state.json"
+last97=$(run97 "$sid97" "$t97" "$(printf 'こんにちは。
+
+%s
+' "$REQ97")" false)
+rm -f "$t97.handoff-state.json"
+active97=$(run97 "$sid97" "$t97" "$REQ97" true)
+nofield97=$(run97 "$sid97" "$t97" "-" false)
+# 型違い: last_assistant_message が数値・stop_hook_active が文字列 "true"（PS は型で、sh は jq で判定する — 分裂しないこと）
+nonstr97=$(o97=$(invoke_hook handoff-check.sh "$(jq -n --arg sid "$sid97" --arg tp "$t97" --arg cwd "$work/proj"     '{session_id: $sid, transcript_path: $tp, cwd: $cwd, hook_event_name: "Stop", stop_hook_active: false, last_assistant_message: 5}')");     printf '%s:%s' "$(kind97 "$o97")" "$(st97 "$t97")")
+activestr97=$(run97 "$sid97" "$t97" "$REQ97" '"true"')
+
+sid97b="97979797-0000-0000-0000-000000000002"; t97b="$troot/t97b.jsonl"
+done91 "$sid97b" "$t97b" "nonce-t97b-00000000"
+donesoft97=$(run97 "$sid97b" "$t97b" "$REQ97" false)
+grow91 "$t97b" 450
+esc97=$(run97 "$sid97b" "$t97b" "了解" false)
+
+sid97c="97979797-0000-0000-0000-000000000003"; t97c="$troot/t97c.jsonl"
+usage_transcript "$t97c" 450
+seed_hard_state "$t97c" "nonce-t97c-00000000"
+doc90 "$(dir91 "$sid97c")/draft.md" "nonce-t97c-00000000"
+invoke_hook handoff-check.sh "$(stop_input "$sid97c" "$t97c")" > /dev/null
+donehard97=$(run97 "$sid97c" "$t97c" "$REQ97" false)
+
+sid97d="97979797-0000-0000-0000-000000000004"; t97d="$troot/t97d.jsonl"
+usage_transcript "$t97d" 250
+soft_state90 "$t97d" "nonce-t97d-00000000"
+pend97=$(run97 "$sid97d" "$t97d" "$REQ97" false)
+case "$(jq -r '.nonce' "$t97d.handoff-state.json" 2>/dev/null)" in nonce-t97d-00000000) pend97="$pend97/samenonce" ;; *) pend97="$pend97/newnonce" ;; esac
+
+sid97e="97979797-0000-0000-0000-000000000005"; t97e="$troot/t97e.jsonl"
+usage_transcript "$t97e" 450
+printf '{"schema_version":1,"mode":"hard","nonce":"nonce-t97e-00000000","attempts":3,"completed":false,"failed":true}' > "$t97e.handoff-state.json"
+failed97=$(run97 "$sid97e" "$t97e" "$REQ97" false)
+
+sid97f="97979797-0000-0000-0000-000000000006"; t97f="$troot/t97f.jsonl"
+usage_transcript "$t97f" 250
+soft_state90 "$t97f" "nonce-t97f-00000000"
+doc90 "$(dir91 "$sid97f")/draft.md" "nonce-t97f-00000000"
+race97=$(run97 "$sid97f" "$t97f" "$REQ97" false)
+printf 'C97 low=%s high=%s ws=%s nbsp=%s part=%s after=%s last=%s active=%s nofield=%s nonstr=%s activestr=%s donesoft=%s esc=%s donehard=%s pend=%s failed=%s race=%s\n' \
+    "$low97" "$high97" "$ws97" "$nbsp97" "$part97" "$after97" "$last97" "$active97" "$nofield97" "$nonstr97" "$activestr97" "$donesoft97" "$esc97" "$donehard97" "$pend97" "$failed97" "$race97"
 fi
 
 # KEEP_WORK=1 で作業ディレクトリを残す（失敗ケースの成果物調査用。issue #16）

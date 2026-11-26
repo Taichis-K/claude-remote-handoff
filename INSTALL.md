@@ -77,6 +77,8 @@
   無関係なファイルを上書きする場合である）。**承認が無いまま書かない**
 
 コピー後、利用者に「導入したいプロジェクトで `/handoff-init` を実行してください」と伝える。
+同じタグに `commands/handoff-now.md` があれば（v0.2.5 以降）、同じ手順で `~/.claude/commands/` へ置いてよい
+（任意。使用量の閾値を待たずに引き継ぎ資料を作らせるコマンド。`/handoff-init` も置くかを尋ねる）。
 フックの更新も同じコマンドで、配布元の最新リリースと版を比べて差があれば入れ替える
 （プラグインで導入済みの場合だけは例外で、フックの更新は `claude plugin update` の担当。
 コマンドは版を比べてその旨を案内する）。
@@ -113,6 +115,8 @@ macOS/Linuxは方法Bで導入すること。
    フックのコピーや登録は行わない（§2）
 4. permissions.allow に `Edit(.claude-handoff/**)` を追加（§3-2）
 5. `/autocompact <window値>` を実行し、`/hooks` で5エントリを確認（§3-1, §3-4）
+6. （任意）`commands/handoff-now.md` を `~/.claude/commands/` へコピー（`CLAUDE_CONFIG_DIR` を設定していればそのディレクトリの
+   `commands/`）。閾値を待たずに資料を作らせる `/handoff-now` が使えるようになる（v0.2.5 以降）
 
 手順:
 
@@ -419,7 +423,8 @@ claude plugin update claude-remote-handoff --scope <user|project|local|managed>
 **方法B（手動導入）**:
 
 1. 最新Releaseのzipを展開する（または本リポジトリを `git pull` する）
-2. `.claude/hooks/claude-remote-handoff/` を**新しい `hooks/` 一式で丸ごと置き換える**
+2. `.claude/hooks/claude-remote-handoff/` を**新しい `hooks/` 一式で丸ごと置き換える**。
+   `/handoff-now` を使うなら `commands/handoff-now.md` も `~/.claude/commands/` へ置き直す（v0.2.5 以降。任意）
    （差分適用はしない。ローカルで手を入れていた場合その改変は失われる — 必要なら退避しておく）
 3. `.claude/settings.local.json` のフック定義を §1手順2 の最新スニペットと突き合わせ、
    コマンド・引数が変わっていれば差し替える（**v0.1.4でWindowsの `args` に

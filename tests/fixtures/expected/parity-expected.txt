@@ -94,3 +94,4 @@ C93 big=222 span=444 in500=556 out500=0 crlf=666 nolf=777 esc=999 part=998 none=
 C94 five=yes budget=3 in2000=yes out2000=no clean=yes
 C95 cross=a/pid,b/pid,none live=none,none,c/latest name=none,e/name fail=none,g/latest stale=f2/latest bad=h/latest ret=kept/gone
 C96 dtgt=none,refused pidmax=injected many=none/1,injected name=noshow
+C97 low=manual:soft/1/nocarry/open high=manual:hard/1/nocarry/open ws=manual:soft/1/nocarry/open nbsp=none:nostate part=none:nostate after=none:nostate last=manual:soft/1/nocarry/open active=none:nostate nofield=none:nostate nonstr=none:nostate activestr=none:nostate donesoft=refresh:soft/1/carry/open esc=hard-refresh:hard/1/carry/open donehard=refresh:hard/1/carry/open pend=manual:soft/1/nocarry/open/newnonce failed=manual:hard/1/nocarry/open race=none:soft/1/nocarry/done
