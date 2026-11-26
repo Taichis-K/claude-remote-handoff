@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.4 (2026-11-26)
+
+- **修正（PS版）: PowerShell 7 から起動した環境で、資料が完成しても `latest.json` が更新されなかった**。
+  VS Code や Claude Code を PowerShell 7 から起動すると、フックを動かす Windows PowerShell 5.1 が受け継ぐ
+  `PSModulePath` の先頭が PowerShell 7 のモジュールの置き場所になる。5.1 の `Get-FileHash` はモジュールの関数なので、
+  自動読み込みが 7 用の同名モジュールを見つけて失敗し（CommandNotFoundException）、SHA-256 を計算できなかった。
+  error.log には「SHA-256計算に失敗したためポインタ(latest.json)を更新しません」と出て、`/clear` 後に資料が注入されない。
+  SHA-256 は .NET で直接計算するようにした（値は同じ）。v0.2.3 で入れた本体プロセスの問い合わせも、
+  `Get-CimInstance` をやめてモジュールに頼らない形にした
+- **開発**: フックと setup の .ps1 で、モジュールの自動読み込みに頼るコマンドを使っていないかを検査に加えた
+
 ## v0.2.3 (2026-11-22)
 
 - **改善: 同一ワークスペースで複数セッションを並行させたとき、`/clear` 後に自分の資料を注入する**。

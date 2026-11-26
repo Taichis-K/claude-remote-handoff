@@ -756,9 +756,22 @@ function Get-FileSha256 {
         # テスト用シーム: SHA計算失敗経路をパリティ試験で決定的に再現する（C59）
         return $null
     }
+    # 計算は .NET で直接行う（Get-FileHash は使わない）。Windows PowerShell 5.1 の Get-FileHash は
+    # Microsoft.PowerShell.Utility のスクリプトモジュールの関数で、PowerShell 7 から起動した環境（VS Code 等）では
+    # PSModulePath の先頭が 7 の置き場所になり、自動読み込みが 7 用の同名モジュールを見つけて失敗する
+    # （CommandNotFoundException。資料は完成したのに latest.json が更新されなかった — 2026-11-26 の報告、v0.2.4）。
+    # 戻り値は従来どおり英大文字の16進64文字
     for ($i = 0; $i -lt 3; $i++) {
-        try { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash } catch {
+        $fs = $null
+        try {
+            # 共有は Read だけ（書き込み中のファイルは開けずに再試行する。Get-FileHash と同じ扱い）
+            $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try { return [System.BitConverter]::ToString($sha.ComputeHash($fs)).Replace("-", "") } finally { $sha.Dispose() }
+        } catch {
             Start-Sleep -Milliseconds 200
+        } finally {
+            if ($null -ne $fs) { $fs.Dispose() }
         }
     }
     return $null
@@ -990,8 +1003,12 @@ function Get-HoHostProcess {
             $par = (Get-Process -Id $PID).Parent
             if ($null -ne $par) { $hostPid = [long]$par.Id }
         } else {
-            $ci = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$PID" -OperationTimeoutSec 3 -ErrorAction Stop
-            if ($null -ne $ci) { $hostPid = [long]$ci.ParentProcessId }
+            # Get-CimInstance（CimCmdlets モジュール）は使わず、モジュールの読み込みに頼らない [wmisearcher] で問い合わせる。
+            # PowerShell 7 から起動した環境でも Get-CimInstance は実測では動いたが、Get-FileSha256 と同じく
+            # モジュールの自動読み込みに頼らないための予防（v0.2.4）
+            $q = [wmisearcher]("SELECT ParentProcessId FROM Win32_Process WHERE ProcessId=$PID")
+            $q.Options.Timeout = [System.TimeSpan]::FromSeconds(3)
+            foreach ($r in $q.Get()) { $hostPid = [long]$r.ParentProcessId }
         }
         if ($null -eq $hostPid -or $hostPid -le 1 -or $hostPid -gt $HO_PID_MAX) { return $null }
         if (-not (Test-Path -LiteralPath "$cfg/sessions/$hostPid.json" -PathType Leaf)) { return $null }
